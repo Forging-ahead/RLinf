@@ -1559,6 +1559,99 @@ def test_response_only_logits_match_full_logits_at_scored_positions():
     assert scored[:, [0, 3, 4]].count_nonzero() == 0
 
 
+def _assert_chunked_sao_gradients(rank, dtype, temperature):
+    from rlinf.algorithms.losses import compute_dis_actor_loss
+    from rlinf.utils.distributed import vocab_parallel_log_probs_from_logits
+
+    torch.manual_seed(3)
+    full = torch.randn(1, 9, 22, dtype=dtype, requires_grad=True)
+    labels = torch.tensor([[0, 21, 4, 15, 11, 8, 1, 20, 12]])
+    advantages = torch.linspace(-1, 1, 9).unsqueeze(0)
+    mask = torch.tensor([[True, False, True, True, False, True, True, False, True]])
+    expected = (
+        (full.float() / temperature)
+        .log_softmax(-1)
+        .gather(-1, labels.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    old = expected.detach() + torch.linspace(-0.4, 0.4, 9).unsqueeze(0)
+    delta = (expected - old).detach()
+    keep = mask & (delta > torch.tensor(0.8).log()) & (delta < torch.tensor(1.2).log())
+    ratio = delta.exp().masked_fill(~keep, 0.0)
+    reference_loss = -(ratio * advantages * expected).sum() / mask.sum()
+    reference_loss.backward()
+    local = full.detach().chunk(2, dim=-1)[rank].clone().requires_grad_()
+    original = local.detach().clone()
+    saved = []
+
+    def pack(tensor):
+        saved.append((tensor.dtype, tensor.numel(), tensor.data_ptr()))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        actual = vocab_parallel_log_probs_from_logits(
+            local, labels, chunk_size=4, temperature=temperature
+        )
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    loss, metrics = compute_dis_actor_loss(
+        logprobs=actual,
+        old_logprobs=old,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        advantages=advantages,
+        loss_mask=mask,
+    )
+    torch.testing.assert_close(loss, reference_loss, rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(metrics["actor/ratio"], ratio[mask].mean().detach())
+    loss.backward()
+    torch.testing.assert_close(
+        local.grad, full.grad.chunk(2, dim=-1)[rank], rtol=2e-3, atol=2e-6
+    )
+    assert torch.equal(local, original)
+    assert not any(
+        kind == torch.float32 and count == local.numel() and pointer != local.data_ptr()
+        for kind, count, pointer in saved
+    ), "Chunked logprobs retained a separate full-vocabulary FP32 tensor"
+
+
+def _chunked_log_probs_rank(rank: int, store: str) -> None:
+    from megatron.core import parallel_state
+    from megatron.core.transformer.module import Float16Module
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{store}", rank=rank, world_size=2
+    )
+    try:
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
+        wrapper = Float16Module(
+            TransformerConfig(
+                num_layers=1, hidden_size=4, num_attention_heads=2, bf16=True
+            ),
+            torch.nn.Identity(),
+        )
+        sample = torch.ones(1, 9, 11, dtype=torch.bfloat16)
+        assert wrapper(sample).dtype == torch.float32
+        assert wrapper(sample, fp32_output=False).dtype == torch.bfloat16
+        for dtype, temperature in (
+            (torch.float32, 1.0),
+            (torch.bfloat16, 1.0),
+            (torch.bfloat16, 0.7),
+        ):
+            _assert_chunked_sao_gradients(rank, dtype, temperature)
+    finally:
+        parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+
+def test_chunked_vocab_log_probs_match_dense_tp_values_and_gradients(tmp_path):
+    pytest.importorskip("megatron.core")
+    torch.multiprocessing.spawn(
+        _chunked_log_probs_rank, args=(str(tmp_path / "store"),), nprocs=2
+    )
+
+
 def _sequence_parallel_positions_rank(rank: int, store: str) -> None:
     from megatron.core import parallel_state, tensor_parallel
     from megatron.core.transformer.transformer_config import TransformerConfig

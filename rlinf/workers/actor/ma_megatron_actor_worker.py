@@ -219,6 +219,7 @@ class MAMegatronActor(MegatronActor):
             label_mask = copy.deepcopy(batch["attention_mask"])
             label_mask[:, :-1] = label_mask[:, 1:].clone()  # Shift left by 1
             label_mask[:, -1] = False
+            chunked_logprobs = self.response_only_logits and not self.calculate_entropy
 
             def logits_processor(logits, label, label_mask):
                 assert logits.shape[:2] == label.shape[:2]
@@ -233,7 +234,14 @@ class MAMegatronActor(MegatronActor):
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs, "entropy": entropy}
                 else:
-                    log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+                    log_probs = vocab_parallel_log_probs_from_logits(
+                        logits,
+                        label,
+                        chunk_size=256 if self.response_only_logits else 0,
+                        temperature=self.cfg.algorithm.sampling_params.temperature
+                        if chunked_logprobs
+                        else 1.0,
+                    )
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs}
 
@@ -253,11 +261,16 @@ class MAMegatronActor(MegatronActor):
                     sequence_parallel=self.transformer_config.sequence_parallel,
                     logits_processor=logits_processor,
                     logits_processor_args=logits_processor_args,
-                    temperature=self.cfg.algorithm.sampling_params.temperature,
+                    # Float16Module otherwise upcasts the entire vocabulary
+                    # output. Scale only each FP32 chunk, including at T != 1.
+                    temperature=1.0
+                    if chunked_logprobs
+                    else self.cfg.algorithm.sampling_params.temperature,
                     trim_right_padding=self.cfg.get("actor", {}).get(
                         "trim_right_padding", False
                     ),
                     **self._forward_multimodal_inputs(batch),
+                    **({"fp32_output": False} if chunked_logprobs else {}),
                 )
 
             if not self.return_loss:

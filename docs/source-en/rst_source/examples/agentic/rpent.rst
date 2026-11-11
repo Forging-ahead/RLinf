@@ -253,6 +253,9 @@ RPent; the others are general training options that the recipe turns on.
        an episode reuse its prefix cache.
    * - ``actor.response_only_logits``
      - Computes vocabulary logits only at positions that score generated tokens.
+       When entropy is disabled, keeps model output in BF16 and recomputes
+       temperature-scaled FP32 softmax in token chunks during backward,
+       retaining every scored token without a full FP32 vocabulary tensor.
    * - ``actor.megatron.empty_cache_after_backward``,
        ``critic.megatron.empty_cache_after_backward``
      - Returns cached activation memory before the gradient reduction.

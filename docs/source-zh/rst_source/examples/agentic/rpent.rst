@@ -185,7 +185,7 @@ SGLang 和 Megatron 算出的 logprob 有差异，训练用按 token 截断（�
    * - ``rollout.replica_affinity``
      - 把每个 agent worker 的请求固定发到同一个 SGLang 副本，让同一个 episode 的各轮复用前缀缓存。
    * - ``actor.response_only_logits``
-     - 只在给生成 token 打分的位置计算词表 logits。
+     - 只在给生成 token 打分的位置计算词表 logits。关闭 entropy 时保持模型输出为 BF16，反向传播按 token 分块进行含 temperature 缩放的 FP32 softmax 重计算，避免完整 FP32 词表张量，保留全部参与训练的 token。
    * - ``actor.megatron.empty_cache_after_backward``、``critic.megatron.empty_cache_after_backward``
      - 在梯度归约前释放缓存的激活显存。
 
