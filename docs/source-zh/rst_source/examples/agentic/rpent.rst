@@ -194,6 +194,12 @@ SGLang 和 Megatron 算出的 logprob 有差异，训练用按 token 截断（�
 
 把 ``runner.resume_dir`` 设为 ``checkpoints/global_step_N`` 目录，即可恢复 actor、critic、优化器和 dataloader。``rollout.model.model_path`` 不用改：开启 ``rollout.sglang.enable_weights_cpu_backup=true`` 时，SGLang 从部署模型加载完整权重并保留未参与同步的视觉部分，第一次同步再用恢复后的 actor 权重替换语言部分，所以 ``rollout.validate_weight_first_sync`` 只在从头训练时生效。
 
+异步 checkpoint 还会保留采集端的 epoch 和排队输入。恢复时，sampler 先走过采集端已完成的 epoch，再恢复保存的游标；采集端可能已领先于 learner。
+
+训练与采集共用 GPU，且一次更新可能超过 Planner 请求或任务超时时，可设 ``rollout.drain_before_training=true``。它先暂停启动新任务，让活动任务按原预算正常完成，再暂停生成并训练；所有完成结果都会保留在缓冲区。发布新策略后恢复启动任务，进程即将结束时不再启动。该选项默认关闭，要求 ``rollout_buffer_capacity >= max_in_flight_rollouts``，避免收尾任务堵在已满的缓冲区；它不延长任务超时。
+
+收尾模式限制已提交输入的数量，保证消费一个 learner batch 后的剩余结果都能放入缓冲区；活动任务全部结束后才补充排队输入。
+
 要部署训练后的 policy，例如用于评估，先把它写入部署模型的一份副本：
 
 .. code-block:: bash

@@ -289,12 +289,15 @@ class ReasoningRunner:
                 f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch"
             )
 
-    def _restore_dataloader_state(self, state: dict) -> None:
+    def _restore_dataloader_state(
+        self, state: dict, completed_epochs: Optional[int] = None
+    ) -> None:
         """Restore the sampler's epoch and the saved within-epoch position."""
         if self.cfg.data.shuffle:
             # The loader tracks RandomSampler's cursor, not its generator.
             # Checkpoints precede exhaustion of the current epoch's iterator.
-            completed_epochs = (self.global_steps - 1) // len(self.train_dataloader)
+            if completed_epochs is None:
+                completed_epochs = (self.global_steps - 1) // len(self.train_dataloader)
             for _ in range(completed_epochs):
                 for _ in self.train_dataloader.sampler:
                     pass

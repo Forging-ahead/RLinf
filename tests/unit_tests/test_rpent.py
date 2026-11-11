@@ -1402,6 +1402,32 @@ def test_sao_preserves_ppo_task_model_and_generation_settings():
     assert sao.critic.loss_type == "sao" and sao.critic.update_epochs == 2
 
 
+@pytest.mark.parametrize("drain", [False, True])
+def test_sao_drain_reserves_buffer_space_for_all_active_episodes(drain):
+    from rlinf.config import validate_rpent_cfg
+
+    cfg = compose(config_name="train_qwen3.5_4b_libero_rl_sao_3node")
+    cfg.rollout.max_in_flight_rollouts = 256
+    cfg.rollout.rollout_buffer_capacity = 128
+    cfg.rollout.drain_before_training = drain
+    if drain:
+        with pytest.raises(ValueError, match="so active episodes can finish"):
+            validate_rpent_cfg(cfg)
+        cfg.rollout.rollout_buffer_capacity = 256
+    validate_rpent_cfg(cfg)
+
+
+def test_sao_drain_rejects_a_non_boolean_switch():
+    from rlinf.config import validate_rpent_cfg
+
+    cfg = compose(config_name="train_qwen3.5_4b_libero_rl_sao_3node")
+    values = OmegaConf.to_container(cfg, resolve=False)
+    values["rollout"]["drain_before_training"] = 1
+    cfg = OmegaConf.create(values)
+    with pytest.raises(ValueError, match="must be a boolean"):
+        validate_rpent_cfg(cfg)
+
+
 def test_clean_training_profiles_inherit_without_deployment_paths():
     directory = Path(__file__).parents[2] / "examples/agent/rpent/config"
     names = [

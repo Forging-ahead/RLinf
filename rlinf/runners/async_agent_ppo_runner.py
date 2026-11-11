@@ -58,12 +58,18 @@ class AsyncAgentPPORunner(AgentPPORunner):
         ):
             raise ValueError("Async PPO uses the training workers for inference.")
         self.critic_input_channel = self.critic_output_channel
+        self.drain_before_training = self.cfg.rollout.get(
+            "drain_before_training", False
+        )
         self.async_rollout_channel = Channel.create(
             "AsyncRollout", maxsize=self.cfg.rollout.rollout_buffer_capacity
         )
+        prefetch_reserve = self.cfg.rollout.max_in_flight_rollouts
+        if self.drain_before_training:
+            # After a learner batch is consumed, all admitted remainders must fit.
+            prefetch_reserve = min(prefetch_reserve, self.cfg.data.rollout_batch_size)
         self.prompt_capacity = (
-            self.cfg.rollout.rollout_buffer_capacity
-            + self.cfg.rollout.max_in_flight_rollouts
+            self.cfg.rollout.rollout_buffer_capacity + prefetch_reserve
         )
         self.published_version = 0
         self.actor_version = 0
@@ -148,7 +154,10 @@ class AsyncAgentPPORunner(AgentPPORunner):
             raise ValueError(
                 "Restored trajectories exceed rollout.rollout_buffer_capacity."
             )
-        self.train_dataloader.load_state_dict(state["dataloader"])
+        # The producer can enter the next epoch before the learner consumes it.
+        self._restore_dataloader_state(
+            state["dataloader"], completed_epochs=rollout["producer_epoch"]
+        )
         self._restored_buffer = rollout["buffer"]
         self._restored_pending = rollout["pending"]
         self._stale_count = rollout.get("stale_count", 0)
@@ -173,6 +182,17 @@ class AsyncAgentPPORunner(AgentPPORunner):
             self._sync_weights(weight_version=self.actor_version)
             self.published_version = self.actor_version
             self.rollout.resume_generation().wait()
+
+    def _rollout_memory_metrics(self) -> dict:
+        states = self.agent_loop.get_async_buffer_bytes().wait()
+        return {
+            "async/retained_bytes_estimate": sum(
+                state["retained_bytes_estimate"] for state in states
+            ),
+            "async/memory_admission_paused_workers": sum(
+                state["memory_admission_paused"] for state in states
+            ),
+        }
 
     def run(self) -> None:
         """Train from completed trajectories while rollout workers run in the background."""
@@ -226,12 +246,30 @@ class AsyncAgentPPORunner(AgentPPORunner):
                     self._stale_count += batch_state["stale_dropped"]
                     for sample_id in batch_state["sample_ids"]:
                         self._pending.pop(sample_id)
-                    self._put_prompts()
+                    if self.cfg.rollout.get("max_buffer_bytes", 0):
+                        self.agent_loop.release_rollout_bytes(
+                            batch_state["sample_ids"]
+                        ).wait()
+                    if not self.drain_before_training:
+                        self._put_prompts()
                 consumed_version = self.published_version
                 agent_metrics = MultiAgentLoopWorker.aggregate_metrics(
                     batch_state["agent_metrics"]
                 )
                 paused_states = []
+                if self.drain_before_training:
+                    with self.timer("drain_rollout"):
+                        drained_states = self.agent_loop.pause_rollouts().wait()
+                        if any(
+                            state["in_flight"] or state["waiting_for_buffer"]
+                            for state in drained_states
+                        ):
+                            raise RuntimeError(
+                                "Rollout drain returned with active episodes or pending results."
+                            )
+                        logger.info("Drained rollout workers: %s", drained_states)
+                        # Keep the drain bounded; queued prompts cannot start yet.
+                        self._put_prompts()
                 if self.release_rollout:
                     with self.timer("pause_rollout"):
                         paused_states = self.rollout.pause_generation().wait()
@@ -302,6 +340,10 @@ class AsyncAgentPPORunner(AgentPPORunner):
                     with self.timer("pause_rollout"):
                         paused_states = self.rollout.pause_generation().wait()
                 self._publish()
+                if self.drain_before_training and not (
+                    is_train_end or run_time_exceeded
+                ):
+                    self.agent_loop.resume_rollouts().wait()
 
             time_metrics = self.timer.consume_durations()
             time_metrics["training"] = actor_handle.consume_duration()
@@ -330,6 +372,8 @@ class AsyncAgentPPORunner(AgentPPORunner):
                     state["parked_requests"] for state in paused_states
                 ),
             }
+            if self.cfg.rollout.get("max_buffer_bytes", 0):
+                async_metrics.update(self._rollout_memory_metrics())
             logging_steps = (self.global_steps - 1) * self.cfg.algorithm.n_minibatches
             log_time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
 

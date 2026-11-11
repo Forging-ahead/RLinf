@@ -14,7 +14,10 @@
 
 """Channel-backed completion ordering, critic targets, and policy staleness."""
 
+import asyncio
 import copy
+from collections import deque
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,6 +37,31 @@ def channel(capacity=0):
         "async-completions", None, None, None, local_channel=LocalChannel(capacity)
     )
     return result
+
+
+class AsyncQueueChannel:
+    """Async transport double; LocalChannel only supports synchronous calls."""
+
+    def __init__(self, capacity=0):
+        self.queue = asyncio.Queue(capacity)
+
+    def put(self, item, async_op=False):
+        if async_op:
+            return SimpleNamespace(async_wait=lambda: self.queue.put(item))
+        self.queue.put_nowait(item)
+
+    def get(self, *, async_op):
+        assert async_op
+        return SimpleNamespace(async_wait=self.queue.get)
+
+    def get_nowait(self):
+        return self.queue.get_nowait()
+
+    def qsize(self):
+        return self.queue.qsize()
+
+    def empty(self):
+        return self.queue.empty()
 
 
 def trajectory(sample_id=0, versions=None):
@@ -158,3 +186,318 @@ def test_consumption_rejects_unpublished_weights():
     with pytest.raises(ValueError, match="newer than the published version"):
         consume(incoming, output, retry, published_version=1)
     assert output.empty() and retry.empty()
+
+
+@pytest.fixture
+def producer_worker(monkeypatch):
+    from omegaconf import OmegaConf
+
+    from rlinf.workers.agent.agent_loop import AgentLoopWorker, MultiAgentLoopWorker
+
+    def init_hardware(self, cfg, placement):
+        self.cfg = cfg
+        self._rank = 0
+        self._world_size = 1
+
+    monkeypatch.setattr(AgentLoopWorker, "__init__", init_hardware)
+    return lambda: MultiAgentLoopWorker(
+        OmegaConf.create(
+            {
+                "runner": {"task_type": "reasoning"},
+                "rollout": {"max_in_flight_rollouts": 2},
+                "data": {"rollout_batch_size": 2},
+            }
+        ),
+        None,
+    )
+
+
+def test_byte_backpressure_preserves_a_complete_batch_and_releases_consumed_results(
+    producer_worker,
+):
+    async def run():
+        worker = producer_worker()
+        worker.cfg.rollout.max_buffer_bytes = 1
+        incoming, outgoing = AsyncQueueChannel(), AsyncQueueChannel(8)
+        started = []
+
+        async def rollout(*, input_dict, **kwargs):
+            started.append(input_dict[0])
+            return trajectory(input_dict[0]).result, {}
+
+        worker.run_agentloop_rollout_group = rollout
+        for index in range(4):
+            incoming.put((index, [index], "answer"))
+        producer = asyncio.create_task(worker.run_async_rollout(incoming, outgoing))
+        try:
+            while outgoing.qsize() < 2:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert started == [0, 1]
+            assert worker.get_async_buffer_bytes()["memory_admission_paused"] == 1
+            consumed = [outgoing.get_nowait().sample_id for _ in range(2)]
+            assert consumed == [0, 1]
+            # The learner can drain safely while queued admissions wait for bytes.
+            await worker.pause_rollouts()
+            worker.release_rollout_bytes(consumed)
+            assert worker.get_async_buffer_bytes()["retained_bytes_estimate"] == 0
+            await asyncio.sleep(0)
+            assert started == [0, 1]
+            await worker.resume_rollouts()
+            while outgoing.qsize() < 2:
+                await asyncio.sleep(0)
+            assert [outgoing.get_nowait().sample_id for _ in range(2)] == [2, 3]
+        finally:
+            await worker.stop_rollouts()
+            await producer
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+
+def test_retained_bytes_count_tensor_storage_once():
+    from rlinf.data.schema.agent_trajectory import retained_size_bytes
+
+    tensor = torch.zeros(1024)
+    assert retained_size_bytes([tensor, tensor]) < 2 * tensor.nbytes
+    assert retained_size_bytes([tensor, tensor[:512]]) < 2 * tensor.nbytes
+
+
+@pytest.mark.parametrize(
+    "drain,in_flight,batch,capacity",
+    [(True, 4, 2, 4), (True, 2, 4, 4), (False, 4, 2, 4)],
+)
+def test_drain_admission_bound_leaves_room_for_every_remaining_result(
+    monkeypatch, drain, in_flight, batch, capacity
+):
+    pytest.importorskip("megatron.training")
+    from omegaconf import OmegaConf
+
+    from rlinf.runners.agent_ppo_runner import AgentPPORunner
+    from rlinf.runners.async_agent_ppo_runner import AsyncAgentPPORunner
+
+    def init_hardware(self, **kwargs):
+        self.cfg = OmegaConf.create(
+            {
+                "data": {"rollout_batch_size": batch},
+                "rollout": {
+                    "drain_before_training": drain,
+                    "max_in_flight_rollouts": in_flight,
+                    "rollout_buffer_capacity": capacity,
+                },
+            }
+        )
+        self.component_placement = SimpleNamespace(
+            get_hardware_ranks=lambda role: [0],
+            has_dedicated_actor_inference=False,
+            has_dedicated_critic_inference=False,
+        )
+        self.critic_output_channel = channel()
+
+    monkeypatch.setattr(AgentPPORunner, "__init__", init_hardware)
+    monkeypatch.setattr(
+        Channel, "create", lambda name, **kwargs: channel(kwargs["maxsize"])
+    )
+    runner = AsyncAgentPPORunner()
+    if drain:
+        assert runner.prompt_capacity >= in_flight
+        assert runner.prompt_capacity - batch <= capacity
+    else:
+        assert runner.prompt_capacity == capacity + in_flight
+
+
+def test_producer_drain_finishes_active_successes_and_failures_before_resuming(
+    producer_worker,
+):
+    async def run():
+        worker = producer_worker()
+        incoming, outgoing = AsyncQueueChannel(), AsyncQueueChannel(4)
+        started, ready, finish = [], asyncio.Event(), asyncio.Event()
+
+        async def rollout(*, input_dict, **kwargs):
+            index = input_dict[0]
+            started.append(index)
+            if len(started) == 2:
+                ready.set()
+            await finish.wait()
+            result = trajectory(index).result
+            result.rewards = [float(index != 1)] * result.num_sequence
+            return result, {}
+
+        worker.run_agentloop_rollout_group = rollout
+        for index in range(4):
+            incoming.put((index, [index], "answer"))
+        producer = asyncio.create_task(worker.run_async_rollout(incoming, outgoing))
+        try:
+            await ready.wait()
+            draining = asyncio.create_task(worker.pause_rollouts())
+            await asyncio.sleep(0)
+            assert not draining.done()
+            finish.set()
+            assert await draining == {"in_flight": 0, "waiting_for_buffer": 0}
+            await asyncio.sleep(0)
+            assert started == [0, 1]
+            assert worker.get_async_rollout_state() == {
+                "in_flight": 0,
+                "waiting_for_buffer": 0,
+            }
+            first = [outgoing.get_nowait(), outgoing.get_nowait()]
+            assert [entry.sample_id for entry in first] == [0, 1]
+            assert [entry.result.rewards[-1] for entry in first] == [1.0, 0.0]
+            await worker.resume_rollouts()
+            while outgoing.qsize() < 2:
+                await asyncio.sleep(0)
+            assert started == [0, 1, 2, 3]
+            assert [outgoing.get_nowait().sample_id for _ in range(2)] == [2, 3]
+        finally:
+            if not producer.done():
+                await worker.stop_rollouts()
+            await producer
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+
+def test_stopping_a_paused_producer_does_not_start_queued_episodes(producer_worker):
+    async def run():
+        worker = producer_worker()
+        incoming, outgoing = AsyncQueueChannel(), AsyncQueueChannel(2)
+
+        async def rollout(**kwargs):
+            pytest.fail("a paused producer must not start an episode")
+
+        worker.run_agentloop_rollout_group = rollout
+        assert await worker.pause_rollouts() == {
+            "in_flight": 0,
+            "waiting_for_buffer": 0,
+        }
+        for index in range(2):
+            incoming.put((index, [index], "answer"))
+        producer = asyncio.create_task(worker.run_async_rollout(incoming, outgoing))
+        while not hasattr(worker, "_async_rollout_group"):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await worker.stop_rollouts()
+        await producer
+        assert outgoing.empty()
+        assert worker.get_async_rollout_state() == {
+            "in_flight": 0,
+            "waiting_for_buffer": 0,
+        }
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+
+def test_producer_drain_waits_for_a_blocked_result_send(producer_worker):
+    async def run():
+        worker = producer_worker()
+        incoming, outgoing = AsyncQueueChannel(), AsyncQueueChannel(1)
+        outgoing.put(trajectory(9))
+        incoming.put((0, [0], "answer"))
+
+        async def rollout(**kwargs):
+            return trajectory(0).result, {}
+
+        worker.run_agentloop_rollout_group = rollout
+        producer = asyncio.create_task(worker.run_async_rollout(incoming, outgoing))
+        try:
+            while not worker.get_async_rollout_state()["waiting_for_buffer"]:
+                await asyncio.sleep(0)
+            draining = asyncio.create_task(worker.pause_rollouts())
+            await asyncio.sleep(0)
+            assert not draining.done()
+            assert outgoing.get_nowait().sample_id == 9
+            assert await draining == {"in_flight": 0, "waiting_for_buffer": 0}
+            assert outgoing.get_nowait().sample_id == 0
+            assert worker.get_async_rollout_state() == {
+                "in_flight": 0,
+                "waiting_for_buffer": 0,
+            }
+        finally:
+            if not producer.done():
+                await worker.stop_rollouts()
+            await producer
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+
+@pytest.fixture
+def async_data_runner():
+    pytest.importorskip("megatron.training")
+
+    from omegaconf import OmegaConf
+    from torch.utils.data import RandomSampler, SequentialSampler
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    from rlinf.data.datasets.reasoning import collate_fn
+    from rlinf.runners.async_agent_ppo_runner import AsyncAgentPPORunner
+
+    items = [
+        SimpleNamespace(
+            prompt=[i],
+            length=1,
+            idx=i,
+            answer=[str(i)],
+            solution=None,
+            image_data=None,
+            prompt_text=None,
+            meta=None,
+            multi_modal_inputs=None,
+        )
+        for i in range(32)
+    ]
+
+    def create(shuffle):
+        runner = object.__new__(AsyncAgentPPORunner)
+        runner.cfg = OmegaConf.create(
+            {
+                "runner": {"max_epochs": 10},
+                "data": {"rollout_batch_size": 8, "shuffle": shuffle},
+                "rollout": {"rollout_buffer_capacity": 8},
+            }
+        )
+        runner.max_steps = 40
+        generator = torch.Generator().manual_seed(1234)
+        sampler = (
+            RandomSampler(items, generator=generator)
+            if shuffle
+            else SequentialSampler(items)
+        )
+        runner.train_dataloader = StatefulDataLoader(
+            items,
+            batch_size=8,
+            drop_last=True,
+            num_workers=0,
+            sampler=sampler,
+            collate_fn=collate_fn,
+        )
+        runner._next_sample_id = runner._producer_epoch = runner._stale_count = 0
+        runner._prompt_queue = deque()
+        runner._data_iterator = None
+        runner._pending = {}
+        runner.async_rollout_channel = channel()
+        runner.published_version = runner.actor_version = runner.actor_updates = 1
+        runner.critic_updates = 2
+        return runner
+
+    return create
+
+
+@pytest.mark.parametrize(
+    "shuffle,produced", [(True, 11), (True, 32), (True, 40), (True, 104), (False, 40)]
+)
+def test_async_resume_preserves_producer_sampler_order(
+    async_data_runner, shuffle, produced
+):
+    reference = async_data_runner(shuffle)
+    reference.global_steps = max(1, produced // 8 - 2)
+    for _ in range(produced):
+        prompt = reference._next_prompt()
+    reference._pending = {prompt[0]: prompt}
+    snapshot = copy.deepcopy(reference._save_data_state())
+    expected = [reference._next_prompt() for _ in range(48)]
+
+    restored = async_data_runner(shuffle)
+    restored.global_steps = reference.global_steps
+    restored._load_data_state(snapshot)
+
+    assert [restored._next_prompt() for _ in range(48)] == expected
+    assert restored._restored_pending == [prompt]

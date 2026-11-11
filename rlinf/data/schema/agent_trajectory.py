@@ -14,6 +14,7 @@
 
 """Complete agent trajectories, buffered batches, and fixed token targets."""
 
+import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,37 @@ import torch
 from rlinf.algorithms.registry import get_adv_and_returns
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.scheduler import Channel
+
+
+def retained_size_bytes(value: Any) -> int:
+    """Estimate Python heap plus unique tensor storage, without serializing a copy.
+
+    This is an admission signal, not a process RSS or a hard memory reservation.
+    File-backed images count only their references; their bounded pixel cache has
+    a separate budget. Shared objects and tensor views are counted once.
+    """
+    seen, storages = set(), set()
+
+    def size(item):
+        if id(item) in seen:
+            return 0
+        seen.add(id(item))
+        total = sys.getsizeof(item)
+        if torch.is_tensor(item):
+            storage = item.untyped_storage()
+            key = (str(item.device), storage.data_ptr())
+            if key not in storages:
+                storages.add(key)
+                total += storage.nbytes()
+        elif isinstance(item, dict):
+            total += sum(size(key) + size(val) for key, val in item.items())
+        elif isinstance(item, (list, tuple, set, deque)):
+            total += sum(size(val) for val in item)
+        elif hasattr(item, "__dict__"):
+            total += size(vars(item))
+        return total
+
+    return size(value)
 
 
 def _action_positions(result: DynamicRolloutResult, row: int) -> torch.Tensor:

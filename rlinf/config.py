@@ -1900,6 +1900,20 @@ def validate_async_agent_ppo_cfg(cfg: DictConfig, task: str) -> None:
         raise ValueError(
             "rollout.max_weight_staleness must be null or a nonnegative integer."
         )
+    drain = cfg.rollout.get("drain_before_training", False)
+    buffer_bytes = cfg.rollout.get("max_buffer_bytes", 0)
+    if type(buffer_bytes) is not int or buffer_bytes < 0:
+        raise ValueError("rollout.max_buffer_bytes must be a nonnegative integer.")
+    if type(drain) is not bool:
+        raise ValueError("rollout.drain_before_training must be a boolean.")
+    if (
+        drain
+        and cfg.rollout.rollout_buffer_capacity < cfg.rollout.max_in_flight_rollouts
+    ):
+        raise ValueError(
+            "rollout.drain_before_training requires rollout.rollout_buffer_capacity "
+            ">= rollout.max_in_flight_rollouts so active episodes can finish."
+        )
 
 
 def validate_reasoning_eval_cfg(cfg: DictConfig) -> DictConfig:

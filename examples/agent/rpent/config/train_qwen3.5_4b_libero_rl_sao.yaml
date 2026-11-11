@@ -26,6 +26,8 @@ critic:
 
 rollout:
   max_weight_staleness: null
+  # Finish active episodes before pausing generation on shared training GPUs.
+  drain_before_training: false
   # null resolves to twice data.rollout_batch_size in validate_cfg.
   max_in_flight_rollouts: null
   rollout_buffer_capacity: null

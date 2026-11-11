@@ -270,6 +270,20 @@ loads the deployment model and preserves its unsynchronized vision weights acros
 offload. The first weight sync replaces the language weights with the restored
 actor's weights. ``rollout.validate_weight_first_sync`` only checks a fresh start.
 
+Async checkpoints also retain the producer epoch and queued prompts. On resume,
+the sampler advances through the producer's completed epochs before restoring its
+saved cursor; the producer can be ahead of the learner.
+
+For shared training and rollout GPUs, set ``rollout.drain_before_training=true``
+when an update can exceed a planner request or episode timeout. New episodes then
+wait while active episodes finish with their original budgets, before generation
+is paused for training. Every completed outcome stays in the buffer. Admissions
+resume after policy publication, except when the process is ending. The option
+defaults to false and requires ``rollout_buffer_capacity >= max_in_flight_rollouts``
+so draining cannot block on a full buffer. It does not extend task timeouts.
+Admitted prompts are bounded so all remainders fit after consuming a learner
+batch; queued inputs are replenished only after the workers are quiescent.
+
 To serve a trained policy, for example for evaluation, write it into a copy of
 the served model:
 

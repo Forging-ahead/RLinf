@@ -28,7 +28,7 @@ from rlinf.agents.tool_call.schema import (
     ToolResponse,
 )
 from rlinf.algorithms.registry import get_toolcall_parser
-from rlinf.data.schema.agent_trajectory import BufferedTrajectory
+from rlinf.data.schema.agent_trajectory import BufferedTrajectory, retained_size_bytes
 from rlinf.data.schema.reasoning_requests import RolloutRequest
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult, RolloutResult
 from rlinf.models.tokenization.hf import hf_tokenizer
@@ -472,6 +472,13 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         self.is_eval = self.cfg.runner.task_type == "reasoning_eval"
         self._async_in_flight = 0
         self._async_sending = 0
+        self._async_admission = asyncio.Event()
+        self._async_admission.set()
+        self._async_idle = asyncio.Event()
+        self._async_idle.set()
+        self._async_retained_bytes = {}
+        self._async_memory_admission = asyncio.Event()
+        self._async_memory_admission.set()
 
     async def run_async_rollout(
         self, input_channel: Channel, output_channel: Channel
@@ -491,26 +498,43 @@ class MultiAgentLoopWorker(AgentLoopWorker):
 
         async def produce(prompt: tuple[int, list[int], Any]) -> None:
             sample_id, prompt_ids, answer = prompt
-            self._async_in_flight += 1
             try:
-                result, metrics = await self.run_agentloop_rollout_group(
-                    input_dict=prompt_ids,
-                    answer=answer,
-                    group_size=1,
-                    output_channel=None,
-                )
+                await self._async_admission.wait()
+                await self._async_memory_admission.wait()
+                # A memory wait can outlast a pause requested by the learner.
+                await self._async_admission.wait()
+                self._async_idle.clear()
+                self._async_in_flight += 1
+                try:
+                    result, metrics = await self.run_agentloop_rollout_group(
+                        input_dict=prompt_ids,
+                        answer=answer,
+                        group_size=1,
+                        output_channel=None,
+                    )
+                finally:
+                    self._async_in_flight -= 1
+                result.rollout_ids = [sample_id] * result.num_sequence
+                self._async_sending += 1
+                try:
+                    entry = BufferedTrajectory(
+                        sample_id, prompt_ids, answer, result, metrics
+                    )
+                    if self.cfg.rollout.get("max_buffer_bytes", 0):
+                        self._async_retained_bytes[sample_id] = retained_size_bytes(
+                            entry
+                        )
+                        self._update_memory_admission()
+                    await output_channel.put(
+                        entry,
+                        async_op=True,
+                    ).async_wait()
+                finally:
+                    self._async_sending -= 1
             finally:
-                self._async_in_flight -= 1
-            result.rollout_ids = [sample_id] * result.num_sequence
-            self._async_sending += 1
-            try:
-                await output_channel.put(
-                    BufferedTrajectory(sample_id, prompt_ids, answer, result, metrics),
-                    async_op=True,
-                ).async_wait()
-            finally:
-                self._async_sending -= 1
                 slots.release()
+                if not self._async_in_flight and not self._async_sending:
+                    self._async_idle.set()
 
         async with create_task_group() as group:
             self._async_rollout_group = group
@@ -521,6 +545,47 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                     slots.release()
                     break
                 group.start_soon(produce, prompt)
+
+    async def pause_rollouts(self) -> dict[str, int]:
+        """Stop new admissions and wait for active episodes and sends to finish."""
+        self._async_admission.clear()
+        await self._async_idle.wait()
+        return self.get_async_rollout_state()
+
+    async def resume_rollouts(self) -> None:
+        """Allow queued prompts to start after the learner publishes its policy."""
+        self._async_admission.set()
+
+    def _update_memory_admission(self) -> None:
+        budget = self.cfg.rollout.get("max_buffer_bytes", 0)
+        if not budget:
+            self._async_memory_admission.set()
+            return
+        # Preserve enough results to assemble one complete learner batch. A
+        # byte limit must never strand the learner waiting for missing samples.
+        minimum = (
+            self.cfg.data.rollout_batch_size + self._world_size - 1
+        ) // self._world_size
+        if (
+            budget
+            and len(self._async_retained_bytes) >= minimum
+            and sum(self._async_retained_bytes.values()) * self._world_size >= budget
+        ):
+            self._async_memory_admission.clear()
+        else:
+            self._async_memory_admission.set()
+
+    def release_rollout_bytes(self, sample_ids: list[int]) -> None:
+        """Acknowledge consumed results; retain neither their payload nor a copy."""
+        for sample_id in sample_ids:
+            self._async_retained_bytes.pop(sample_id, None)
+        self._update_memory_admission()
+
+    def get_async_buffer_bytes(self) -> dict:
+        return {
+            "retained_bytes_estimate": sum(self._async_retained_bytes.values()),
+            "memory_admission_paused": int(not self._async_memory_admission.is_set()),
+        }
 
     async def stop_rollouts(self) -> None:
         """Stop the producer and unblock its pending channel read."""
