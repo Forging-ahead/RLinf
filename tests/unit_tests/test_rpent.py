@@ -821,6 +821,7 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
         cfg = compose(config_name=config_name, overrides=list(overrides))
     # Templates require deployment paths; CPU tests supply explicit stand-ins.
     for name, value in {
+        "runner.output_dir": "/test/training",
         "data.train_data_paths": ["/test/tasks.jsonl"],
         "tools.rpent.python": "/test/env/bin/python",
         "tools.rpent.libero_config_path": "/test/libero-config",
@@ -868,6 +869,10 @@ def test_example_configs_match_the_standalone_planner(config_name):
     assert sampling.max_new_tokens == 32768
     assert cfg.agentloop.max_turns == 100
     assert cfg.agentloop.observation_mode == "adaptive"
+    assert (
+        cfg.rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
+        == "rlinf.hybrid_engines.sglang.multimodal"
+    )
     if cfg.runner.task_type == "reasoning":
         for component in (cfg.actor, cfg.critic):
             assert not component.megatron.ckpt_convertor.hf_model_path.endswith("-text")
@@ -1507,9 +1512,17 @@ def test_clean_training_profiles_inherit_without_deployment_paths():
     for parent, name in zip(names, names[1:], strict=False):
         cfg = OmegaConf.load(directory / f"{name}.yaml")
         assert list(cfg.defaults) == [parent, "_self_"]
-        if name != names[-1]:
-            assert "/mnt/" not in (directory / f"{name}.yaml").read_text()
-            assert "/path/to/" not in (directory / f"{name}.yaml").read_text()
+        assert "/mnt/" not in (directory / f"{name}.yaml").read_text()
+        assert "/path/to/" not in (directory / f"{name}.yaml").read_text()
+    raw_local = OmegaConf.load(directory / f"{names[-1]}.yaml")
+    assert OmegaConf.missing_keys(raw_local) == {
+        "runner.output_dir",
+        "data.train_data_paths",
+        "tools.rpent.python",
+        "tools.rpent.libero_config_path",
+        "tools.rpent.output_dir",
+        "rollout.model.model_path",
+    }
     local = compose(config_name=names[-1])
     assert not OmegaConf.missing_keys(local)
 

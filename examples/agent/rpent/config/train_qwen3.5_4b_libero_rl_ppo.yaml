@@ -62,6 +62,7 @@ tools:
 rollout:
   # The SGLang memory saver requires the non-expandable allocator.
   env_vars:
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
     PYTORCH_ALLOC_CONF: expandable_segments:False
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   model:

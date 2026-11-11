@@ -191,6 +191,7 @@ jobs:
               - 'rlinf/runners/reasoning_runner.py'
               - 'rlinf/runners/async_agent_ppo_runner.py'
               - 'examples/agent/rpent/checkpoint.py'
+              - 'examples/agent/rpent/eval.py'
               - 'examples/agent/rpent/config/**'
               - 'rlinf/robotics/**'
               # Unit tests import env modules directly (robot task envs, the
