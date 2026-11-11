@@ -28,13 +28,12 @@ The package versions below describe prior runtime compatibility. A clean install
 
 ## Install code and environments
 
-Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL libraries, Git and `uv`. Choose a shared root, or reproduce the same paths on every node. Use the delivered RLinf repository or bundle and the pinned RPent revision below. This personal branch has not been published: obtain the source from its owner and compare `rev-parse HEAD` with the supplied commit before installation.
+Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL libraries, Git and `uv`. Choose a shared root, or reproduce the same paths on every node. Clone the development branch from the personal fork below and use the pinned RPent revision. Record `rev-parse HEAD` before installation so collaborators can reproduce the same source revision.
 
 ```bash
 export STACK_ROOT="$HOME/rpent-stack"
 mkdir -p "$STACK_ROOT/repos" "$STACK_ROOT/envs" "$STACK_ROOT/models" "$STACK_ROOT/data"
-export RLINF_SOURCE=/path/to/received/RLinf  # repository or Git bundle from the owner
-git clone --branch dev/rpent-rlinf-baseline "$RLINF_SOURCE" "$STACK_ROOT/repos/RLinf"
+git clone --branch dev/rpent-rlinf-baseline https://github.com/Sonorous281/RLinf.git "$STACK_ROOT/repos/RLinf"
 git -C "$STACK_ROOT/repos/RLinf" rev-parse HEAD
 git clone --branch rpent-ppo https://github.com/zhexuanxu/RPent.git "$STACK_ROOT/repos/RPent"
 git -C "$STACK_ROOT/repos/RPent" checkout f11eee5910b74d132363a526ad385fa828ad4a26

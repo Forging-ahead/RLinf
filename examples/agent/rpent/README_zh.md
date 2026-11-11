@@ -28,13 +28,12 @@
 
 ## 安装代码与环境
 
-使用 Linux NVIDIA 主机，准备兼容驱动、CUDA 12.8 toolkit、EGL/OpenGL 库、Git 和 `uv`。选择共享根目录；无共享存储时，各节点需保持相同路径。使用交付的 RLinf 仓库或 bundle，以及下方固定的 RPent commit。个人分支尚未推送：从负责人取得源码，并核对 `rev-parse HEAD` 与交付 SHA 一致后再安装。
+使用 Linux NVIDIA 主机，准备兼容驱动、CUDA 12.8 toolkit、EGL/OpenGL 库、Git 和 `uv`。选择共享根目录；无共享存储时，各节点需保持相同路径。从下方个人仓库克隆开发分支，并使用固定的 RPent commit。安装前记录 `rev-parse HEAD`，便于协作者复现同一份源码。
 
 ```bash
 export STACK_ROOT="$HOME/rpent-stack"
 mkdir -p "$STACK_ROOT/repos" "$STACK_ROOT/envs" "$STACK_ROOT/models" "$STACK_ROOT/data"
-export RLINF_SOURCE=/path/to/received/RLinf  # repository or Git bundle from the owner
-git clone --branch dev/rpent-rlinf-baseline "$RLINF_SOURCE" "$STACK_ROOT/repos/RLinf"
+git clone --branch dev/rpent-rlinf-baseline https://github.com/Sonorous281/RLinf.git "$STACK_ROOT/repos/RLinf"
 git -C "$STACK_ROOT/repos/RLinf" rev-parse HEAD
 git clone --branch rpent-ppo https://github.com/zhexuanxu/RPent.git "$STACK_ROOT/repos/RPent"
 git -C "$STACK_ROOT/repos/RPent" checkout f11eee5910b74d132363a526ad385fa828ad4a26
