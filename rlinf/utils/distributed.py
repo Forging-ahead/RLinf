@@ -383,44 +383,57 @@ def _to_cpu(value):
     return value
 
 
-def _all_gather_cpu_tensors(batches, rows_per_rank, group):
-    """All-gather a rank's CPU tensor batch into one dict per data-parallel rank.
-
-    Entries are grouped by dtype and joined into a single flat buffer, so each
-    dtype costs one collective instead of one per entry. A rank's row count can
-    differ from its peers', so each buffer is zero-padded to the longest rank's
-    length and sliced back by that rank's own row count.
-    """
-    world_size = len(rows_per_rank)
-    gathered_batches = [{} for _ in range(world_size)]
-    keys_by_dtype: dict[torch.dtype, list[str]] = {}
-    for key in sorted(batches):
-        keys_by_dtype.setdefault(batches[key].dtype, []).append(key)
-
-    for dtype, keys in keys_by_dtype.items():
-        # One row of one entry: every entry of a dtype shares its trailing dims.
-        bytes_per_row = sum(
-            int(np.prod(batches[key].shape[1:], dtype=np.int64))
-            * batches[key].element_size()
-            for key in keys
+def _exchange_tensor_rows(values, row_counts, partitions, rank, group, pad):
+    """Exchange only assigned rows, retaining at most one peer's transfer buffer."""
+    starts = list(accumulate((0, *row_counts)))
+    assigned = partitions[rank]
+    output = pad.expand(len(assigned), *pad.shape[1:]).clone()
+    local_slots = [
+        slot
+        for slot, index in enumerate(assigned)
+        if starts[rank] <= index < starts[rank + 1]
+    ]
+    local_indices = [assigned[slot] - starts[rank] for slot in local_slots]
+    output[local_slots] = values[local_indices]
+    device = (
+        "cpu"
+        if torch.distributed.get_backend(group) == "gloo"
+        else Worker.torch_platform.current_device()
+    )
+    for peer in range(len(row_counts)):
+        if peer == rank:
+            continue
+        send_indices = [
+            index - starts[rank]
+            for index in partitions[peer]
+            if starts[rank] <= index < starts[rank + 1]
+        ]
+        receive_slots = [
+            slot
+            for slot, index in enumerate(assigned)
+            if starts[peer] <= index < starts[peer + 1]
+        ]
+        outgoing = values[send_indices].to(device).contiguous()
+        incoming = torch.empty(
+            (len(receive_slots), *values.shape[1:]),
+            dtype=values.dtype,
+            device=device,
         )
-        flat = torch.cat([batches[key].reshape(-1).view(torch.uint8) for key in keys])
-        padded = torch.zeros(max(rows_per_rank) * bytes_per_row, dtype=torch.uint8)
-        padded[: flat.numel()] = flat
-        chunks = [torch.empty_like(padded) for _ in range(world_size)]
-        if padded.numel():
-            torch.distributed.all_gather(chunks, padded, group=group)
-            del padded
-        for gathered_batch, chunk, rows in zip(gathered_batches, chunks, rows_per_rank):
-            offset = 0
-            for key in keys:
-                shape = (rows, *batches[key].shape[1:])
-                size = int(np.prod(shape, dtype=np.int64)) * batches[key].element_size()
-                gathered_batch[key] = (
-                    chunk[offset : offset + size].view(dtype).reshape(shape)
-                )
-                offset += size
-    return gathered_batches
+        peer_global = torch.distributed.get_global_rank(group, peer)
+        # Matching peer order also covers ranks that send or receive zero rows.
+        if rank < peer:
+            if outgoing.numel():
+                torch.distributed.send(outgoing, peer_global, group)
+            if incoming.numel():
+                torch.distributed.recv(incoming, peer_global, group)
+        else:
+            if incoming.numel():
+                torch.distributed.recv(incoming, peer_global, group)
+            if outgoing.numel():
+                torch.distributed.send(outgoing, peer_global, group)
+        output[receive_slots] = incoming.cpu()
+        del outgoing, incoming
+    return output
 
 
 def _auxiliary_plan(values, row_counts, partitions, rank, pad_value):
@@ -832,43 +845,22 @@ class RolloutDataBalance(UserDict):
         rollout_batches = {k: v.cpu() for k, v in rollout_batches.items()}
         tensor_pad = {k: v.cpu() for k, v in tensor_pad.items()}
 
-        # CPU tensor collectives need Gloo. NCCL-only callers retain the
-        # object-collective path, which stages its own exchange buffers.
-        if torch.distributed.get_backend(object_group) == "gloo":
-            gathered_rollout_batches = _all_gather_cpu_tensors(
-                rollout_batches, [manifest[2] for manifest in manifests], object_group
-            )
-        else:
-            gathered_rollout_batches = [None] * dp_world_size
-            torch.distributed.all_gather_object(
-                gathered_rollout_batches, rollout_batches, group=object_group
-            )
-
-        global_batch_size = sum(
-            b["input_ids"].size(0) for b in gathered_rollout_batches
+        # Only lengths are global; full token tensors stay with their owners.
+        gathered_lengths = [None] * dp_world_size
+        torch.distributed.all_gather_object(
+            gathered_lengths,
+            (
+                rollout_batches["prompt_lengths"] + rollout_batches["response_lengths"]
+            ).tolist(),
+            group=object_group,
         )
-
-        # 2. Merge data and pad data to fixed length
-        if global_batch_size % (dp_world_size * split_fix_chunk) == 0:
-            pad_size = 0
-        else:
-            pad_size = (dp_world_size * split_fix_chunk) - (
-                global_batch_size % (dp_world_size * split_fix_chunk)
-            )
-        # make sure dp_world_size * split_fix_chunk (dp size * self.num_train_steps * self.cfg.actor.micro_batch_size) can be divided by global_batch_size
-        merged_rollout_batches = {}
-        for key in rollout_batches.keys():
-            merged_rollout_batches[key] = torch.cat(
-                [rollout_batches[key] for rollout_batches in gathered_rollout_batches]
-                + [tensor_pad[key]] * pad_size,
-                dim=0,
-            )
-
-        # 3. get length of each sample
-        sample_lengths = (
-            merged_rollout_batches["prompt_lengths"]
-            + merged_rollout_batches["response_lengths"]
-        ).tolist()
+        sample_lengths = [length for lengths in gathered_lengths for length in lengths]
+        global_batch_size = sum(manifest[2] for manifest in manifests)
+        pad_size = -global_batch_size % (dp_world_size * split_fix_chunk)
+        pad_length = int(
+            tensor_pad["prompt_lengths"][0] + tensor_pad["response_lengths"][0]
+        )
+        sample_lengths.extend([pad_length] * pad_size)
 
         # 4. Calc partitions
         # Every rank derives the same assignment from the gathered lengths, so
@@ -878,8 +870,6 @@ class RolloutDataBalance(UserDict):
             k_partitions=dp_world_size,
             equal_size=True,
         )
-        self_partition = partitions[dp_rank]
-
         # 5. Move each payload row to the ranks that train it
         merged_auxiliary = {}
         for key, local in auxiliary.items():
@@ -897,7 +887,15 @@ class RolloutDataBalance(UserDict):
 
         # 6. Get indices of samples for current rank
         selected_rollout_batches = {
-            k: v[self_partition] for k, v in merged_rollout_batches.items()
+            key: _exchange_tensor_rows(
+                rollout_batches[key],
+                [manifest[2] for manifest in manifests],
+                partitions,
+                dp_rank,
+                object_group,
+                tensor_pad[key],
+            )
+            for key in local_tensors
         }
         selected_rollout_batches.update(merged_auxiliary)
 

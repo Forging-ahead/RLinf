@@ -1014,28 +1014,6 @@ def test_dynamic_balance_tolerates_a_rank_without_image_rows(monkeypatch, tmp_pa
     assert balanced["input_ids"].shape[0] == 4
 
 
-def test_flat_gather_handles_ranks_with_different_row_counts(monkeypatch, tmp_path):
-    """A rank may hold fewer rows than its peer; the gather pads to the longest
-    and every rank slices back its own share."""
-    from rlinf.utils.distributed import _all_gather_cpu_tensors
-
-    torch.distributed.init_process_group(
-        "gloo", init_method=(tmp_path / "flat-gather").as_uri(), rank=0, world_size=1
-    )
-    try:
-        batches = {
-            "input_ids": torch.zeros(2, 4, dtype=torch.long),
-            "prompt_lengths": torch.ones(2, dtype=torch.int32),
-        }
-        gathered = _all_gather_cpu_tensors(batches, [2], torch.distributed.group.WORLD)
-    finally:
-        torch.distributed.destroy_process_group()
-
-    assert len(gathered) == 1
-    assert gathered[0]["input_ids"].shape == (2, 4)
-    assert gathered[0]["prompt_lengths"].dtype == torch.int32
-
-
 def test_payload_exchange_moves_only_the_rows_a_rank_trains():
     """The assignment decides delivery: no rank keeps payloads it will not use."""
     from rlinf.utils.distributed import _auxiliary_plan
@@ -2287,3 +2265,80 @@ def test_multimodal_right_padding_trim_keeps_dummy_rows_and_full_shape(
     assert output.shape == (1, 16, 1)
     torch.testing.assert_close(output[0, :valid, 0], tokens[0, :valid].float())
     assert output[0, valid:].count_nonzero() == 0
+
+
+def _dynamic_balance_partition_rank(rank, store):
+    from datetime import timedelta
+
+    from rlinf.utils.data_iter_utils import get_seqlen_balanced_partitions
+    from rlinf.utils.distributed import RolloutDataBalance
+
+    counts = [2, 1, 0]
+    start = sum(counts[:rank])
+    all_ids = torch.arange(3 * 9).reshape(3, 9)
+    lengths = torch.tensor([3, 7, 5], dtype=torch.int32)
+    rows = slice(start, start + counts[rank])
+    batch = {
+        "input_ids": all_ids[rows],
+        "prompt_lengths": lengths[rows],
+        "response_lengths": torch.ones(counts[rank], dtype=torch.int32),
+        "returns": all_ids[rows].float() / 10,
+        "response_mask": all_ids[rows] % 2 == 0,
+    }
+    if rank == 0:
+        batch["multi_modal_inputs"] = [{"row": 0}, {"row": 1}]
+    pad = {
+        key: torch.zeros((1, *value.shape[1:]), dtype=value.dtype)
+        for key, value in batch.items()
+        if torch.is_tensor(value)
+    }
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{store}",
+        rank=rank,
+        world_size=3,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        # Global tensor payload replication is the memory regression under test.
+        with pytest.MonkeyPatch.context() as patch:
+
+            def reject_full_gather(*args, **kwargs):
+                raise AssertionError("Global token tensors must not be all-gathered")
+
+            patch.setattr(torch.distributed, "all_gather", reject_full_gather)
+            balanced = RolloutDataBalance.from_rollout_batches_dynamic(
+                batch,
+                3,
+                rank,
+                torch.distributed.group.WORLD,
+                pad,
+                2,
+                get_seqlen_balanced_partitions,
+            )
+        partition = get_seqlen_balanced_partitions(
+            [4, 8, 6, 0, 0, 0],
+            3,
+            equal_size=True,
+        )[rank]
+        for key, source in {
+            "input_ids": all_ids,
+            "prompt_lengths": lengths,
+            "response_lengths": torch.ones(3, dtype=torch.int32),
+            "returns": all_ids.float() / 10,
+            "response_mask": all_ids % 2 == 0,
+        }.items():
+            expected = torch.cat([source, pad[key].expand(3, *source.shape[1:])])
+            torch.testing.assert_close(balanced[key], expected[partition])
+        expected_images = [{"row": 0}, {"row": 1}, None, None, None, None]
+        assert balanced["multi_modal_inputs"] == [expected_images[i] for i in partition]
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_dynamic_balance_exchanges_only_assigned_rows(tmp_path):
+    torch.multiprocessing.spawn(
+        _dynamic_balance_partition_rank,
+        args=(str(tmp_path / "balance-store"),),
+        nprocs=3,
+    )
