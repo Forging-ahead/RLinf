@@ -14,19 +14,30 @@
 |---|---|
 | `train_qwen3.5_4b_libero_rl_ppo` | 同步 PPO 模板 |
 | `train_qwen3.5_4b_libero_rl_sao` | 异步 SAO 模板 |
-| `train_qwen3.5_4b_libero_rl_sao_local` | 含本地部署路径的最终启动配置 |
+| `train_qwen3.5_4b_libero_rl_sao_local` | 需自行填写路径的启动配置 |
 | `train_qwen3.5_4b_libero_rl_sao_3node` | 两台模型节点共享 16 卡运行 SAO，另加一台环境节点 |
 | `eval_qwen3.5_4b_libero_rl` | 多模态评测模板 |
 
+## 开发基线与实验边界
+
+本分支基于 zhexuan 的 `rpent-ppo` commit `f351c57e62818b18315ed4b2194312a44cafb697`。新增内容按职责拆成带 sign-off 的提交：图像 Token 保真及延迟加载、按目标交换 rollout 行、分块重算 logprob、rollout 准入背压与生产顺序恢复、端口范围分配，以及请求和评测诊断。用 `git log --reverse f351c57e..HEAD` 查看改动归属与依赖顺序。
+
+正在运行的 Batch64/Env128 实验还有启动覆盖项和部署代码。这份可移植模板默认 Batch128/Env256、一个 SAM3 服务、100 轮，Thinking 只受总回复预算约束；不包含实验的 Thinking512 强制闭合、H/GD 远程传输、四 SAM 布局、CP3 专用恢复包装，以及维护和审计脚本。因此直接运行此 YAML 不等于复现当前实验。原实验 checkout 和产物保持独立。
+
+下方软件版本记录历史运行兼容性。接收方仍需在自己的机器验证干净安装、SGLang 图像请求与 logprob、完整 learner update 和 checkpoint 恢复；CPU 测试不能证明 GPU 容量或学习效果。
+
 ## 安装代码与环境
 
-使用 Linux NVIDIA 主机，准备兼容驱动、CUDA 12.8 toolkit、EGL/OpenGL 库、Git 和 `uv`。选择共享根目录；无共享存储时，各节点需保持相同路径。下列功能分支包含此集成的两端实现，不能假设其他官方 main 版本也包含这些模块。
+使用 Linux NVIDIA 主机，准备兼容驱动、CUDA 12.8 toolkit、EGL/OpenGL 库、Git 和 `uv`。选择共享根目录；无共享存储时，各节点需保持相同路径。使用交付的 RLinf 仓库或 bundle，以及下方固定的 RPent commit。个人分支尚未推送：从负责人取得源码，并核对 `rev-parse HEAD` 与交付 SHA 一致后再安装。
 
 ```bash
 export STACK_ROOT="$HOME/rpent-stack"
 mkdir -p "$STACK_ROOT/repos" "$STACK_ROOT/envs" "$STACK_ROOT/models" "$STACK_ROOT/data"
-git clone --branch rpent-ppo https://github.com/zhexuanxu/RLinf.git "$STACK_ROOT/repos/RLinf"
+export RLINF_SOURCE=/path/to/received/RLinf  # repository or Git bundle from the owner
+git clone --branch dev/rpent-rlinf-baseline "$RLINF_SOURCE" "$STACK_ROOT/repos/RLinf"
+git -C "$STACK_ROOT/repos/RLinf" rev-parse HEAD
 git clone --branch rpent-ppo https://github.com/zhexuanxu/RPent.git "$STACK_ROOT/repos/RPent"
+git -C "$STACK_ROOT/repos/RPent" checkout f11eee5910b74d132363a526ad385fa828ad4a26
 git clone https://github.com/NVIDIA/Megatron-LM.git "$STACK_ROOT/repos/Megatron-LM"
 git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
 export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
@@ -39,13 +50,20 @@ UV_TORCH_BACKEND=cu128 UNINSTALL_FA4=1 bash requirements/install.sh agentic \
 
 安装器复用已有的 `MEGATRON_PATH`。它在解析依赖时会临时修改依赖元数据，因此请使用空闲 checkout 和新环境。`--no-root` 要求原生系统依赖已准备好；`UNINSTALL_FA4=1` 选择经过验证的 FA2 路径。其他平台参数见 `bash requirements/install.sh --help`。
 
-从匹配的 RPent 分支安装独立的 simulator/SAM3 环境：
+从固定的 RPent checkout 安装独立 simulator/SAM3 环境。它的 requirements 引用了移动中的 RLinf 分支，因此下方 override 将依赖指向交付 checkout。启动前核对输出的模块路径：
 
 ```bash
 cd "$STACK_ROOT/repos/RPent"
 uv venv --python 3.12 "$STACK_ROOT/envs/rpent"
 source "$STACK_ROOT/envs/rpent/bin/activate"
-uv pip install --prerelease=allow --torch-backend cu128 -r requirements/libero-rl.txt
+python - <<'PYTHON' > "$STACK_ROOT/envs/rpent-source-overrides.txt"
+import os
+from pathlib import Path
+print("rlinf @ " + (Path(os.environ["STACK_ROOT"]) / "repos/RLinf").as_uri())
+PYTHON
+uv pip install --prerelease=allow --torch-backend cu128 \
+  -r requirements/libero-rl.txt --override "$STACK_ROOT/envs/rpent-source-overrides.txt"
+python -c 'import rlinf, robots.libero_rl; print(rlinf.__file__, robots.libero_rl.__file__)'
 ```
 
 以下记录已验证的兼容组合，不保证未来任意一次依赖解析都会得到完全相同的环境。
@@ -57,7 +75,7 @@ uv pip install --prerelease=allow --torch-backend cu128 -r requirements/libero-r
 | Qwen 线性注意力 | flash-linear-attention/fla-core 0.6.0；TileLang 0.1.8；Triton 3.6.0 |
 | 环境模拟器 | Torch 2.11.0+cu128；Transformers 4.57.6；NumPy 1.26.4；MuJoCo 3.3.0；robosuite 1.5.2；rpent-libero/rpent-liberopro 0.2.0；SAM3 0.1.0 |
 
-使用 `python -m pip freeze`、`python -c 'import torch; print(torch.__version__, torch.version.cuda)'` 和 `git -C "$MEGATRON_PATH" rev-parse HEAD` 核对并在验证后保留版本清单。源码编译需要匹配的 CUDA 编译器；可联网的纯 CPU 节点适合下载 wheels/源码，但不一定能编译 CUDA 扩展。离线计算节点应先在兼容 Linux/Python/CUDA 构建机准备完整依赖，再传输 wheels 和 Git 源码，通过 `uv pip install --no-index --find-links /path/to/wheelhouse ...` 安装。部分 wheel 缓存不等于完整离线安装包。
+使用 `uv pip freeze`、`python -c 'import torch; print(torch.__version__, torch.version.cuda)'` 和 `git -C "$MEGATRON_PATH" rev-parse HEAD` 核对并在验证后保留版本清单。源码编译需要匹配的 CUDA 编译器；可联网的纯 CPU 节点适合下载 wheels/源码，但不一定能编译 CUDA 扩展。离线计算节点应先在兼容 Linux/Python/CUDA 构建机准备完整依赖，再传输 wheels 和 Git 源码，通过 `uv pip install --no-index --find-links /path/to/wheelhouse ...` 安装。部分 wheel 缓存不等于完整离线安装包。
 
 所有 Ray 节点必须有相同的 RLinf 环境、源码和模型文件。RPent 保留独立环境，不要为了统一版本把 RLinf 的 Transformers 升级为 RPent 版本。若使用自定义激活脚本，保留安装器设置的 Megatron、CUDA、NCCL 路径。本方案使用 FA2 并关闭 Torch 编译，在启动 Ray 前设置 `NVTE_FLASH_ATTN=1`、`NVTE_FUSED_ATTN=0`、`TORCH_COMPILE_DISABLE=1`。环境节点还需要可用的 EGL。
 
@@ -111,13 +129,13 @@ python examples/agent/rpent/prepare_tasks.py --workflow libero_rl \
   --seeds 1-32 --output-dir "$STACK_ROOT/data/libero-rl-tasks"
 ```
 
-生成 1,280 行及记录 task/初始状态数量、seeds、哈希的 manifest。seed 0 保留评测。生成器拒绝越过各任务初始状态范围的 seed，避免取模后重复同一初始状态。可使用 `--seeds 33-39 --split dev` 或 `--seeds 40-49 --split test`，为各 split 指定独立输出目录。原来的 memory 清单生成器仍为默认 `--workflow libero`，仍要求 `--memory-dir`。
+这里按同一组 40 个任务的初始状态划分，不是未见过的任务族；称为独立 holdout 前还需检查与 SFT 训练清单是否重叠。生成 1,280 行及记录 task/初始状态数量、seeds、哈希的 manifest。seed 0 保留评测。生成器拒绝越过各任务初始状态范围的 seed，避免取模后重复同一初始状态。可使用 `--seeds 33-39 --split dev` 或 `--seeds 40-49 --split test`，为各 split 指定独立输出目录。原来的 memory 清单生成器仍为默认 `--workflow libero`，仍要求 `--memory-dir`。
 
 ## 配置共享 16 卡 SAO
 
 Clean workflow 只保留四份依次继承的训练配置：`libero_rl_ppo` → `libero_rl_sao` → `libero_rl_sao_3node` → `libero_rl_sao_local`，完整文件名均带 `train_qwen3.5_4b_` 前缀。第一份继承原版 `train_qwen3.5_4b_ppo`，原版 LIBERO 集成仍可使用该基础配置。任务、采样和模型参数放在 clean PPO 中；SAO 只覆盖更新规则，三节点配置只覆盖 placement，local 配置只填写部署路径。
 
-根据自己的安装位置编辑 `config/train_qwen3.5_4b_libero_rl_sao_local.yaml`，填写完整多模态模型、训练 JSONL、RPent 解释器、LIBERO 配置、episode 目录和训练输出目录。父配置将这些路径标记为必填，不提供特定机器的默认路径。`rollout.model.model_path` 同时设置 actor/critic 的 tokenizer 和 HF 导入路径。
+根据自己的安装位置填写 `examples/agent/rpent/config/train_qwen3.5_4b_libero_rl_sao_local.yaml`，或使用下方启动命令的路径覆盖项；未填写的 `???` 会报错，不会回退到原实验路径。需填写完整多模态模型、训练 JSONL、RPent 解释器、LIBERO 配置、episode 目录和训练输出目录。父配置将这些路径标记为必填，不提供特定机器的默认路径。`rollout.model.model_path` 同时设置 actor/critic 的 tokenizer 和 HF 导入路径。
 
 | 资源或参数 | 配置 |
 |---|---|
@@ -132,9 +150,7 @@ Clean workflow 只保留四份依次继承的训练配置：`libero_rl_ppo` → 
 | 生成 | Context 262144，output 32768；temperature 1、top-p 0.95、top-k 20、presence penalty 1.5、repetition penalty 1.0 |
 | Context management | 原生消息窗口 80→40，触发比例 0.7；不额外清除工具结果或生成摘要 |
 
-`agentloop.chat_template_kwargs.enable_thinking` 支持 `true` 和 `false`，本配方默认
-为 `true`。改变训练模式前，应固定 checkpoint 和任务 seed，对比原生成功率与生成成本。
-对照必须从新的 episode 开始，不能删除已有轨迹中的 thinking token 或行为 logprob。
+`agentloop.chat_template_kwargs.enable_thinking` 支持 `true` 和 `false`，本配方默认为 `true`。改变训练模式前，应固定 checkpoint 和任务 seed，对比原生成功率与生成成本。对照必须从新的 episode 开始，不能删除已有轨迹中的 thinking token 或行为 logprob。
 
 `agentloop.prompt=simple_brief` 选择 RPent 的可选简短推理提示词，目标是每次决策约 256 个推理 token，不强制插入解码 token。RPent 版本需支持此变体。保留历史 thinking，并比较原生成功率与实际成本后再采用。
 
@@ -144,6 +160,8 @@ SAO 允许最多 256 条在途 episode，按完成顺序收集下一批 128 条�
 
 工具结果和图片保留在后续输入中。Policy loss 只作用于 policy 生成的 assistant token，user/tool/history token 不参与监督。逐 token 前缀兼容的连续 turn 合并，压缩或历史改写后分段。Actor 和 critic 使用相同的 response 位置映射；response-only logits 要求 CP1。
 
+启用 `tools.rpent.store_images_on_disk=true` 时，所有 rollout 和 learner 进程必须能读取**相同绝对路径下的图像**。`tools.rpent.output_dir` 需要在模型节点与环境节点间共享，并在轨迹或保存的 checkpoint 仍引用它时保留；不同节点上同名的本地目录不够。没有共享图像存储时保留默认 `false`，让轨迹携带图像字节，但内存成本更高。不要清理可恢复 checkpoint 所需的 Episode 产物。
+
 ### 保留图像 Turn 的 Token 边界
 
 合并 Qwen3.5 图像 turn 时，在每台模型节点启动 Ray **之前**启用保留 token 的 processor：
@@ -151,6 +169,8 @@ SAO 允许最多 256 条在途 episode，按完成顺序收集下一批 128 条�
 ```bash
 export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
 ```
+
+adaptive 训练和评测模板也通过 `rollout.env_vars` 传入此变量，使 worker 启动不只依赖终端环境。
 
 该配置使用 SGLang 的外部 processor 注册入口。图像请求携带已展开的 prompt IDs 和原始图片；适配器核对图片数量及各图 pad 段与处理后 grid 的对应关系，保留原始文本和动作 IDs，再由 SGLang 根据这一序列计算 offset 和 M-RoPE。对已采样 token 解码后重新编码，即使文本相同，也可能改变 token 边界。字符串请求保持上游行为；该图像适配器会拒绝携带视频、音频或预计算图像输入的 token-ID 请求。
 
@@ -171,6 +191,10 @@ CUDA_VISIBLE_DEVICES='' SGLANG_USE_CUDA_IPC_TRANSPORT=0 \
 
 ```bash
 source "$STACK_ROOT/envs/rlinf/bin/activate"
+export PYTHONPATH="$STACK_ROOT/repos/RPent:$STACK_ROOT/repos/RLinf:$MEGATRON_PATH${PYTHONPATH:+:$PYTHONPATH}"
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
+export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 TORCH_COMPILE_DISABLE=1
+export RLINF_TIMEOUT=10800
 export HEAD_IP=10.0.0.10  # 各节点可达的 head 地址
 export RLINF_NODE_RANK=0
 ray start --head --port 6387 --node-ip-address="$HEAD_IP" --num-gpus 8
@@ -204,17 +228,49 @@ Agent worker 和 episode 子进程都位于节点 2，因此 `http://127.0.0.1:8
 ```bash
 source "$STACK_ROOT/envs/rlinf/bin/activate"
 cd "$STACK_ROOT/repos/RLinf"
-bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_local
+bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_local \
+  runner.output_dir="$STACK_ROOT/logs/training" \
+  data.train_data_paths="[$STACK_ROOT/data/libero-rl-tasks/train.jsonl]" \
+  tools.rpent.python="$STACK_ROOT/envs/rpent/bin/python" \
+  tools.rpent.libero_config_path="$LIBERO_CONFIG_PATH" \
+  tools.rpent.output_dir="$STACK_ROOT/data/episodes" \
+  rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B"
 ```
 
-Hydra 覆盖参数放在配置名之后，例如 `rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B-SFT"`。末尾加 `--cfg job --resolve` 可以只检查最终配置而不启动训练。使用 `runner.resume_dir=/path/to/saved/checkpoint` 从完整 SAO checkpoint 恢复两套模型/优化器与 buffered/pending rollout 状态。同步 PPO checkpoint 不包含 SAO 所需的队列状态。Actor/critic checkpoint 和日志位于 `runner.output_dir` 下的实验目录；episode 请求、工具图片和结果位于 `tools.rpent.output_dir`。
+Hydra 覆盖参数放在配置名之后，例如 `rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B-SFT"`。末尾加 `--cfg job --resolve` 可以只检查最终配置而不启动训练。使用 `runner.resume_dir=/path/to/checkpoints/global_step_N` 从完整 SAO checkpoint 恢复两套模型/优化器与 buffered/pending rollout 状态。只选择包含 actor/critic 状态及最后写入的 `data/data.pt` 标记的完整 checkpoint。Pending prompt 会重新入队，并非持久化到一半的模拟器状态；恢复时保持数据集、算法、world size 和引用图像兼容。同步 PPO checkpoint 不包含 SAO 所需的队列状态。Actor/critic checkpoint 和日志位于 `runner.output_dir` 下的实验目录；episode 请求、工具图片和结果位于 `tools.rpent.output_dir`。
 
 使用 Hydra 覆盖参数运行独立短 smoke，无须单独维护 smoke YAML。检查 loss/梯度是否有限、参数是否实际更新、模型副本活动、任务成功率及基础设施错误。短 smoke 通过证明连通和优化器执行，不代表最长 262144-token 工作负载一定能放入显存。遇到显存限制先保留证据并诊断，再决定切分或预算调整。
 
-评测使用独立的显式入口：
+独立评测需要另行分配可用资源；评测默认 placement 是一台八卡模型节点与独立环境节点，不要与训练共用已占用 GPU。原始评测模板使用 LIBERO-PRO、1200 步预算和更短历史窗口，**不能直接与标准训练配方比较**。下方覆盖这些参数以对齐训练；placement 仍需按实际分配资源设置。
+
+导出时 `--vlm` 必须指向训练初始化所用的完整模型，以保留冻结的视觉权重和 processor。从 SFT 开始训练时相应替换路径。导出目录必须是新目录；HF 导出只用于推理，不能替代包含优化器和队列的恢复 checkpoint。
 
 ```bash
-bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl
+# Generate the same fixed cases once, using the simulator environment.
+"$STACK_ROOT/envs/rpent/bin/python" examples/agent/rpent/prepare_tasks.py \
+  --workflow libero_rl --libero-type standard --libero-config-path "$LIBERO_CONFIG_PATH" \
+  --seeds 0 --split eval --output-dir "$STACK_ROOT/data/libero-rl-eval"
+
+# Export a completed checkpoint into a new full-model directory.
+python examples/agent/rpent/checkpoint.py export \
+  --checkpoint /path/to/checkpoints/global_step_5 \
+  --vlm "$STACK_ROOT/models/Qwen3.5-4B" \
+  --output "$STACK_ROOT/models/policy-step5"
+
+bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl \
+  runner.output_dir="$STACK_ROOT/logs/eval-step5" \
+  data.val_data_paths="[$STACK_ROOT/data/libero-rl-eval/eval.jsonl]" \
+  rollout.model.model_path="$STACK_ROOT/models/policy-step5" \
+  tools.rpent.python="$STACK_ROOT/envs/rpent/bin/python" \
+  tools.rpent.output_dir="$STACK_ROOT/data/eval-episodes-step5" \
+  +tools.rpent.libero_config_path="$LIBERO_CONFIG_PATH" \
+  tools.rpent.libero_type=standard tools.rpent.max_episode_steps=10000 \
+  agentloop.episode_timeout_s=14400 tools.rpent.process_timeout_s=15000 \
+  agentloop.history_compaction.max_messages=80 \
+  agentloop.history_compaction.keep_messages=40 \
+  +algorithm.sampling_params.presence_penalty=1.5
 ```
 
-按部署填写其模型、数据、解释器、benchmark 配置和 placement。原版不传配置名的启动行为及原版 LIBERO YAML 继续保持不变。
+评测初始模型时，只改变模型与输出路径，复用同一份 manifest、任务/初态 ID、prompt、采样参数、轮数/动作预算及压缩设置。分别报告原生成功数/总数、轮数耗尽和基础设施失败。训练完成队列的成功率不是独立评测；固定 40 条 case 也不足以确认很小的学习增益。
+
+原版不传配置名的启动行为及原版 LIBERO YAML 继续保持不变。
