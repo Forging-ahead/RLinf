@@ -155,15 +155,27 @@ class Cluster:
         Args:
             max_port_num (Optional[int]): Largest acceptable port. Use it for servers that
                 derive a second port from this one and would overflow past 65535.
+                A supplied limit must be between 1024 and 65535.
         """
+        import errno
+        import secrets
         import socket
 
-        for _ in range(1000):
+        if max_port_num is None:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("", 0))
-                port = s.getsockname()[1]
-            if max_port_num is None or port <= max_port_num:
-                return port
+                return s.getsockname()[1]
+        if not 1024 <= max_port_num <= 65535:
+            raise ValueError("max_port_num must be between 1024 and 65535")
+        for _ in range(1000):
+            port = 1024 + secrets.randbelow(max_port_num - 1023)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    return s.getsockname()[1]
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
         raise RuntimeError(f"Failed to find a free port at most {max_port_num}.")
 
     @classmethod

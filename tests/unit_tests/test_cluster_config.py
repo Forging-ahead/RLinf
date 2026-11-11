@@ -15,6 +15,7 @@
 import logging
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1262,3 +1263,21 @@ def test_process_that_built_a_cluster_keeps_its_exit_code():
     )
 
     assert result.returncode == 3, result.stderr
+
+
+@pytest.mark.parametrize("limit", [None, 8192])
+def test_cluster_find_free_port_respects_limit(limit):
+    port = Cluster.find_free_port(max_port_num=limit)
+    assert 1024 <= port <= (limit or 65535)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("", port))
+
+
+def test_cluster_find_free_port_reports_occupied_bounded_range():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try:
+            listener.bind(("", 1024))
+        except OSError:
+            pytest.skip("Port 1024 cannot be held on this host")
+        with pytest.raises(RuntimeError, match="Failed to find a free port"):
+            Cluster.find_free_port(max_port_num=1024)
