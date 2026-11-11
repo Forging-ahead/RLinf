@@ -54,6 +54,8 @@ tools:
     # Limit cold-start pressure; reset environments release these permits.
     max_env_initializations_per_worker: 8
     output_dir: ???
+    # Requires a shared output_dir retained through checkpoint recovery.
+    store_images_on_disk: false
     keep_episodes: all
     process_timeout_s: 15000
 

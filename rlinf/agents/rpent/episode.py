@@ -58,6 +58,12 @@ def merge_prefix_turns(
     Rewards and per-turn metadata come from the last merged turn;
     ``extra_fields["turn_ids"]`` lists the merged turn IDs.
 
+    Image turns merge on the same token-prefix rule, but only within one
+    render chain (``extra_fields["chain_id"]``): a turn whose history was
+    rewritten starts a new chain, so its images never fold into the previous
+    row even when a same-size replacement leaves the pad tokens unchanged. A
+    merged row takes the last merged turn's image set, which its tokens expand.
+
     Unlike ``DynamicRolloutResult.pack_traj_batch``, which folds turns only for
     training, merged rows also shorten logprob and value inference. Train them
     with ``actor.pack_traj: false``.
@@ -69,12 +75,9 @@ def merge_prefix_turns(
         history = last.prompt_ids + last.response_ids if last else None
         if (
             last is not None
+            and turn.extra_fields.get("chain_id") == last.extra_fields.get("chain_id")
             and turn.prompt_ids[: len(history)] == history
             and sum(last.response_mask) + sum(mask) <= max_scored_tokens
-            # A row carries one image set, so a turn that expands images of its
-            # own must start a new row rather than fold its grid away.
-            and turn.response_images is None
-            and last.response_images is None
         ):
             gap = len(turn.prompt_ids) - len(history)
             last.response_ids = (turn.prompt_ids + turn.response_ids)[
@@ -94,6 +97,9 @@ def merge_prefix_turns(
                     last.response_weight_versions += [carried] * gap + list(
                         turn.response_weight_versions
                     )
+            # The row now ends at this turn, whose prompt already expands every
+            # image of the chain in order, so the row adopts its image set.
+            last.response_images = turn.response_images
             last.response_text, last.is_end = turn.response_text, turn.is_end
             last.reward_score = turn.reward_score
             last.extra_fields = {

@@ -37,7 +37,10 @@ from rlinf.algorithms.utils import (
     truncated_importance_weights,
 )
 from rlinf.data.schema.reasoning_requests import get_seq_length
-from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+from rlinf.data.schema.reasoning_results import (
+    DynamicRolloutResult,
+    materialize_multimodal_inputs,
+)
 from rlinf.hybrid_engines.megatron.utils import (
     output_layer_positions,
     preprocess_packed_seqs,
@@ -124,26 +127,16 @@ class MAMegatronActor(MegatronActor):
                 "actor.response_only_logits requires context_parallel_size=1"
             )
 
-    @staticmethod
-    def _forward_multimodal_inputs(batch: dict) -> dict[str, torch.Tensor]:
-        """Concatenate the images of every row into this forward's inputs.
-
-        The vision tower maps its tokens by position, so the rows' image grids
-        are concatenated in row order and the model matches them against the
-        image markers in ``input_ids``.
-        """
-        payloads = [entry for entry in batch.get("multi_modal_inputs") or [] if entry]
-        if not payloads:
-            return {}
-        device = torch.cuda.current_device()
-        return {
-            "pixel_values": torch.cat([entry["pixel_values"] for entry in payloads]).to(
-                device
+    def _forward_multimodal_inputs(self, batch: dict) -> dict[str, torch.Tensor]:
+        """Materialize only the rows scored by this forward, in token-marker order."""
+        return materialize_multimodal_inputs(
+            batch.get("multi_modal_inputs") or [],
+            self.cfg.rollout.model.model_path,
+            self.torch_device_type,
+            cache_bytes=self.cfg.tools.get("rpent", {}).get(
+                "training_image_cache_bytes", 0
             ),
-            "image_grid_thw": torch.cat(
-                [entry["image_grid_thw"] for entry in payloads]
-            ).to(device),
-        }
+        )
 
     def _scored_positions(
         self, batch: dict[str, torch.Tensor], attention_mask: torch.Tensor
@@ -514,6 +507,7 @@ class MAMegatronActor(MegatronActor):
         batch = DynamicRolloutResult.merge_batches(
             batches, self.cfg.algorithm.group_size
         )
+        del batches
         if any(entry is not None for entry in multimodal_inputs):
             if len(multimodal_inputs) != batch["input_ids"].shape[0]:
                 raise ValueError(
@@ -690,6 +684,7 @@ class MAMegatronActor(MegatronActor):
         merged_batch, num_sequence_per_group = DynamicRolloutResult.merge_batches(
             batches, adjust_traj_indices=False, return_num_sequence_per_group=True
         )
+        del batches
 
         rollout_result = DynamicRolloutResult.merge_result_list(
             rollout_results,

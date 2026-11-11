@@ -307,3 +307,23 @@ Limitations
 - Training requires rollout TP1, and the actor and critic require pipeline and
   context parallel sizes of 1.
 - CI runs the unit tests only; training needs GPUs, RPent, and LIBERO.
+
+
+Memory for Image Histories
+--------------------------
+
+For long multimodal episodes, set ``tools.rpent.store_images_on_disk: true`` and ``tools.rpent.keep_episodes: all``. Put ``tools.rpent.output_dir`` on storage visible at the same absolute path to agent workers and learners. Each episode stores immutable image bytes once; rollout queues and checkpoints retain ordered references and token grids. Actor and Critic materialize pixels only for the current microbatch, verifying image checksums and grids before forward. Keep those image directories for as long as a checkpoint may be resumed; copying a checkpoint alone does not copy its referenced assets. The default keeps processor tensors in memory and works without shared storage.
+
+``tools.rpent.training_image_cache_bytes`` optionally bounds reusable CPU processor
+outputs per training process (default 0, disabled). Multiply this budget by the
+number of Actor and Critic processes when planning host memory. Image contents
+and recorded grids are still checked on cache hits; complete image sequences are
+cached so preprocessing order and batch-dependent behavior remain unchanged.
+
+``rollout.max_buffer_bytes`` optionally pauses new episode admissions using an
+estimate of retained Python objects and unique tensor storage (default 0,
+disabled). Workers retain enough completions for a full learner batch and let
+already active episodes finish. This is a soft admission budget, not an RSS cap:
+active episodes, learner batches, caches and restored checkpoint buffers require
+additional memory. Consumed sample IDs release the admission accounting; no
+completed trajectory is dropped or selected by its reward or length.

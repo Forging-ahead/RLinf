@@ -19,9 +19,11 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import hashlib
 import io
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from rlinf.agents.tokenization import AgenticTokenizer
@@ -120,6 +122,30 @@ class ImagePrompt:
     """PNG bytes of each image, in the order the template placed its marker."""
     image_grid_thw: Any = None
     """Processor token grid of the images, kept for the training forward."""
+    pixel_values: Any = None
+    """Processor pixels, used directly when retaining an in-memory row."""
+
+    def store_images(self, directory: Path) -> dict:
+        """Store immutable image bytes once per episode for lazy training reads.
+
+        The directory must remain visible to learners and checkpoint recovery.
+        A turn retains its own ordered references even when history is compacted.
+        """
+        directory.mkdir(parents=True, exist_ok=True)
+        references = []
+        for image in self.images:
+            digest = hashlib.sha256(image).hexdigest()
+            path = directory / digest
+            if not path.exists():
+                temporary = path.with_suffix(".tmp")
+                temporary.write_bytes(image)
+                temporary.replace(path)
+            references.append({"path": str(path.resolve()), "sha256": digest})
+        return {
+            "image_refs": references,
+            "image_grid_thw": self.image_grid_thw,
+            "num_images": len(references),
+        }
 
 
 def render_prompt(tokenizer: AgenticTokenizer, request: dict) -> list[int]:
@@ -167,6 +193,61 @@ def render_image_prompt(
         input_ids=inputs["input_ids"][0].tolist(),
         images=images,
         image_grid_thw=inputs["image_grid_thw"],
+        pixel_values=inputs["pixel_values"],
+    )
+
+
+def render_image_increment(
+    tokenizer: AgenticTokenizer,
+    new_messages: list[dict],
+    processor: Any,
+) -> ImagePrompt:
+    """Render only the appended messages of a continuing turn, images expanded.
+
+    ``new_messages`` are the user and tool messages added since the recorded
+    assistant reply. The increment text keeps the recorded tokens a prefix of
+    this turn, and the processor expands any image markers in it just as a full
+    render would, so the appended pad tokens match the engine and the forward.
+    """
+    from PIL import Image
+
+    text = tokenizer.render_incremental_text(new_messages)
+    images = message_images(new_messages)
+    if not images:
+        ids = tokenizer.tokenizer(text, add_special_tokens=False)["input_ids"]
+        return ImagePrompt(input_ids=ids)
+    decoded = [Image.open(io.BytesIO(image)).convert("RGB") for image in images]
+    inputs = processor(text=[text], images=decoded, return_tensors="pt")
+    return ImagePrompt(
+        input_ids=inputs["input_ids"][0].tolist(),
+        images=images,
+        image_grid_thw=inputs["image_grid_thw"],
+        pixel_values=inputs["pixel_values"],
+    )
+
+
+def _extend_image_prompt(
+    prior: ImagePrompt | None, increment: ImagePrompt, input_ids: list[int]
+) -> ImagePrompt:
+    """Return the cumulative images of a prefix chain extended by one turn.
+
+    The appended turn owns ``input_ids``; its images follow the earlier ones in
+    the order the template placed their markers, so the row carries every image
+    the forward must expand, once each occurrence.
+    """
+    if prior is None:
+        return replace(increment, input_ids=input_ids)
+    if not increment.images:
+        return replace(prior, input_ids=input_ids)
+    import torch
+
+    return ImagePrompt(
+        input_ids=input_ids,
+        images=prior.images + increment.images,
+        image_grid_thw=torch.cat([prior.image_grid_thw, increment.image_grid_thw]),
+        pixel_values=None
+        if prior.pixel_values is None or increment.pixel_values is None
+        else torch.cat([prior.pixel_values, increment.pixel_values]),
     )
 
 
@@ -186,6 +267,22 @@ class AppendOnlyHistory:
         self._tools = None
         self._assistant_message = None
         self._ids = None
+        # Cumulative images of the current prefix chain, and the id of that
+        # chain. Both reset together whenever the token history is rewritten,
+        # so a later turn never inherits a dropped chain's images and only
+        # turns of one chain merge. The id advances on every new chain.
+        self._image_prompt: ImagePrompt | None = None
+        self._chain_id = 0
+
+    @property
+    def chain_id(self) -> int:
+        """Id of the current prefix chain; a rewrite starts a new one."""
+        return self._chain_id
+
+    def _begin_chain(self) -> None:
+        """Start a fresh prefix chain: new id, no inherited images."""
+        self._chain_id += 1
+        self._image_prompt = None
 
     def _continues(self, request: dict) -> bool:
         messages = request["messages"]
@@ -202,9 +299,35 @@ class AppendOnlyHistory:
     def render(self, request: dict) -> list[int]:
         """Return the prompt token IDs for a chat request."""
         if not self._continues(request):
+            # A text rewrite starts a new chain and drops any earlier images.
+            self._begin_chain()
             return render_prompt(self.tokenizer, request)
         new_messages = template_messages(request["messages"][len(self._messages) + 1 :])
         return self.tokenizer.build_native_tool_response(self._ids, new_messages)
+
+    def render_multimodal(self, request: dict, processor: Any) -> ImagePrompt:
+        """Return the prompt and the cumulative images for an image-bearing turn.
+
+        A continuing turn expands only its new messages and appends them to the
+        recorded tokens, so the turn stays a token prefix of the next and its
+        images extend the chain's image list. A rewritten history renders in
+        full and starts a new chain. The returned ``image_grid_thw`` and
+        ``pixel_values`` cover every image the prompt expands, in order.
+
+        Called once per turn before ``record``; a turn that fails before
+        ``record`` abandons the episode, so the chain never reuses stale images.
+        """
+        if not self._continues(request):
+            self._begin_chain()
+            self._image_prompt = render_image_prompt(self.tokenizer, request, processor)
+            return self._image_prompt
+        new_messages = template_messages(request["messages"][len(self._messages) + 1 :])
+        increment = render_image_increment(self.tokenizer, new_messages, processor)
+        prompt_ids = self.tokenizer.join_increment(self._ids, increment.input_ids)
+        self._image_prompt = _extend_image_prompt(
+            self._image_prompt, increment, prompt_ids
+        )
+        return self._image_prompt
 
     def record(
         self,

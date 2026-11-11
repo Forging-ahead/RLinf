@@ -17,7 +17,10 @@ from megatron.core import parallel_state
 from megatron.training.training import unwrap_model
 from omegaconf import DictConfig
 
-from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+from rlinf.data.schema.reasoning_results import (
+    DynamicRolloutResult,
+    materialize_multimodal_inputs,
+)
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
@@ -70,20 +73,13 @@ class MAMegatronCritic(MegatronCritic):
                 key: val.to(self.torch_device_type) if torch.is_tensor(val) else val
                 for key, val in next(dataloader_iter).items()
             }
-            payloads = [
-                entry for entry in batch.get("multi_modal_inputs") or [] if entry
-            ]
-            multimodal_inputs = (
-                {
-                    "pixel_values": torch.cat(
-                        [entry["pixel_values"] for entry in payloads]
-                    ).to(self.torch_device_type),
-                    "image_grid_thw": torch.cat(
-                        [entry["image_grid_thw"] for entry in payloads]
-                    ).to(self.torch_device_type),
-                }
-                if payloads
-                else {}
+            multimodal_inputs = materialize_multimodal_inputs(
+                batch.get("multi_modal_inputs") or [],
+                self.cfg.rollout.model.model_path,
+                self.torch_device_type,
+                cache_bytes=self.cfg.tools.get("rpent", {}).get(
+                    "training_image_cache_bytes", 0
+                ),
             )
             output = self.custom_forward(
                 model,
@@ -183,6 +179,7 @@ class MAMegatronCritic(MegatronCritic):
         batch = DynamicRolloutResult.merge_batches(
             batches, self.cfg.algorithm.group_size
         )
+        del batches
         assert "returns" in batch, "Multi-agent critic requires fixed returns."
         rollout_metrics = (
             self._compute_rollout_metrics(batch) if compute_rollout_metrics else None
@@ -265,6 +262,7 @@ class MAMegatronCritic(MegatronCritic):
         merged_batch, num_sequence_per_group = DynamicRolloutResult.merge_batches(
             batches, adjust_traj_indices=False, return_num_sequence_per_group=True
         )
+        del batches
         merged_batch.pop("idx_to_traj")
 
         rollout_result = DynamicRolloutResult.merge_result_list(rollout_results)

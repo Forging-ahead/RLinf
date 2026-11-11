@@ -212,6 +212,238 @@ def test_merge_prefix_turns_masks_tool_tokens_and_splits_at_rewrites():
     assert budgeted[1].prompt_ids == [1, 2, 3, 4, 9, 8]
 
 
+def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
+    """Image turns merge on the token prefix; the row takes the last image set.
+
+    Each turn's prompt expands every image of the chain in order, so a merged
+    row carries the last merged turn's images, which match its merged tokens. A
+    rewrite breaks the prefix and starts a new row with its own images.
+    """
+    import torch
+
+    def images(count):
+        return {
+            "image_grid_thw": torch.ones(count, 3, dtype=torch.long),
+            "num_images": count,
+        }
+
+    def turn(turn_id, prompt, response, count):
+        return AgentLoopOutput(
+            prompt_ids=prompt,
+            response_ids=response,
+            response_logprobs=[-float(token) for token in response],
+            response_weight_versions=[0] * len(response),
+            response_images=images(count),
+            is_end=True,
+            reward_score=1.0,
+            extra_fields={"turn_id": turn_id, "tool_names": [f"tool{turn_id}"]},
+        )
+
+    turns = [
+        turn(0, [1, 2], [3, 4], 1),  # image A
+        # Adds a tool observation with image B; its prompt extends turn 0.
+        turn(1, [1, 2, 3, 4, 9, 8], [5, 6], 2),
+        # Compaction rewrote the history: a new row with its own image set.
+        turn(2, [1, 2, 7], [8], 1),
+    ]
+    first, second = merge_prefix_turns(turns, max_scored_tokens=8)
+    assert first.prompt_ids == [1, 2] and first.response_ids == [3, 4, 9, 8, 5, 6]
+    assert first.response_mask == [1, 1, 0, 0, 1, 1]
+    assert first.extra_fields["turn_ids"] == [0, 1]
+    # The merged row holds every image of the chain, once each, in order.
+    assert first.response_images["num_images"] == 2
+    assert torch.equal(
+        first.response_images["image_grid_thw"], torch.ones(2, 3, dtype=torch.long)
+    )
+    assert second.prompt_ids == [1, 2, 7] and second.response_images["num_images"] == 1
+
+
+def test_merge_prefix_turns_splits_a_rewritten_visual_chain():
+    """A visual history rewrite must not fold, even if tokens/grid still match.
+
+    Same-size different images expand to identical image-pad tokens and grids,
+    so the token prefix alone cannot tell a continued chain from a rewritten
+    one. The render chain id does, and a new chain must start a new row.
+    """
+    import torch
+
+    def turn(turn_id, chain_id, prompt, response):
+        return AgentLoopOutput(
+            prompt_ids=prompt,
+            response_ids=response,
+            response_logprobs=[-float(t) for t in response],
+            response_images={
+                "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
+                "num_images": 1,
+            },
+            is_end=True,
+            reward_score=1.0,
+            extra_fields={"turn_id": turn_id, "chain_id": chain_id, "tool_names": []},
+        )
+
+    first = turn(0, 1, [1, 2], [3, 4])
+    # Prefix and grid match, but the history was rewritten (new chain) with a
+    # different image of the same size: the rows must stay separate.
+    rewritten = turn(1, 2, [1, 2, 3, 4, 9, 8], [5, 6])
+    assert len(merge_prefix_turns([first, rewritten], max_scored_tokens=100)) == 2
+    # The same tokens on the same chain do fold, so the guard is not over-broad.
+    continued = turn(1, 1, [1, 2, 3, 4, 9, 8], [5, 6])
+    (row,) = merge_prefix_turns([first, continued], max_scored_tokens=100)
+    assert row.extra_fields["turn_ids"] == [0, 1]
+
+
+def test_image_turns_extend_the_prefix_and_accumulate_their_grids(qwen35):
+    """A continuing image turn appends to the sampled tokens and adds its image.
+
+    The incremental prompt keeps the recorded tokens a prefix of the next turn,
+    which is what lets image turns merge, and the cumulative grid gains one row
+    per turn so the merged row can expand every image.
+    """
+    import base64
+    import io
+
+    import torch
+    from PIL import Image
+
+    def image_part(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    def processor(*, text, images, return_tensors):
+        # Stands in for the model processor: the ids carry the increment, and
+        # each image contributes one grid row and one pixel row.
+        assert return_tensors == "pt"
+        ids = qwen35.tokenizer(text[0])["input_ids"]
+        count = len(images)
+        return {
+            "input_ids": torch.tensor([ids]),
+            "image_grid_thw": torch.ones(count, 3, dtype=torch.long),
+            "pixel_values": torch.arange(count * 4, dtype=torch.float32).reshape(
+                count, 4
+            ),
+        }
+
+    history = AppendOnlyHistory(qwen35)
+    base = [
+        {"role": "system", "content": "rules"},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "task"}, image_part("red")],
+        },
+    ]
+    first_request = {"messages": [dict(m) for m in base], "tools": TOOLS}
+    first = history.render_multimodal(first_request, processor)
+    response = qwen35.tokenizer("step 0<|im_end|>")["input_ids"]
+    history.record(first_request, first.input_ids, response, tool_reply(0))
+
+    messages = base + [
+        tool_reply(0),
+        {"role": "tool", "tool_call_id": "c", "content": "seen"},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "obs"}, image_part("blue")],
+        },
+    ]
+    second = history.render_multimodal(
+        {"messages": [dict(m) for m in messages], "tools": TOOLS}, processor
+    )
+    # The sampled tokens are a prefix of the next turn, so the turns can merge.
+    assert second.input_ids[: len(first.input_ids) + len(response)] == (
+        first.input_ids + response
+    )
+    # Each turn adds one image; the row carries both, the earlier one first.
+    assert first.image_grid_thw.shape[0] == 1
+    assert second.image_grid_thw.shape[0] == 2
+    assert len(second.images) == 2 and second.images[:1] == first.images
+
+
+def test_text_history_rewrite_drops_earlier_images(qwen35):
+    """A text-only compaction must clear the chain's images, not keep them.
+
+    Image A, then a rewrite that compacts history to text (the text render
+    path), then image B: the next row must expand only B. Leaving the old
+    image state would feed a dropped image back into the model.
+    """
+    import base64
+    import io
+
+    import torch
+    from PIL import Image
+
+    def image_part(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    def processor(*, text, images, return_tensors):
+        ids = qwen35.tokenizer(text[0])["input_ids"]
+        count = len(images)
+        return {
+            "input_ids": torch.tensor([ids]),
+            "image_grid_thw": torch.ones(count, 3, dtype=torch.long),
+            "pixel_values": torch.arange(count * 4, dtype=torch.float32).reshape(
+                count, 4
+            ),
+        }
+
+    history = AppendOnlyHistory(qwen35)
+    # Turn 0: an image-bearing request opens a chain with image A.
+    req0 = {
+        "messages": [
+            {"role": "system", "content": "rules"},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "task"}, image_part("red")],
+            },
+        ],
+        "tools": TOOLS,
+    }
+    ip0 = history.render_multimodal(req0, processor)
+    history.record(
+        req0,
+        ip0.input_ids,
+        qwen35.tokenizer("a<|im_end|>")["input_ids"],
+        {"role": "assistant", "content": "a"},
+    )
+    assert history.chain_id == 1 and ip0.image_grid_thw.shape[0] == 1
+
+    # Turn 1: history is compacted to text only (a rewrite); this starts a new
+    # chain and must forget image A.
+    compact = {
+        "messages": [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "summary"},
+        ],
+        "tools": TOOLS,
+    }
+    assert not history._continues(compact)
+    text_ids = history.render(compact)
+    assert history.chain_id == 2 and history._image_prompt is None
+    assistant1 = {"role": "assistant", "content": "b"}
+    history.record(
+        compact, text_ids, qwen35.tokenizer("b<|im_end|>")["input_ids"], assistant1
+    )
+
+    # Turn 2: a new image B continues the compacted history; only B is present.
+    req2 = {
+        "messages": compact["messages"]
+        + [
+            assistant1,
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "obs"}, image_part("blue")],
+            },
+        ],
+        "tools": TOOLS,
+    }
+    ip2 = history.render_multimodal(req2, processor)
+    assert history.chain_id == 2
+    assert ip2.image_grid_thw.shape[0] == 1 and len(ip2.images) == 1
+
+
 # Stands in for RPent's ``robots.libero_rl.rl_episode``: it plans against the
 # worker's policy endpoint and writes the outcome, as the real process does.
 FAKE_EPISODE = """
@@ -1228,3 +1460,85 @@ def test_environment_cold_start_permit_releases_before_episode_end(
             await asyncio.gather(watcher, return_exceptions=True)
 
     asyncio.run(run())
+
+
+def test_image_references_preserve_order_and_survive_serialization(
+    tmp_path, monkeypatch
+):
+    import io
+    import pickle
+
+    import torch
+    from PIL import Image
+
+    from rlinf.agents.rpent.history import ImagePrompt
+    from rlinf.data.schema import reasoning_results
+
+    def png(color):
+        output = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(output, format="PNG")
+        return output.getvalue()
+
+    images = [png("red"), png("blue"), png("red")]
+    grid = torch.ones(3, 3, dtype=torch.long)
+    rendered = ImagePrompt([1, 2], images, grid)
+    directory = tmp_path / "images"
+    payload = rendered.store_images(directory)
+    # Identical bytes have one persistent owner, independent of turn history.
+    assert len(list(directory.iterdir())) == 2
+    payload = pickle.loads(pickle.dumps(payload))
+    assert payload["image_refs"][0] == payload["image_refs"][2]
+
+    calls = []
+
+    def processor(*, images, return_tensors):
+        calls.append(len(images))
+        assert return_tensors == "pt"
+        return {
+            "pixel_values": torch.tensor([image.getpixel((0, 0)) for image in images]),
+            "image_grid_thw": torch.ones(len(images), 3, dtype=torch.long),
+        }
+
+    # Isolate the third-party image processor; file IO and row assembly are real.
+    monkeypatch.setattr(reasoning_results, "_image_processor", lambda path: processor)
+    materialize = reasoning_results.materialize_multimodal_inputs
+    result = materialize([None, payload], "unused-model", "cpu")
+    torch.testing.assert_close(
+        result["pixel_values"],
+        torch.tensor([[255, 0, 0], [0, 0, 255], [255, 0, 0]], dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(result["image_grid_thw"], grid)
+    cached = materialize([payload], "unused-model", "cpu", cache_bytes=1024)
+    again = materialize([payload], "unused-model", "cpu", cache_bytes=1024)
+    torch.testing.assert_close(cached["pixel_values"], result["pixel_values"])
+    torch.testing.assert_close(again["pixel_values"], result["pixel_values"])
+    assert calls == [3, 3]  # Uncached baseline, then one cache fill.
+    assert reasoning_results._processed_image_cache.bytes <= 1024
+    materialize([payload], "unused-model", "cpu", cache_bytes=1)
+    assert reasoning_results._processed_image_cache.bytes == 0
+    payload["image_grid_thw"] = grid + 1
+    with pytest.raises(ValueError, match="grid differs"):
+        materialize([payload], "unused-model", "cpu", cache_bytes=1024)
+    payload["image_grid_thw"] = grid
+    Path(payload["image_refs"][0]["path"]).write_bytes(b"changed")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        materialize([payload], "unused-model", "cpu", cache_bytes=1024)
+
+
+def test_image_storage_requires_retained_episode_assets():
+    from rlinf.config import validate_rpent_cfg
+
+    cfg = OmegaConf.create(
+        {
+            "tools": {
+                "rpent": {
+                    "env_gpus": [0],
+                    "episodes_per_worker": 1,
+                    "keep_episodes": "failures",
+                    "store_images_on_disk": True,
+                }
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="keep_episodes=all"):
+        validate_rpent_cfg(cfg)

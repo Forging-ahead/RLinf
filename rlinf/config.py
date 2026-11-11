@@ -1730,6 +1730,16 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             "tools.rpent.keep_episodes must be all, failures or none, got "
             f"{rpent.keep_episodes!r}."
         )
+    if rpent.get("store_images_on_disk", False) and rpent.keep_episodes != "all":
+        raise ValueError(
+            "tools.rpent.store_images_on_disk requires keep_episodes=all; "
+            "training and checkpoint recovery still reference episode images."
+        )
+    cache_bytes = rpent.get("training_image_cache_bytes", 0)
+    if type(cache_bytes) is not int or cache_bytes < 0:
+        raise ValueError(
+            "tools.rpent.training_image_cache_bytes must be a nonnegative integer."
+        )
     agentloop = cfg.agentloop
     if (
         agentloop.toolcall_parser != "qwen3.5"

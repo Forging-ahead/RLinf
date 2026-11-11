@@ -224,3 +224,13 @@ SGLang 和 Megatron 算出的 logprob 有差异，训练用按 token 截断（�
 
 - 训练时 rollout 要求 TP1；actor 和 critic 的 pipeline 并行与 context 并行大小必须为 1。
 - CI 只跑单元测试；训练需要 GPU、RPent 和 LIBERO。
+
+
+图像历史的内存占用
+------------------
+
+长多模态 episode 可设置 ``tools.rpent.store_images_on_disk: true`` 和 ``tools.rpent.keep_episodes: all``。``tools.rpent.output_dir`` 必须在 agent worker 与 learner 上以相同绝对路径可读。每个 episode 只保存一份相同的原始图像，rollout 队列和 checkpoint 保留有序引用及 token 网格；Actor 和 Critic 只为当前 microbatch 生成像素张量，并在前向之前校验图像摘要和网格。只要 checkpoint 还可能恢复，就须保留对应图像目录；单独复制 checkpoint 不会复制这些图像。默认仍在内存保留 processor 张量，可用于没有共享存储的部署。
+
+``tools.rpent.training_image_cache_bytes`` 可限制每个训练进程复用的 CPU 预处理结果字节数，默认0表示关闭。规划主存时须乘以 Actor 和 Critic 进程数。命中缓存仍校验图像内容与原网格；按完整图像序列缓存，不改变预处理顺序或依赖批组成的行为。
+
+``rollout.max_buffer_bytes`` 可根据保留的 Python 对象与去重 tensor storage 字节估计暂停新 episode，默认0表示关闭。各 worker 至少允许收齐一个 learner batch，已启动任务仍正常结束。它是软准入预算，不是 RSS 上限；活动任务、learner batch、缓存与恢复的 checkpoint buffer 另需主存。消费样本ID后释放对应计数，不丢弃轨迹或按奖励、长度筛选结果。

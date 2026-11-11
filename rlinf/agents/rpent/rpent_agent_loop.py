@@ -32,7 +32,6 @@ from omegaconf import DictConfig, OmegaConf
 from rlinf.agents.rpent.episode import Episode, RPentEpisodeError, merge_prefix_turns
 from rlinf.agents.rpent.history import (
     AppendOnlyHistory,
-    render_image_prompt,
     request_has_images,
 )
 from rlinf.agents.tokenization import get_agentic_tokenizer
@@ -374,44 +373,33 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             )
         return self._image_processor
 
-    def _multimodal_inputs(self, images: list[bytes]) -> dict:
-        """Preprocess a turn's images once, for both rollout and training.
-
-        The processor output is what the actor forwards to the vision tower, so
-        producing it here keeps the rollout prompt and the training row on the
-        same token layout.
-        """
-        from PIL import Image
-
-        processor = self._processor()
-        decoded = [
-            Image.open(__import__("io").BytesIO(image)).convert("RGB")
-            for image in images
-        ]
-        inputs = processor.image_processor(images=decoded, return_tensors="pt")
-        return {
-            # The vision tower is bf16, so fp32 payloads only cost host memory:
-            # a 1024x1024 frame is 24 MB in fp32 and halves per image row.
-            "pixel_values": inputs["pixel_values"].to(torch.bfloat16),
-            "image_grid_thw": inputs["image_grid_thw"],
-            "num_images": len(decoded),
-        }
-
     async def _render_request(self, episode: Episode, request: dict):
         """Return this turn's prompt tokens and the images they expand.
 
-        A request carrying images is rendered in full with the model's
-        processor, because the served engine only expands an image marker when
-        it is handed the image itself. Text-only turns append to the previous
-        turn's sampled tokens as usual.
+        A request carrying images appends only its new messages to the recorded
+        tokens, expanding their images with the model's processor, so the turn
+        stays a token prefix of the next and consecutive turns can merge into
+        one training row. Text-only turns append to the sampled tokens as usual.
         """
         if not request_has_images(request):
             prompt_ids = await asyncio.to_thread(episode.history.render, request)
             return prompt_ids, [], None
         rendered = await asyncio.to_thread(
-            render_image_prompt, self.agentic_tokenizer, request, self._processor()
+            episode.history.render_multimodal, request, self._processor()
         )
-        multimodal = await asyncio.to_thread(self._multimodal_inputs, rendered.images)
+        if self.cfg.tools.rpent.get("store_images_on_disk", False):
+            directory = (
+                Path(self.cfg.tools.rpent.output_dir)
+                / episode.episode_id
+                / "training_images"
+            )
+            multimodal = await asyncio.to_thread(rendered.store_images, directory)
+        else:
+            multimodal = {
+                "pixel_values": rendered.pixel_values.to(torch.bfloat16),
+                "image_grid_thw": rendered.image_grid_thw,
+                "num_images": len(rendered.images),
+            }
         return rendered.input_ids, rendered.images, multimodal
 
     async def _complete(self, episode: Episode, request: dict) -> dict:
@@ -449,6 +437,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 extra_fields={
                     "turn_id": turn_idx,
                     "tool_names": [call["name"] for call in calls],
+                    "chain_id": episode.history.chain_id,
                 },
             )
         )

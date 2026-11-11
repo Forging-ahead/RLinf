@@ -310,7 +310,13 @@ class Qwen35AgenticTokenizer(AgenticTokenizer):
             self._end_of_turn, add_special_tokens=False
         )["input_ids"]
 
-    def render_incremental(self, tool_messages: list[dict]) -> list[int]:
+    def render_incremental_text(self, tool_messages: list[dict]) -> str:
+        """Chat-template text the appended messages add after the anchor turn.
+
+        An image turn feeds this text, which still holds one vision marker per
+        image, to the model's processor to expand the markers into pad tokens,
+        so the token path stays incremental for images too.
+        """
         text = self.apply_chat_template(
             [*self._ANCHOR_TURNS, *tool_messages],
             tokenize=False,
@@ -319,18 +325,29 @@ class Qwen35AgenticTokenizer(AgenticTokenizer):
         _, found, increment = text.partition(self._ANCHOR + self._end_of_turn)
         if not found:
             raise ValueError("the chat template rewrote the anchor assistant turn")
-        return self.tokenizer(increment, add_special_tokens=False)["input_ids"]
+        return increment
+
+    def render_incremental(self, tool_messages: list[dict]) -> list[int]:
+        return self.tokenizer(
+            self.render_incremental_text(tool_messages), add_special_tokens=False
+        )["input_ids"]
+
+    def join_increment(
+        self, prefix_ids: list[int], increment_ids: list[int]
+    ) -> list[int]:
+        """Append an already-rendered increment to prefix_ids over the turn boundary.
+
+        A text increment comes from ``render_incremental``; an image increment
+        comes from the processor. Both fold the same end-of-turn tail, which a
+        response that stopped on EOS already holds its first token of.
+        """
+        overlap = int(bool(prefix_ids) and prefix_ids[-1] == self._end_of_turn_ids[0])
+        return [*prefix_ids, *self._end_of_turn_ids[overlap:], *increment_ids]
 
     def build_native_tool_response(
         self, prefix_ids: list[int], tool_messages: list[dict]
     ) -> list[int]:
-        # A response that stopped on EOS already holds the end of turn's first token.
-        overlap = int(bool(prefix_ids) and prefix_ids[-1] == self._end_of_turn_ids[0])
-        return [
-            *prefix_ids,
-            *self._end_of_turn_ids[overlap:],
-            *self.render_incremental(tool_messages),
-        ]
+        return self.join_increment(prefix_ids, self.render_incremental(tool_messages))
 
 
 class AgenticTokenizerType(str, Enum):

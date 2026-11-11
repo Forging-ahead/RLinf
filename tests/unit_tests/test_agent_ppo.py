@@ -16,8 +16,9 @@
 
 import asyncio
 import copy
+import os
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -32,6 +33,146 @@ from rlinf.data.schema.agent_trajectory import prepare_agent_ppo_targets
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.scheduler import Channel, Cluster
 from rlinf.scheduler.channel.channel_worker import LocalChannel
+
+
+@pytest.fixture
+def qwen_image_processor():
+    """Real SGLang/HF preprocessing; model assets are optional in CPU CI."""
+    model_path = os.environ.get("RLINF_TEST_QWEN_VL_MODEL")
+    if not model_path:
+        pytest.skip("Set RLINF_TEST_QWEN_VL_MODEL to a local Qwen3.5 processor.")
+    pytest.importorskip("sglang")
+    from transformers import AutoConfig, AutoProcessor
+
+    from rlinf.hybrid_engines.sglang.multimodal.qwen_vl import TokenizedQwenVLProcessor
+
+    hf = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    server = SimpleNamespace(
+        mm_process_config={},
+        skip_tokenizer_init=True,
+        disable_fast_image_processor=True,
+        keep_mm_feature_on_device=False,
+        tokenizer_worker_num=1,
+    )
+    processor = TokenizedQwenVLProcessor(config, server, hf, "cpu", skip_mm_pool=True)
+    try:
+        yield processor, hf, config
+    finally:
+        processor.io_executor.shutdown()
+        processor.cpu_executor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("detokenize", "parts"),
+    [(False, ["\n", "\n"]), (True, ["\n", "\n"]), (False, ["a", "hello"])],
+)
+def test_qwen_image_processor_preserves_sampled_tokens(
+    qwen_image_processor, detokenize, parts
+):
+    from PIL import Image
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+
+    processor, hf, config = qwen_image_processor
+    processor.server_args.skip_tokenizer_init = not detokenize
+    images = [Image.new("RGB", (64, 64), "red"), Image.new("RGB", (96, 64), "blue")]
+    separator = "".join(parts)
+    text = f"A<|vision_start|><|image_pad|><|vision_end|>{separator}<|im_end|>B<|vision_start|><|image_pad|><|vision_end|>C"
+    expected = hf(text=[text], images=images, return_tensors="pt")
+    canonical = expected.input_ids[0].tolist()
+    at = canonical.index(config.vision_end_token_id) + 1
+    separator_size = len(hf.tokenizer.encode(separator, add_special_tokens=False))
+    prompt = (
+        canonical[:at]
+        + [
+            token
+            for part in parts
+            for token in hf.tokenizer.encode(part, add_special_tokens=False)
+        ]
+        + canonical[at + separator_size :]
+    )
+    assert hf.tokenizer.decode(prompt) == hf.tokenizer.decode(canonical)
+    assert prompt != hf.tokenizer.encode(
+        hf.tokenizer.decode(prompt), add_special_tokens=False
+    )
+    request = SimpleNamespace(
+        video_data=None, audio_data=None, rid="token-preservation"
+    )
+    output = asyncio.run(processor.process_mm_data_async(images, prompt, request))
+    assert output.input_ids == prompt
+    assert torch.equal(
+        torch.cat([item.feature for item in output.mm_items]), expected.pixel_values
+    )
+    input_ids = torch.tensor([prompt])
+    for item in output.mm_items:
+        for start, end in item.offsets:
+            assert input_ids[0, start : end + 1].eq(config.image_token_id).all()
+    # HF's independent position implementation needs only configuration, not weights.
+    geometry = SimpleNamespace(config=config)
+    geometry.get_vision_position_ids = MethodType(
+        Qwen3_5Model.get_vision_position_ids, geometry
+    )
+    positions, delta = Qwen3_5Model.get_rope_index(
+        geometry,
+        input_ids,
+        (input_ids == config.image_token_id).int(),
+        image_grid_thw=expected.image_grid_thw,
+    )
+    assert torch.equal(output.mrope_positions, positions[:, 0])
+    assert torch.equal(output.mrope_position_delta, delta)
+
+
+@pytest.mark.parametrize("invalid", ["grid", "image_count"])
+def test_qwen_image_processor_rejects_inconsistent_images(
+    qwen_image_processor, invalid
+):
+    from PIL import Image
+
+    processor, hf, config = qwen_image_processor
+    images = [Image.new("RGB", (64, 64), "red")]
+    prompt = (
+        hf(
+            text=["A<|vision_start|><|image_pad|><|vision_end|>B"],
+            images=images,
+            return_tensors="pt",
+        )
+        .input_ids[0]
+        .tolist()
+    )
+    if invalid == "grid":
+        prompt.remove(config.image_token_id)
+        message = "processor grid needs"
+    else:
+        images.append(images[0])
+        message = "image spans, but received"
+    request = SimpleNamespace(video_data=None, audio_data=None, rid="invalid-image")
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(processor.process_mm_data_async(images, prompt, request))
+
+
+def test_qwen_image_processor_keeps_text_request_behavior(qwen_image_processor):
+    from PIL import Image
+
+    processor, hf, _ = qwen_image_processor
+    images = [Image.new("RGB", (64, 64), "red")]
+    text = "A<|vision_start|><|image_pad|><|vision_end|>\n\nB"
+    expected = hf(text=[text], images=images, return_tensors="pt")
+    request = SimpleNamespace(video_data=None, audio_data=None, rid="text-request")
+    output = asyncio.run(processor.process_mm_data_async(images, text, request))
+    assert output.input_ids == expected.input_ids[0].tolist()
+    assert torch.equal(output.mm_items[0].feature, expected.pixel_values)
+
+
+def test_qwen_image_processor_external_registration(qwen_image_processor, monkeypatch):
+    from sglang.srt.managers import multimodal_processor
+
+    processor, _, _ = qwen_image_processor
+    monkeypatch.setattr(multimodal_processor, "PROCESSOR_MAPPING", {})
+    multimodal_processor.import_processors(
+        "rlinf.hybrid_engines.sglang.multimodal", overwrite=True
+    )
+    for model in processor.models:
+        assert multimodal_processor.PROCESSOR_MAPPING[model] is type(processor)
 
 
 def _local_channel():
