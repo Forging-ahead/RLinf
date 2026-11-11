@@ -1776,18 +1776,21 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
                 f"agentloop.observation_mode must be adaptive, got {mode!r}."
             )
         prompt = agentloop.get("prompt", "simple")
-        if prompt not in ("simple", "base", "base_gripper", "base_gripper_camera"):
+        if prompt not in (
+            "simple",
+            "simple_brief",
+            "base",
+            "base_gripper",
+            "base_gripper_camera",
+        ):
             raise ValueError(
-                "agentloop.prompt must be simple, base, base_gripper or "
+                "agentloop.prompt must be simple, simple_brief, base, base_gripper or "
                 f"base_gripper_camera, got {prompt!r}."
             )
         template_kwargs = agentloop.get("chat_template_kwargs") or {}
-        if template_kwargs.get("enable_thinking", True) is False:
-            # Without a think block the planner acts in zero reasoning tokens, which
-            # is how the 4B policy earned no reward at all.
+        if not isinstance(template_kwargs.get("enable_thinking", True), bool):
             raise ValueError(
-                "RPent planners reason on every turn: remove "
-                "agentloop.chat_template_kwargs.enable_thinking=false."
+                "agentloop.chat_template_kwargs.enable_thinking must be a boolean."
             )
         if agentloop.max_turns < 25:
             raise ValueError(

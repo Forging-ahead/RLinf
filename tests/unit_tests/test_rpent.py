@@ -902,6 +902,73 @@ def test_adaptive_rows_disable_packing_but_keep_balancing():
 
 # Shared synchronous agent PPO settings are covered by the SearchR1 tests.
 @pytest.mark.parametrize(
+    "environment",
+    [{"SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE": "custom_processors"}, {}],
+)
+def test_eval_forwards_rollout_environment(monkeypatch, environment):
+    import importlib.util
+    import inspect
+
+    path = Path(__file__).parents[2] / "examples/agent/rpent/eval.py"
+    spec = importlib.util.spec_from_file_location("rpent_eval_entry", path)
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    launch_options = {}
+    rollout = SimpleNamespace(
+        launch=lambda *args, **kwargs: launch_options.update(kwargs) or rollout
+    )
+    agent = SimpleNamespace(launch=lambda *args, **kwargs: agent)
+    placement = SimpleNamespace(get_strategy=lambda role: role)
+    runner = SimpleNamespace(init_workers=lambda: None, run=lambda: None)
+    replacements = {
+        "validate_cfg": lambda cfg: cfg,
+        "Cluster": lambda **kwargs: object(),
+        "ModelParallelEvalComponentPlacement": lambda *args: placement,
+        "get_logger": lambda: SimpleNamespace(info=lambda message: None),
+        "get_rollout_backend_worker": lambda cfg: SimpleNamespace(
+            create_group=lambda *args, **kwargs: rollout
+        ),
+        "RPentAgentLoopWorker": SimpleNamespace(
+            create_group=lambda *args, **kwargs: agent
+        ),
+        "hf_tokenizer": lambda model: None,
+        "create_reasoning_datasets": lambda *args: (None, []),
+        "RPentEvalRunner": lambda **kwargs: runner,
+    }
+    for name, replacement in replacements.items():
+        monkeypatch.setattr(entry, name, replacement)
+    cfg = OmegaConf.create(
+        {
+            "cluster": {},
+            "rollout": {
+                "group_name": "rollout",
+                "model": {"model_path": "policy"},
+                "env_vars": environment,
+            },
+            "agentloop": {"group_name": "agentloop"},
+        }
+    )
+    inspect.unwrap(entry.main)(cfg)
+    assert launch_options.get("env_vars") == (environment or None)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("prompt", ["simple", "simple_brief"])
+def test_libero_rl_accepts_both_thinking_modes(enabled, prompt):
+    from rlinf.config import validate_rpent_cfg
+
+    cfg = validate_rpent_cfg(
+        compose(
+            [
+                f"agentloop.chat_template_kwargs.enable_thinking={str(enabled).lower()}",
+                f"agentloop.prompt={prompt}",
+            ]
+        )
+    )
+    assert cfg.agentloop.chat_template_kwargs.enable_thinking is enabled
+
+
+@pytest.mark.parametrize(
     "override,message",
     [
         ("tools.rpent.episodes_per_worker=0", "one episode per worker"),
@@ -916,7 +983,7 @@ def test_adaptive_rows_disable_packing_but_keep_balancing():
         ("agentloop.toolcall_parser=qwen2.5", "Qwen3.5 chats"),
         ("agentloop.minimum_output_tokens=65536", "minimum_output_tokens"),
         ("critic.use_critic_model=false", "critic.use_critic_model=True"),
-        ("agentloop.chat_template_kwargs.enable_thinking=false", "enable_thinking"),
+        ("agentloop.chat_template_kwargs.enable_thinking=invalid", "must be a boolean"),
         ("agentloop.max_turns=10", "max_turns"),
         ("agentloop.prompt=fancy", "agentloop.prompt"),
         ("agentloop.observation_mode=text", "must be adaptive"),

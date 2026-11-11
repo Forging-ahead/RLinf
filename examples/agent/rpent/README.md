@@ -132,11 +132,43 @@ Edit `config/train_qwen3.5_4b_libero_rl_sao_local.yaml` for your installation. S
 | Generation | Context 262144, output 32768; temperature 1, top-p 0.95, top-k 20, presence penalty 1.5, repetition penalty 1.0 |
 | Context management | Native message window 80→40, trigger fraction 0.7; no extra tool clearing or summarization |
 
+`agentloop.chat_template_kwargs.enable_thinking` accepts `true` or `false`; this
+recipe defaults to `true`. Compare native task success and generation cost on the
+same checkpoint and task seeds before changing the mode for training. Start new
+episodes for the comparison; do not remove thinking tokens from an existing
+trajectory or its recorded behavior logprobs.
+
+`agentloop.prompt=simple_brief` selects RPent's optional concise-reasoning prompt,
+which targets 256 reasoning tokens per decision without forcing decoder tokens.
+It requires an RPent version that provides this prompt variant. Keep thinking
+history and compare native success and measured cost before adopting it.
+
 SAO keeps up to 256 episodes in flight and consumes the next 128 completed trajectories, rather than waiting for a fixed synchronous batch to finish. An episode's slot includes model waits and tool execution; eight workers with 32 slots can start all 256 in-flight episodes. `max_env_initializations_per_worker=8` bounds cold starts to 64 processes across the eight workers. A permit is released after the first environment state is saved, not at episode completion, so all 256 environments can remain active after warmup. This limits CPU/import/CUDA-context pressure without reducing rollout capacity. The buffer holds complete trajectories. Additional pending prompts can be queued, but do not increase the in-flight limit. Each episode normally has one outstanding model request, so a per-replica limit of 128 is an admission ceiling, not 128 continuously active requests on every GPU.
 
 Shared GPUs still require a phase switch: pause/retract model requests, offload rollout memory, train the critic and actor, synchronize weights, then resume the waiting requests. Environment work may continue during training, but model generation pauses. SAO also changes the learning rules: DIS actor loss, clip bounds 0.3/5.0, `sao_gae` with alpha 1.5, and the SAO critic objective. It uses behavior logprobs saved during rollout instead of recomputing old-policy logprobs. The task, model, prompt, sampling and compression settings remain inherited from clean PPO.
 
 Tool results and images remain in subsequent prompts. Only policy-generated assistant tokens receive policy loss; user/tool/history tokens do not. Prefix-compatible turns merge, while context compression/history rewriting starts a new row. The critic and actor use the same response-position mapping. Response-only logits require CP1.
+
+### Preserve image-turn token boundaries
+
+For merged Qwen3.5 image turns, enable the token-preserving processor on each model node **before starting Ray**:
+
+```bash
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
+```
+
+This uses SGLang's external processor registry. Image requests carry already expanded prompt IDs and raw images. The adapter validates the number of images and each image's pad span against its processed grid, retains the exact text/action IDs, and lets SGLang derive offsets and M-RoPE from that sequence. Decoding and re-encoding sampled tokens can otherwise change their boundaries, even when the decoded text is identical. String requests retain the upstream behavior. Token-ID requests with video, audio or precomputed image inputs are rejected by this image-only adapter.
+
+Run the processor regressions with a local model directory containing its config, tokenizer and processor files:
+
+```bash
+CUDA_VISIBLE_DEVICES='' SGLANG_USE_CUDA_IPC_TRANSPORT=0 \
+  RLINF_TEST_QWEN_VL_MODEL=/path/to/Qwen3.5-4B \
+  PYTHONPATH=.:tests/unit_tests \
+  python -m pytest tests/unit_tests/test_agent_ppo.py -k qwen_image_processor
+```
+
+These CPU checks cover input IDs, image tensors, offsets and HF/SGLang M-RoPE agreement. They do not replace real-engine generation/logprob checks or a complete learner update and checkpoint recovery before deploying a new processor version.
 
 ## Start three Ray nodes and SAM3
 

@@ -132,11 +132,38 @@ Clean workflow 只保留四份依次继承的训练配置：`libero_rl_ppo` → 
 | 生成 | Context 262144，output 32768；temperature 1、top-p 0.95、top-k 20、presence penalty 1.5、repetition penalty 1.0 |
 | Context management | 原生消息窗口 80→40，触发比例 0.7；不额外清除工具结果或生成摘要 |
 
+`agentloop.chat_template_kwargs.enable_thinking` 支持 `true` 和 `false`，本配方默认
+为 `true`。改变训练模式前，应固定 checkpoint 和任务 seed，对比原生成功率与生成成本。
+对照必须从新的 episode 开始，不能删除已有轨迹中的 thinking token 或行为 logprob。
+
+`agentloop.prompt=simple_brief` 选择 RPent 的可选简短推理提示词，目标是每次决策约 256 个推理 token，不强制插入解码 token。RPent 版本需支持此变体。保留历史 thinking，并比较原生成功率与实际成本后再采用。
+
 SAO 允许最多 256 条在途 episode，按完成顺序收集下一批 128 条轨迹，不再等待某个固定同步 batch 的全部轨迹。Episode 槽位包含等待模型与执行工具的时间；八个 worker 各 32 个槽位，足以同时展开全部 256 条在途轨迹。`max_env_initializations_per_worker=8` 将八个 worker 的同时冷启动数量限制为 64；保存首次环境状态后立即释放冷启动槽位，不等 episode 结束，因此预热后仍可保持 256 个活跃环境。这只约束 CPU、import 和 CUDA context 初始化压力，不降低 rollout 容量。Buffer 保存已完成轨迹；额外排队的 prompt 不会提高在途上限。每个 episode 通常只有一个未完成模型请求，因此每副本 128 是准入上限，并不表示每张 GPU 始终都有 128 个活跃请求。
 
 共享 GPU 仍需切换阶段：暂停并收回模型请求、卸载 rollout 显存、依次训练 critic 和 actor、同步权重，再恢复等待中的请求。训练时环境动作可以继续，但模型生成暂停。SAO 的学习规则也有变化：DIS actor loss、0.3/5.0 clip 边界、alpha 为 1.5 的 `sao_gae` 和 SAO critic 目标；它直接使用 rollout 保存的 behavior logprob，不重算旧 policy 的 logprob。任务、模型、prompt、采样和压缩参数均继承 clean PPO。
 
 工具结果和图片保留在后续输入中。Policy loss 只作用于 policy 生成的 assistant token，user/tool/history token 不参与监督。逐 token 前缀兼容的连续 turn 合并，压缩或历史改写后分段。Actor 和 critic 使用相同的 response 位置映射；response-only logits 要求 CP1。
+
+### 保留图像 Turn 的 Token 边界
+
+合并 Qwen3.5 图像 turn 时，在每台模型节点启动 Ray **之前**启用保留 token 的 processor：
+
+```bash
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
+```
+
+该配置使用 SGLang 的外部 processor 注册入口。图像请求携带已展开的 prompt IDs 和原始图片；适配器核对图片数量及各图 pad 段与处理后 grid 的对应关系，保留原始文本和动作 IDs，再由 SGLang 根据这一序列计算 offset 和 M-RoPE。对已采样 token 解码后重新编码，即使文本相同，也可能改变 token 边界。字符串请求保持上游行为；该图像适配器会拒绝携带视频、音频或预计算图像输入的 token-ID 请求。
+
+使用包含 config、tokenizer 和 processor 文件的本地模型目录运行回归：
+
+```bash
+CUDA_VISIBLE_DEVICES='' SGLANG_USE_CUDA_IPC_TRANSPORT=0 \
+  RLINF_TEST_QWEN_VL_MODEL=/path/to/Qwen3.5-4B \
+  PYTHONPATH=.:tests/unit_tests \
+  python -m pytest tests/unit_tests/test_agent_ppo.py -k qwen_image_processor
+```
+
+这些 CPU 检查覆盖输入 IDs、图像 tensor、offset，以及 HF 与 SGLang 的 M-RoPE 一致性。部署新版本前，还需要验证真实引擎的生成和 logprob、完整 learner 更新及 checkpoint 恢复。
 
 ## 启动三节点 Ray 和 SAM3
 

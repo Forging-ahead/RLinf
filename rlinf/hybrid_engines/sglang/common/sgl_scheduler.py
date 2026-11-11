@@ -391,7 +391,9 @@ class Scheduler(_Scheduler):
         super().continue_generation(ContinueGenerationReqInput())
         return self.get_async_rollout_state()
 
-    def get_async_rollout_state(self, include_requests: bool = False) -> dict[str, Any]:
+    def get_async_rollout_state(
+        self, include_requests: bool = False, include_live_requests: bool = False
+    ) -> dict[str, Any]:
         """Return publication and generation counters, with optional paused prefixes."""
         parked = self._rlinf_parked or {}
         state = {
@@ -411,6 +413,24 @@ class Scheduler(_Scheduler):
                     ),
                 }
                 for rid, req in parked.items()
+            }
+        if include_live_requests:
+            requests = {req.rid: req for req in self.waiting_queue}
+            for batch in (self.running_batch, self.last_batch, self.cur_batch):
+                if batch is not None:
+                    requests.update((req.rid, req) for req in batch.reqs)
+            if self.chunked_req is not None:
+                requests[self.chunked_req.rid] = self.chunked_req
+            queued = {req.rid for req in self.waiting_queue}
+            state["live_requests"] = {
+                rid: {
+                    "output_tokens": len(req.output_ids),
+                    "prompt_tokens": len(req.origin_input_ids),
+                    "cached_tokens": req.cached_tokens,
+                    "queued": rid in queued,
+                }
+                for rid, req in requests.items()
+                if not req.finished()
             }
         return state
 
