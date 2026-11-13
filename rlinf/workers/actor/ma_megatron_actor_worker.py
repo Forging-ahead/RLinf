@@ -14,6 +14,7 @@
 
 import copy
 from contextlib import nullcontext
+from functools import partial
 from typing import Optional
 
 import torch
@@ -101,6 +102,17 @@ class MAMegatronActor(MegatronActor):
     ):
         self.lm_head_chunk_size = cfg.actor.model.get("lm_head_chunk_size", 0)
         super().__init__(cfg, placement)
+        self.scoring_forward = None
+        if self.lm_head_chunk_size:
+            from rlinf.hybrid_engines.megatron.qwen_vl import (
+                forward_qwen_vl_with_chunked_log_probs,
+            )
+
+            self.scoring_forward = partial(
+                forward_qwen_vl_with_chunked_log_probs,
+                chunk_size=self.lm_head_chunk_size,
+                calculate_entropy=self.calculate_entropy,
+            )
         self._init_auto_scheduler(role)
         self.is_dynamic_rollout_batch = self.cfg.agentloop.is_dynamic_rollout_batch
         assert self.is_dynamic_rollout_batch
@@ -255,6 +267,11 @@ class MAMegatronActor(MegatronActor):
 
             logits_processor_args = {"label": label, "label_mask": label_mask}
 
+            forward_options = {}
+            if chunked_logprobs:
+                # Keep the vocabulary tensor in BF16; scale only FP32 chunks.
+                forward_options["fp32_output"] = False
+
             positions = (
                 None
                 if self.lm_head_chunk_size
@@ -280,15 +297,8 @@ class MAMegatronActor(MegatronActor):
                         "trim_right_padding", False
                     ),
                     **self._forward_multimodal_inputs(batch),
-                    **(
-                        {
-                            "lm_head_chunk_size": self.lm_head_chunk_size,
-                            "calculate_entropy": self.calculate_entropy,
-                        }
-                        if self.lm_head_chunk_size
-                        else {}
-                    ),
-                    **({"fp32_output": False} if chunked_logprobs else {}),
+                    scoring_forward=self.scoring_forward,
+                    **forward_options,
                 )
 
             if not self.return_loss:

@@ -19,7 +19,7 @@ import itertools
 import os
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import megatron
 import torch
@@ -36,7 +36,6 @@ from rlinf.utils.logging import get_logger
 from rlinf.utils.profiler import PyTorchProfiler, PyTorchProfilerFunc
 from rlinf.utils.utils import clear_memory
 
-from .lm_head import forward_qwen_vl_with_chunked_log_probs
 from .utils import (
     postprocess_packed_seqs,
     preprocess_packed_seqs,
@@ -794,18 +793,22 @@ class MegatronModelManager:
         padding_seqlen: Optional[int] = None,
         keep_left_padding: bool = False,
         trim_right_padding: bool = False,
-        lm_head_chunk_size: int = 0,
-        calculate_entropy: bool = False,
+        scoring_forward: Optional[Callable] = None,
         **model_forward_kwargs,
     ):
-        """Default forward pass for GPT models with optional sequence packing."""
+        """Pack model inputs and restore outputs to the caller's padded layout.
+
+        ``scoring_forward`` can replace the packed model/LM-head forward. It
+        receives the wrapper, unwrapped model and packed scoring arguments,
+        and returns per-token scores instead of vocabulary logits.
+        """
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
-        if lm_head_chunk_size and (
+        if scoring_forward is not None and (
             value_model or logits_processor is None or not pack_seqs
         ):
             raise ValueError(
-                "Qwen-VL chunked scoring requires a packed Actor scoring forward"
+                "A scoring forward requires packed Actor inputs and logits processor arguments"
             )
         if pack_seqs:
             # Bridge Qwen-VL embeds images before its own THD/CP packing.
@@ -853,25 +856,19 @@ class MegatronModelManager:
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-            if post_process and lm_head_chunk_size:
-                if not packs_in_model:
-                    raise ValueError(
-                        "This chunked scoring path requires the Qwen-VL wrapper"
-                    )
-                output_orig = forward_qwen_vl_with_chunked_log_probs(
+            if post_process and scoring_forward is not None:
+                output_orig = scoring_forward(
                     model,
                     unwrap_model(model),
                     **args,
-                    chunk_size=lm_head_chunk_size,
                     temperature=temperature,
-                    calculate_entropy=calculate_entropy,
                     **model_inputs,
                 )
             else:
                 output_orig = model(**model_inputs)
                 output_orig /= temperature
             if post_process and logits_processor is not None:
-                if lm_head_chunk_size:
+                if scoring_forward is not None:
                     output_dict = output_orig
                 else:
                     output_dict = logits_processor(output_orig, **args)
