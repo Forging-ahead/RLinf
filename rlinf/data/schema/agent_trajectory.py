@@ -15,7 +15,8 @@
 """Complete agent trajectories, buffered batches, and fixed token targets."""
 
 import sys
-from collections import defaultdict, deque
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -105,18 +106,19 @@ def prepare_agent_critic_returns(
             rows = [
                 i for i, index in enumerate(result.idx_to_traj) if index == trajectory
             ]
-            if not rows or any(result.response_lengths[i] <= 0 for i in rows):
+            positions = [_action_positions(result, i) for i in rows]
+            if not rows or any(len(p) == 0 for p in positions):
                 raise ValueError(
                     "Each agent episode must contain nonempty generated turns."
                 )
-            remaining = sum(result.response_lengths[i] for i in rows)
+            remaining = sum(len(p) for p in positions)
             reward = float(result.rewards[rows[-1]])
-            for row in rows:
-                start, length = result.prompt_lengths[row], result.response_lengths[row]
+            for row, actions in zip(rows, positions, strict=True):
+                length = len(actions)
                 discounts = gamma ** torch.arange(
                     remaining - 1, remaining - length - 1, -1, dtype=torch.float32
                 )
-                result.returns[row, start : start + length] = reward * discounts
+                result.returns[row, actions] = reward * discounts
                 remaining -= length
 
 
@@ -129,6 +131,7 @@ def construct_rollout_batch(
     gamma: float,
     published_version: int,
     max_weight_staleness: int | None = None,
+    release_samples: Callable[[list[int]], None] | None = None,
 ) -> dict[str, Any]:
     """Consume completed trajectories, retry stale ones, and send critic targets."""
     entries: list[BufferedTrajectory] = []
@@ -143,6 +146,9 @@ def construct_rollout_batch(
                 "A rollout version cannot be newer than the published version."
             )
         if max_weight_staleness is not None and lag > max_weight_staleness:
+            # Release the old admission charge before the same ID can be retried.
+            if release_samples is not None:
+                release_samples([entry.sample_id])
             retry_channel.put((entry.sample_id, entry.prompt_ids, entry.answer))
             stale_count += 1
             continue
@@ -182,18 +188,23 @@ def prepare_agent_ppo_targets(
     """
     results = [input_channel.get() for _ in range(batch_size)]
     if logprob_channel is not None:
-        logprobs = defaultdict(deque)
+        predictions = {}
         for _ in range(batch_size):
             prediction = logprob_channel.get()
-            key = tuple(map(tuple, prediction.input_ids))
-            logprobs[key].append(prediction.recomputed_logprobs)
+            if prediction.rollout_ids is None:
+                raise ValueError("Parallel actor predictions require rollout IDs.")
+            key = tuple(prediction.rollout_ids)
+            if key in predictions:
+                raise ValueError(f"Duplicate actor prediction for rollout IDs {key}.")
+            predictions[key] = prediction
         for result in results:
-            key = tuple(map(tuple, result.input_ids))
-            if not logprobs[key]:
+            key = tuple(result.rollout_ids or ())
+            prediction = predictions.pop(key, None)
+            if prediction is None or prediction.input_ids != result.input_ids:
                 raise ValueError(
                     "Expected actor and critic predictions for the same agent turns."
                 )
-            result.recomputed_logprobs = logprobs[key].popleft()
+            result.recomputed_logprobs = prediction.recomputed_logprobs
 
     trajectories = []
     for result in results:

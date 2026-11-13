@@ -973,7 +973,8 @@ class DynamicRolloutResult:
     # row. Async PPO uses the oldest to reject trajectories staler than the
     # configured bound.
     rollout_weight_versions: Optional[list[list[int]]] = None
-    # Async runner sample id of each row, kept for retries and checkpointing.
+    # Group identity, repeated per row and preserved across inference channels.
+    # Async runners use their prompt IDs for retries and checkpointing.
     rollout_ids: Optional[list[int]] = None
     # Processor outputs of the images each row's prompt expanded, one dict per
     # row and None for text-only rows. Kept as plain data so it survives the

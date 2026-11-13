@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 from rlinf.config import torch_dtype_from_precision
 from rlinf.data.schema.reasoning_requests import RolloutRequest, SeqGroupInfo
 from rlinf.data.schema.reasoning_results import RolloutResult
+from rlinf.hybrid_engines.sglang.common.token_metadata import decode_generation_result
 from rlinf.scheduler import Channel, Worker
 from rlinf.scheduler.channel.channel import DEFAULT_KEY
 from rlinf.scheduler.dynamic_scheduler.manager import RolloutScalingScheduler
@@ -583,6 +584,9 @@ class SGLangWorker(Worker):
                 image_data=image_data or None,
                 return_logprob=self._return_logprobs,
             )
+            result_dict = decode_generation_result(
+                result, return_logprobs=self._return_logprobs
+            )
         except Exception as error:
             # The requester waits on this key; report the failure instead of hanging it.
             self.log_error(f"generation failed for request {channel_key}: {error!r}")
@@ -592,31 +596,6 @@ class SGLangWorker(Worker):
                 async_op=True,
             ).async_wait()
             return
-        # sglang will trim matched stop in result text, so we should only return output_ids
-        result_dict = {
-            "output_ids": result["output_ids"],
-            "finish_reason": result["meta_info"]["finish_reason"]["type"],
-            "prompt_tokens": result["meta_info"]["prompt_tokens"],
-        }
-        if "forced_token_mask" in result["meta_info"]:
-            flags = result["meta_info"]["forced_token_mask"]
-            if len(flags) != len(result_dict["output_ids"]) or any(
-                type(flag) is not bool for flag in flags
-            ):
-                raise ValueError(
-                    "Engine forced-token metadata must align with output IDs"
-                )
-            result_dict["forced_token_positions"] = [
-                index for index, forced in enumerate(flags) if forced
-            ]
-        if self._return_logprobs:
-            result_dict["logprobs"] = [
-                item[0] for item in result["meta_info"]["output_token_logprobs"]
-            ]
-        if "rollout_weight_versions" in result["meta_info"]:
-            result_dict["weight_versions"] = result["meta_info"][
-                "rollout_weight_versions"
-            ]
         await output_channel.put(
             result_dict, key=channel_key, async_op=True
         ).async_wait()

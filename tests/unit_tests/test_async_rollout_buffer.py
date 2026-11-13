@@ -501,3 +501,44 @@ def test_async_resume_preserves_producer_sampler_order(
 
     assert [restored._next_prompt() for _ in range(48)] == expected
     assert restored._restored_pending == [prompt]
+
+
+def test_critic_discounts_only_generated_tokens():
+    from rlinf.data.schema.agent_trajectory import prepare_agent_critic_returns
+
+    result = trajectory().result
+    result.response_mask = [[1, 0], [1]]
+    prepare_agent_critic_returns([result], seq_length=6, gamma=0.5)
+    torch.testing.assert_close(
+        result.returns,
+        torch.tensor([[0, 0.5, 0, 0, 0, 0], [0, 0, 0, 0, 1, 0]]).float(),
+    )
+
+
+def test_stale_retry_releases_byte_admission_before_requeue(producer_worker):
+    worker = producer_worker()
+    worker.cfg.rollout.max_buffer_bytes = 1
+    worker._async_retained_bytes = {0: 100, 1: 100}
+    worker._update_memory_admission()
+    assert not worker._async_memory_admission.is_set()
+
+    class RetryChannel:
+        def put(self, prompt):
+            assert worker._async_memory_admission.is_set()
+            assert prompt[0] not in worker._async_retained_bytes
+            incoming.put(trajectory(prompt[0], [[3, 3], [3]]))
+
+    incoming, output = channel(), channel()
+    for sample_id in range(2):
+        incoming.put(trajectory(sample_id))
+    state = consume(
+        incoming,
+        output,
+        RetryChannel(),
+        batch_size=2,
+        published_version=3,
+        max_weight_staleness=0,
+        release_samples=worker.release_rollout_bytes,
+    )
+    assert state["stale_dropped"] == 2
+    assert state["sample_ids"] == [0, 1]

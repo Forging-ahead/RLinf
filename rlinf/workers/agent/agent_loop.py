@@ -470,6 +470,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         self.extra_keys_turn = None
         self.extra_keys_traj = None
         self.is_eval = self.cfg.runner.task_type == "reasoning_eval"
+        self._next_rollout_id = self._rank
         self._async_in_flight = 0
         self._async_sending = 0
         self._async_admission = asyncio.Event()
@@ -641,6 +642,10 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         # For eval mode, allow multiple samples (group_size=k) to compute pass@k and avg@k
         extra_fields = self.gen_extra_fields(task_results, answer)
         rollout_result = self.get_rollout_result(task_results, *extra_fields)
+        rollout_result.rollout_ids = [
+            self._next_rollout_id
+        ] * rollout_result.num_sequence
+        self._next_rollout_id += self._world_size
         agent_metrics = self.get_rollout_metrics(rollout_result)
 
         if output_channel is None:
@@ -720,16 +725,22 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                     extra_fields_traj[k].append(v)
         return extra_fields_turn, extra_fields_traj, None, {}
 
-    def post_process_metric(self, agent_metrics_list: list[dict]):
+    def post_process_metric(
+        self, agent_metrics_list: list[dict], *, gather_workers: bool = True
+    ):
         """Merge per-query metrics, including weighted stats across workers.
 
         Args:
             agent_metrics_list: Metrics returned by each query rollout.
+            gather_workers: Gather worker-local lists. Set false when the runner
+                supplies a complete learner batch to every worker.
 
         Returns:
             Aggregated metric dictionary on rank 0, or empty dict on no data.
         """
-        if self._world_size > 1:
+        if not gather_workers and self._rank != 0:
+            return None
+        if gather_workers and self._world_size > 1:
             if self._rank == 0:
                 for i in range(1, self._world_size):
                     recv_list = self.recv(self._group_name, i)

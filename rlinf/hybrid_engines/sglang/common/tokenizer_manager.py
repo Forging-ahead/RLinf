@@ -40,6 +40,7 @@ from .io_struct import (
     TaskMethodInput,
     TaskMethodOutput,
 )
+from .token_metadata import accumulate_token_metadata
 
 
 # Add two methods and their communicators, input/output structs.
@@ -138,29 +139,6 @@ class TokenizerManager(_TokenizerManager):
         self.auto_create_handle_loop()
         await self.abort_generation_communicator(obj)
 
-    # to return output_ids and response_text simaltaneously in sglang 0.4.x.
-    # copied from srt/managers/tokenizer_manager.py (0.4.6) and only add "output_ids" in out_dict when isinstance(recv_obj, BatchStrOut) is True
-    def _accumulate_weight_versions(self, recv_obj) -> None:
-        """Join each output batch's per-token versions onto the request state.
-
-        A retracted request resumes generation, so one request can report
-        several batches; each batch carries only its own newly generated
-        tokens.
-        """
-        versions = (getattr(recv_obj, "customized_info", None) or {}).get(
-            "rollout_weight_versions"
-        )
-        if versions is None:
-            return
-        for index, rid in enumerate(recv_obj.rids):
-            state = self.rid_to_state.get(rid)
-            if state is None:
-                continue
-            accumulated = list(getattr(state, "rlinf_weight_versions", []))
-            accumulated.extend(versions[index])
-            state.rlinf_weight_versions = accumulated
-            versions[index] = list(accumulated)
-
     def _handle_batch_output(
         self,
         recv_obj,
@@ -168,7 +146,7 @@ class TokenizerManager(_TokenizerManager):
         import json
         import time
 
-        self._accumulate_weight_versions(recv_obj)
+        accumulate_token_metadata(recv_obj, self.rid_to_state)
 
         # for sglang 0.5.0 and later, we use the original _handle_batch_output
         if not self.patch_return_output_ids:

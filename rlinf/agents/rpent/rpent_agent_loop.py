@@ -606,9 +606,13 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             metrics[f"__mean__/rpent/infra_retries/{kind}"] = (counts[kind], episodes)
         return metrics
 
-    def post_process_metric(self, agent_metrics_list: list[dict]) -> dict | None:
+    def post_process_metric(
+        self, agent_metrics_list: list[dict], *, gather_workers: bool = True
+    ) -> dict | None:
         """Stop the update when too many episodes needed infrastructure retries."""
-        metrics = super().post_process_metric(agent_metrics_list)
+        metrics = super().post_process_metric(
+            agent_metrics_list, gather_workers=gather_workers
+        )
         if not metrics:
             return metrics
         threshold = self.cfg.agentloop.max_infra_retry_rate

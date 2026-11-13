@@ -147,6 +147,8 @@ rollout:
   rollout_backend: sglang
   sglang:
     attention_backend: triton
+    # Keep the CPU token history current for penalties and thinking limits.
+    disable_overlap_schedule: true
     decode_log_interval: 500000
     use_torch_compile: false
     torch_compile_max_bs: 128

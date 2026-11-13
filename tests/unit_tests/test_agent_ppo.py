@@ -629,7 +629,8 @@ def test_ppo_targets_join_parallel_predictions_and_preserve_fixed_values(
     results = DynamicRolloutResult.split_results(make_result(), [2, 1])
     if duplicate_turns:
         results[1] = copy.deepcopy(results[0])
-    for result in results:
+    for sample_id, result in enumerate(results):
+        result.rollout_ids = [sample_id] * result.num_sequence
         result.group_size = 1
         result.idx_to_traj = [0] * result.num_sequence
     input_channel, output_channel, logprob_channel = (
@@ -650,7 +651,7 @@ def test_ppo_targets_join_parallel_predictions_and_preserve_fixed_values(
     for index in range(2):
         received = output_channel.get()
         torch.testing.assert_close(received.values, old_values[1 - index])
-        prediction_index = index if duplicate_turns else 1 - index
+        prediction_index = 1 - index
         torch.testing.assert_close(
             received.recomputed_logprobs,
             torch.full_like(received.values, -prediction_index - 1.0),
@@ -667,6 +668,7 @@ def test_ppo_targets_reject_mismatched_parallel_predictions():
         _local_channel(),
     )
     result = make_result()
+    result.rollout_ids = [0] * result.num_sequence
     prediction = copy.deepcopy(result)
     prediction.input_ids[0][0] += 1
     input_channel.put(result)
@@ -2739,3 +2741,66 @@ def test_chunked_lm_head_two_rank_vocab_shards(tmp_path):
     mp.spawn(
         _chunked_lm_head_tp_reference, args=((tmp_path / "tp-init").as_uri(),), nprocs=2
     )
+
+
+def test_sglang_packet_metadata_stays_aligned_with_cumulative_tokens():
+    from rlinf.hybrid_engines.sglang.common.token_metadata import (
+        accumulate_token_metadata,
+        decode_generation_result,
+    )
+
+    states = {"episode": SimpleNamespace()}
+    for version, count, forced in [(1, 3, False), (2, 2, False), (2, 1, True)]:
+        packet = SimpleNamespace(
+            rids=["episode", "cancelled"],
+            customized_info={
+                "rollout_weight_versions": [[version] * count, [0]],
+                "forced_token_mask": [[forced] * count, [False]],
+            },
+        )
+        accumulate_token_metadata(packet, states)
+    assert packet.customized_info["rollout_weight_versions"][0] == [1, 1, 1, 2, 2, 2]
+    assert packet.customized_info["forced_token_mask"][0] == [False] * 5 + [True]
+
+    result = decode_generation_result(
+        {
+            "output_ids": [10, 11, 12, 13, 14, 15],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 8,
+                "forced_token_mask": packet.customized_info["forced_token_mask"][0],
+                "rollout_weight_versions": packet.customized_info[
+                    "rollout_weight_versions"
+                ][0],
+                "output_token_logprobs": [
+                    (-0.5, token, None) for token in range(10, 16)
+                ],
+            },
+        },
+        return_logprobs=True,
+    )
+    assert result["forced_token_positions"] == [5]
+    assert (
+        len(result["logprobs"])
+        == len(result["weight_versions"])
+        == len(result["output_ids"])
+    )
+
+
+def test_sglang_rejects_truncated_forced_token_metadata():
+    from rlinf.hybrid_engines.sglang.common.token_metadata import (
+        decode_generation_result,
+    )
+
+    with pytest.raises(ValueError, match="align with output IDs"):
+        decode_generation_result(
+            {
+                "output_ids": [1, 2],
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                    "prompt_tokens": 1,
+                    "forced_token_mask": [True],
+                },
+            },
+            return_logprobs=False,
+        )

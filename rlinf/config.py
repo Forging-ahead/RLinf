@@ -1800,6 +1800,12 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             "enable_thinking", True
         ):
             raise ValueError("A thinking budget requires enable_thinking=True.")
+        if not cfg.rollout.sglang.get("disable_overlap_schedule", False):
+            raise ValueError(
+                "agentloop.thinking_token_budget requires "
+                "rollout.sglang.disable_overlap_schedule=True; "
+                "overlapped decoding can expose stale CPU token history."
+            )
     if (
         agentloop.toolcall_parser != "qwen3.5"
         or agentloop.agentic_tokenizer != "qwen3_5"

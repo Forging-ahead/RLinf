@@ -789,8 +789,9 @@ def test_episodes_render_on_slot_gpus_and_successes_drop_artifacts(make_agent):
 @pytest.mark.parametrize(
     "retried,threshold,stops", [(2, 0.05, False), (3, 0.05, True), (10, 1.0, False)]
 )
+@pytest.mark.parametrize("gather_workers", [True, False])
 def test_retry_rate_above_the_limit_stops_the_update(
-    make_agent, retried, threshold, stops
+    make_agent, retried, threshold, stops, gather_workers
 ):
     worker = make_agent(FakeRPent())
     worker.cfg.agentloop.max_infra_retry_rate = threshold
@@ -812,10 +813,10 @@ def test_retry_rate_above_the_limit_stops_the_update(
     metrics += [episode([]) for _ in range(10 - retried)]
     if stops:
         with pytest.raises(RuntimeError, match="retry rate 30.00%"):
-            worker.post_process_metric(metrics)
+            worker.post_process_metric(metrics, gather_workers=gather_workers)
     else:
         # Recovered episodes remain counted even when the batch is accepted.
-        result = worker.post_process_metric(metrics)
+        result = worker.post_process_metric(metrics, gather_workers=gather_workers)
         assert result["rpent/infra_retry_rate"] == retried / 10
         assert result["rpent/infra_retries/process"] == retried / 10
 
@@ -871,6 +872,14 @@ def test_example_config_satisfies_the_rpent_contract(config_name):
                 "agentloop.chat_template_kwargs.enable_thinking=false",
             ],
             "enable_thinking=True",
+        ),
+        (
+            [
+                "agentloop.thinking_token_budget=512",
+                "rollout.sglang.enable_custom_logit_processor=true",
+                "rollout.sglang.disable_overlap_schedule=false",
+            ],
+            "disable_overlap_schedule=True",
         ),
     ],
 )

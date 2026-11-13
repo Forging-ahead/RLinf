@@ -32,7 +32,6 @@ from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.logging import get_logger
 from rlinf.utils.runner_utils import check_progress
-from rlinf.workers.agent.agent_loop import MultiAgentLoopWorker
 
 logger = get_logger()
 
@@ -183,6 +182,10 @@ class AsyncAgentPPORunner(AgentPPORunner):
             self.published_version = self.actor_version
             self.rollout.resume_generation().wait()
 
+    def _release_rollout_bytes(self, sample_ids: list[int]) -> None:
+        if self.cfg.rollout.get("max_buffer_bytes", 0):
+            self.agent_loop.release_rollout_bytes(sample_ids).wait()
+
     def _rollout_memory_metrics(self) -> dict:
         states = self.agent_loop.get_async_buffer_bytes().wait()
         return {
@@ -242,20 +245,18 @@ class AsyncAgentPPORunner(AgentPPORunner):
                         gamma=self.cfg.algorithm.gamma,
                         published_version=self.published_version,
                         max_weight_staleness=self.cfg.rollout.max_weight_staleness,
+                        release_samples=self._release_rollout_bytes,
                     )
                     self._stale_count += batch_state["stale_dropped"]
                     for sample_id in batch_state["sample_ids"]:
                         self._pending.pop(sample_id)
-                    if self.cfg.rollout.get("max_buffer_bytes", 0):
-                        self.agent_loop.release_rollout_bytes(
-                            batch_state["sample_ids"]
-                        ).wait()
+                    self._release_rollout_bytes(batch_state["sample_ids"])
                     if not self.drain_before_training:
                         self._put_prompts()
                 consumed_version = self.published_version
-                agent_metrics = MultiAgentLoopWorker.aggregate_metrics(
-                    batch_state["agent_metrics"]
-                )
+                agent_metrics = self.agent_loop.post_process_metric(
+                    batch_state["agent_metrics"], gather_workers=False
+                ).wait()[0]
                 paused_states = []
                 if self.drain_before_training:
                     with self.timer("drain_rollout"):
