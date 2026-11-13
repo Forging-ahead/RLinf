@@ -1,0 +1,551 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""SGLang request metadata, image processing, and service lifecycle."""
+
+import asyncio
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import MethodType, SimpleNamespace
+
+import pytest
+import torch
+
+from rlinf.scheduler import Channel, Cluster
+
+
+def test_sglang_scheduler_wrapper_keeps_the_vendor_entrypoint():
+    pytest.importorskip("sglang")
+    # Engine installation rewrites imported aliases. Check in a fresh process
+    # so global patches neither hide this regression nor leak into other tests.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from rlinf.hybrid_engines.sglang.common import sgl_engine, sgl_scheduler; "
+            "from sglang.srt.managers import scheduler; "
+            "assert scheduler.run_scheduler_process is sgl_scheduler.run_scheduler_process; "
+            "assert sgl_scheduler.ORIG__run_scheduler_process is not scheduler.run_scheduler_process; "
+            "assert sgl_scheduler.ORIG__run_scheduler_process.__module__ == 'sglang.srt.managers.scheduler'",
+        ],
+        check=True,
+        timeout=60,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+
+
+@pytest.fixture
+def qwen_image_processor():
+    """Real SGLang/HF preprocessing; model assets are optional in CPU CI."""
+    model_path = os.environ.get("RLINF_TEST_QWEN_VL_MODEL")
+    if not model_path:
+        pytest.skip("Set RLINF_TEST_QWEN_VL_MODEL to a local Qwen3.5 processor.")
+    pytest.importorskip("sglang")
+    from transformers import AutoConfig, AutoProcessor
+
+    from rlinf.hybrid_engines.sglang.multimodal.qwen_vl import TokenizedQwenVLProcessor
+
+    hf = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    server = SimpleNamespace(
+        mm_process_config={},
+        skip_tokenizer_init=True,
+        disable_fast_image_processor=True,
+        keep_mm_feature_on_device=False,
+        tokenizer_worker_num=1,
+    )
+    processor = TokenizedQwenVLProcessor(config, server, hf, "cpu", skip_mm_pool=True)
+    try:
+        yield processor, hf, config
+    finally:
+        processor.io_executor.shutdown()
+        processor.cpu_executor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("detokenize", "parts"),
+    [(False, ["\n", "\n"]), (True, ["\n", "\n"]), (False, ["a", "hello"])],
+)
+def test_qwen_image_processor_preserves_sampled_tokens(
+    qwen_image_processor, detokenize, parts
+):
+    from PIL import Image
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+
+    processor, hf, config = qwen_image_processor
+    processor.server_args.skip_tokenizer_init = not detokenize
+    images = [Image.new("RGB", (64, 64), "red"), Image.new("RGB", (96, 64), "blue")]
+    separator = "".join(parts)
+    text = f"A<|vision_start|><|image_pad|><|vision_end|>{separator}<|im_end|>B<|vision_start|><|image_pad|><|vision_end|>C"
+    expected = hf(text=[text], images=images, return_tensors="pt")
+    canonical = expected.input_ids[0].tolist()
+    at = canonical.index(config.vision_end_token_id) + 1
+    separator_size = len(hf.tokenizer.encode(separator, add_special_tokens=False))
+    prompt = (
+        canonical[:at]
+        + [
+            token
+            for part in parts
+            for token in hf.tokenizer.encode(part, add_special_tokens=False)
+        ]
+        + canonical[at + separator_size :]
+    )
+    assert hf.tokenizer.decode(prompt) == hf.tokenizer.decode(canonical)
+    assert prompt != hf.tokenizer.encode(
+        hf.tokenizer.decode(prompt), add_special_tokens=False
+    )
+    request = SimpleNamespace(
+        video_data=None, audio_data=None, rid="token-preservation"
+    )
+    output = asyncio.run(processor.process_mm_data_async(images, prompt, request))
+    assert output.input_ids == prompt
+    assert torch.equal(
+        torch.cat([item.feature for item in output.mm_items]), expected.pixel_values
+    )
+    input_ids = torch.tensor([prompt])
+    for item in output.mm_items:
+        for start, end in item.offsets:
+            assert input_ids[0, start : end + 1].eq(config.image_token_id).all()
+    # HF's independent position implementation needs only configuration, not weights.
+    geometry = SimpleNamespace(config=config)
+    geometry.get_vision_position_ids = MethodType(
+        Qwen3_5Model.get_vision_position_ids, geometry
+    )
+    positions, delta = Qwen3_5Model.get_rope_index(
+        geometry,
+        input_ids,
+        (input_ids == config.image_token_id).int(),
+        image_grid_thw=expected.image_grid_thw,
+    )
+    assert torch.equal(output.mrope_positions, positions[:, 0])
+    assert torch.equal(output.mrope_position_delta, delta)
+
+
+@pytest.mark.parametrize("invalid", ["grid", "image_count"])
+def test_qwen_image_processor_rejects_inconsistent_images(
+    qwen_image_processor, invalid
+):
+    from PIL import Image
+
+    processor, hf, config = qwen_image_processor
+    images = [Image.new("RGB", (64, 64), "red")]
+    prompt = (
+        hf(
+            text=["A<|vision_start|><|image_pad|><|vision_end|>B"],
+            images=images,
+            return_tensors="pt",
+        )
+        .input_ids[0]
+        .tolist()
+    )
+    if invalid == "grid":
+        prompt.remove(config.image_token_id)
+        message = "processor grid needs"
+    else:
+        images.append(images[0])
+        message = "image spans, but received"
+    request = SimpleNamespace(video_data=None, audio_data=None, rid="invalid-image")
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(processor.process_mm_data_async(images, prompt, request))
+
+
+def test_qwen_image_processor_keeps_text_request_behavior(qwen_image_processor):
+    from PIL import Image
+
+    processor, hf, _ = qwen_image_processor
+    images = [Image.new("RGB", (64, 64), "red")]
+    text = "A<|vision_start|><|image_pad|><|vision_end|>\n\nB"
+    expected = hf(text=[text], images=images, return_tensors="pt")
+    request = SimpleNamespace(video_data=None, audio_data=None, rid="text-request")
+    output = asyncio.run(processor.process_mm_data_async(images, text, request))
+    assert output.input_ids == expected.input_ids[0].tolist()
+    assert torch.equal(output.mm_items[0].feature, expected.pixel_values)
+
+
+def test_qwen_image_processor_external_registration(qwen_image_processor, monkeypatch):
+    from sglang.srt.managers import multimodal_processor
+
+    processor, _, _ = qwen_image_processor
+    monkeypatch.setattr(multimodal_processor, "PROCESSOR_MAPPING", {})
+    multimodal_processor.import_processors(
+        "rlinf.hybrid_engines.sglang.multimodal", overwrite=True
+    )
+    for model in processor.models:
+        assert multimodal_processor.PROCESSOR_MAPPING[model] is type(processor)
+
+
+@pytest.mark.parametrize("resume_dir", [None, "/checkpoint"])
+@pytest.mark.parametrize("backup", [None, False, True])
+def test_sglang_cpu_backup_loads_unsynchronized_weights(
+    monkeypatch, resume_dir, backup
+):
+    import dataclasses
+
+    from omegaconf import OmegaConf
+
+    pytest.importorskip("sglang")
+    from rlinf.workers.rollout.sglang import sglang_worker
+
+    # Isolate the vendor engine boundary; exercise RLinf's real argument assembly.
+    def server_args(**kwargs):
+        cls = dataclasses.make_dataclass(
+            "ServerArgs", [(key, object) for key in kwargs]
+        )
+        return cls(**kwargs)
+
+    monkeypatch.setattr(sglang_worker, "ServerArgs", server_args)
+    monkeypatch.setattr(sglang_worker, "Engine", lambda **kwargs: kwargs)
+    rollout = OmegaConf.create(
+        {
+            "enforce_eager": False,
+            "validate_weight": False,
+            "validate_weight_first_sync": True,
+            "model": {
+                "model_path": "/model",
+                "precision": "bf16",
+                "trust_remote_code": True,
+            },
+            "sglang": {
+                "use_torch_compile": False,
+                "torch_compile_max_bs": 4,
+                "decode_log_interval": 100,
+                "attention_backend": "triton",
+            },
+            "cuda_graph_max_bs": 4,
+            "max_running_requests": 12,
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.7,
+            "detokenize": False,
+        }
+    )
+    if backup is not None:
+        rollout.sglang.enable_weights_cpu_backup = backup
+    worker = SimpleNamespace(
+        _cfg=SimpleNamespace(runner=SimpleNamespace(resume_dir=resume_dir)),
+        _cfg_rollout=rollout,
+        _rank=0,
+        weight_reload="sync",
+        acquire_free_port=lambda: 12345,
+        log_on_first_rank=lambda message: None,
+    )
+    sglang_worker.SGLangWorker._init_engine(worker)
+    assert worker._engine["enable_weights_cpu_backup"] is bool(backup)
+    assert worker._engine["load_format"] == (
+        "auto" if backup or resume_dir is None else "dummy"
+    )
+
+
+@pytest.mark.parametrize("num_nodes", [1, 2])
+def test_sglang_replicas_reserve_both_initialization_ports(monkeypatch, num_nodes):
+    import dataclasses
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from itertools import count
+
+    from omegaconf import OmegaConf
+
+    pytest.importorskip("sglang")
+    from rlinf.scheduler.manager.lock_manager import PortLockManager
+    from rlinf.scheduler.worker.lock import PortLock
+    from rlinf.scheduler.worker.worker import Worker
+    from rlinf.workers.rollout.sglang import sglang_worker
+
+    # Repeated candidates force contention in the real node-scoped lock.
+    manager = object.__new__(PortLockManager)
+    manager._port_locks = {}
+    manager._lock = threading.Lock()
+    candidates = count()
+    candidate_lock = threading.Lock()
+
+    def find_free_port(max_port_num=None):
+        with candidate_lock:
+            return 35000 + next(candidates) // 4
+
+    monkeypatch.setattr(Cluster, "find_free_port", staticmethod(find_free_port))
+
+    def server_args(**kwargs):
+        cls = dataclasses.make_dataclass(
+            "ServerArgs", [(key, object) for key in kwargs]
+        )
+        return cls(**kwargs)
+
+    monkeypatch.setattr(sglang_worker, "ServerArgs", server_args)
+    monkeypatch.setattr(sglang_worker, "Engine", lambda **kwargs: kwargs)
+
+    def initialize(rank):
+        worker = SimpleNamespace(
+            _cfg=SimpleNamespace(runner=SimpleNamespace(resume_dir=None)),
+            _cfg_rollout=OmegaConf.create(
+                {
+                    "enforce_eager": True,
+                    "validate_weight": False,
+                    "model": {
+                        "model_path": "/model",
+                        "precision": "bf16",
+                        "trust_remote_code": False,
+                    },
+                    "sglang": {
+                        "use_torch_compile": False,
+                        "torch_compile_max_bs": 4,
+                        "decode_log_interval": 100,
+                        "attention_backend": "triton",
+                    },
+                    "cuda_graph_max_bs": 4,
+                    "max_running_requests": 12,
+                    "tensor_parallel_size": 1,
+                    "gpu_memory_utilization": 0.7,
+                    "detokenize": False,
+                }
+            ),
+            _cluster_node_rank=rank % num_nodes,
+            _worker_name=f"rollout-{rank}",
+            _rank=rank,
+            weight_reload="sync",
+            log_on_first_rank=lambda message: None,
+        )
+        port_lock = object.__new__(PortLock)
+        port_lock._worker = worker
+        port_lock._lock_manager = manager
+        worker._port_lock = port_lock
+        worker.acquire_free_port = lambda: Worker.acquire_free_port(worker)
+        sglang_worker.SGLangWorker._init_engine(worker)
+        return worker, worker._engine
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(initialize, range(16)))
+
+    assert len(manager._port_locks) == 32
+    for worker, args in results:
+        nccl_port = args["nccl_port"]
+        init_port = int(args["dist_init_addr"].rsplit(":", 1)[1])
+        assert nccl_port != init_port
+        for port in (nccl_port, init_port):
+            assert manager._port_locks[worker._cluster_node_rank, port] == (
+                worker._worker_name
+            )
+    assert next(candidates) > 32
+
+    # Exercise the installed vendor handoff without launching an engine.
+    from sglang.srt import server_args as vendor
+
+    def unexpected_free_port():
+        pytest.fail("SGLang must use the port reserved by RLinf.")
+
+    monkeypatch.setattr(vendor, "get_free_port", unexpected_free_port)
+    args = results[0][1]
+    vendor_args = object.__new__(vendor.ServerArgs)
+    vendor_args.nccl_port = args["nccl_port"]
+    vendor_args.dist_init_addr = args["dist_init_addr"]
+    ports = vendor.PortArgs.init_new(vendor_args)
+    try:
+        assert ports.nccl_port == args["nccl_port"]
+    finally:
+        for value in vars(ports).values():
+            if isinstance(value, str) and value.startswith("ipc://"):
+                Path(value.removeprefix("ipc://")).unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("cache_kind", ["legacy", "radix", "mamba", "swa"])
+@pytest.mark.parametrize("num_running", [0, 3])
+def test_sglang_running_state_uses_native_hybrid_pool_accounting(
+    cache_kind, num_running
+):
+    from types import MethodType
+    from unittest.mock import Mock
+
+    pytest.importorskip("sglang")
+    from sglang.srt.managers.scheduler import Scheduler as VendorScheduler
+
+    from rlinf.hybrid_engines.sglang.common.sgl_scheduler import Scheduler
+
+    cache = SimpleNamespace(evictable_size=lambda: 20)
+    allocator = SimpleNamespace(available_size=lambda: 50, size=100)
+    state = SimpleNamespace(
+        max_total_num_tokens=100,
+        max_running_requests=8,
+        token_to_kv_pool_allocator=allocator,
+        tree_cache=cache,
+        running_batch=SimpleNamespace(reqs=[object()] * num_running),
+        waiting_queue=[object(), object()],
+    )
+    expected_used = 30
+    if cache_kind != "legacy":
+        state.is_hybrid_ssm = cache_kind == "mamba"
+        state.is_hybrid_swa = cache_kind == "swa"
+        state.enable_hisparse = False
+        state.get_pool_stats = MethodType(VendorScheduler.get_pool_stats, state)
+        for name in ("_get_token_info", "_get_mamba_token_info", "_get_swa_token_info"):
+            setattr(state, name, MethodType(getattr(VendorScheduler, name), state))
+    if cache_kind in ("mamba", "swa"):
+        cache.evictable_size = Mock(side_effect=NotImplementedError)
+        cache.full_evictable_size = lambda: 20
+    if cache_kind == "mamba":
+        cache.supports_mamba = lambda: True
+        cache.is_tree_cache = lambda: True
+        cache.mamba_evictable_size = lambda: 2
+        state.req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(size=10, available_size=lambda: 3)
+        )
+    elif cache_kind == "swa":
+        allocator.available_size = Mock(side_effect=NotImplementedError)
+        allocator.full_available_size = lambda: 30
+        allocator.swa_available_size = lambda: 15
+        cache.swa_evictable_size = lambda: 5
+        state.full_tokens_per_layer = 100
+        state.swa_tokens_per_layer = 60
+        expected_used = 50
+
+    assert Scheduler.get_scheduler_running_state(state) == {
+        "num_running_reqs": num_running,
+        "max_running_reqs": 8,
+        "num_used_tokens": expected_used,
+        "max_total_num_tokens": 100,
+        "token_usage": expected_used / 100,
+        "num_queue_reqs": 2,
+    }
+    if cache_kind in ("mamba", "swa"):
+        cache.evictable_size.assert_not_called()
+    if cache_kind == "swa":
+        allocator.available_size.assert_not_called()
+
+
+@pytest.mark.placement
+@pytest.mark.parametrize("replica_affinity", [False, True])
+def test_serverless_shutdown_unblocks_the_replica_queue(replica_affinity):
+    from omegaconf import OmegaConf
+
+    from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
+
+    Cluster(num_nodes=1)
+    incoming = Channel.create(f"shutdown-input-{replica_affinity}")
+    outgoing = Channel.create(f"shutdown-output-{replica_affinity}")
+    assert incoming.qsize() == outgoing.qsize() == 0
+    worker = object.__new__(SGLangWorker)
+    worker._rank = 3
+    worker._cfg_rollout = OmegaConf.create({"replica_affinity": replica_affinity})
+    request_key = worker._rank if replica_affinity else "default_queue"
+
+    async def run():
+        consumer = asyncio.create_task(worker.rollout_serverless(incoming, outgoing))
+        try:
+            while not hasattr(worker, "_serverless_group"):
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
+            await worker.stop_serverless()
+            await asyncio.wait_for(consumer, timeout=2)
+            for _ in range(100):
+                if incoming.empty(key=request_key):
+                    break
+                await asyncio.sleep(0.01)
+            assert incoming.empty(key=request_key)
+            assert incoming.empty()
+        finally:
+            # Release a receiver even when an incorrect stop key fails this test.
+            incoming.put(None, key=request_key)
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+
+@pytest.mark.parametrize("do_sample", [True, False])
+@pytest.mark.parametrize("presence_penalty", [None, 0.0, 1.5])
+def test_sglang_sampling_keeps_explicit_presence_penalty(do_sample, presence_penalty):
+    from omegaconf import OmegaConf
+
+    from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
+
+    params = {
+        "do_sample": do_sample,
+        "temperature": 1.0,
+        "top_k": 20,
+        "top_p": 0.95,
+        "repetition_penalty": 1.0,
+        "max_new_tokens": 32768,
+    }
+    if presence_penalty is not None:
+        params["presence_penalty"] = presence_penalty
+    actual = SGLangWorker.get_sampling_param_from_config(OmegaConf.create(params))
+    if presence_penalty is None:
+        assert "presence_penalty" not in actual
+    else:
+        assert actual["presence_penalty"] == presence_penalty
+    assert actual["max_new_tokens"] == 32768
+    if do_sample:
+        assert actual["repetition_penalty"] == 1.0
+
+
+def test_sglang_packet_metadata_stays_aligned_with_cumulative_tokens():
+    from rlinf.hybrid_engines.sglang.common.token_metadata import (
+        accumulate_token_metadata,
+        decode_generation_result,
+    )
+
+    states = {"episode": SimpleNamespace()}
+    for version, count, forced in [(1, 3, False), (2, 2, False), (2, 1, True)]:
+        packet = SimpleNamespace(
+            rids=["episode", "cancelled"],
+            customized_info={
+                "rollout_weight_versions": [[version] * count, [0]],
+                "forced_token_mask": [[forced] * count, [False]],
+            },
+        )
+        accumulate_token_metadata(packet, states)
+    assert packet.customized_info["rollout_weight_versions"][0] == [1, 1, 1, 2, 2, 2]
+    assert packet.customized_info["forced_token_mask"][0] == [False] * 5 + [True]
+
+    result = decode_generation_result(
+        {
+            "output_ids": [10, 11, 12, 13, 14, 15],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 8,
+                "forced_token_mask": packet.customized_info["forced_token_mask"][0],
+                "rollout_weight_versions": packet.customized_info[
+                    "rollout_weight_versions"
+                ][0],
+                "output_token_logprobs": [
+                    (-0.5, token, None) for token in range(10, 16)
+                ],
+            },
+        },
+        return_logprobs=True,
+    )
+    assert result["forced_token_positions"] == [5]
+    assert (
+        len(result["logprobs"])
+        == len(result["weight_versions"])
+        == len(result["output_ids"])
+    )
+
+
+def test_sglang_rejects_truncated_forced_token_metadata():
+    from rlinf.hybrid_engines.sglang.common.token_metadata import (
+        decode_generation_result,
+    )
+
+    with pytest.raises(ValueError, match="align with output IDs"):
+        decode_generation_result(
+            {
+                "output_ids": [1, 2],
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                    "prompt_tokens": 1,
+                    "forced_token_mask": [True],
+                },
+            },
+            return_logprobs=False,
+        )
