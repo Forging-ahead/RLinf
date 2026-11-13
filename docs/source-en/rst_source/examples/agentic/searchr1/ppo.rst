@@ -84,7 +84,7 @@ Install the Megatron training stack with SGLang following
    bash requirements/install.sh agentic --engine sglang
    source .venv/bin/activate
 
-PPO currently requires Megatron TP=PP=CP=1. The supplied recipes use SGLang TP=PP=1.
+PPO requires Megatron TP=PP=CP=1. The supplied recipes use SGLang TP=PP=1.
 Manage retrieval resources separately from the eight training GPUs; see
 :doc:`index` for retrieval setup.
 
