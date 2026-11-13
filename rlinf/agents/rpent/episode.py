@@ -48,25 +48,12 @@ class Episode:
 def merge_prefix_turns(
     turns: list[AgentLoopOutput], max_scored_tokens: int
 ) -> list[AgentLoopOutput]:
-    """Merge consecutive turns whose prompt extends the previous turn's tokens.
+    """Merge prefix-compatible turns within one image render chain.
 
-    A merged sample keeps the earlier turns' generated tokens and turns the
-    tokens between turns (tool results, observations) into response tokens
-    with mask 0 and logprob 0. A sample ends at a history rewrite, such as
-    compaction, or before it would score more than ``max_scored_tokens``
-    generated tokens, which bounds the logits one training row computes.
-    Rewards and per-turn metadata come from the last merged turn;
-    ``extra_fields["turn_ids"]`` lists the merged turn IDs.
-
-    Image turns merge on the same token-prefix rule, but only within one
-    render chain (``extra_fields["chain_id"]``): a turn whose history was
-    rewritten starts a new chain, so its images never fold into the previous
-    row even when a same-size replacement leaves the pad tokens unchanged. A
-    merged row takes the last merged turn's image set, which its tokens expand.
-
-    Unlike ``DynamicRolloutResult.pack_traj_batch``, which folds turns only for
-    training, merged rows also shorten logprob and value inference. Train them
-    with ``actor.pack_traj: false``.
+    Tool/observation gaps receive mask 0 and logprob 0. Split at history
+    rewrites or ``max_scored_tokens``. Keep the last turn's images, reward
+    and metadata, and record all merged IDs in ``extra_fields["turn_ids"]``.
+    Use ``actor.pack_traj=false`` because these rows are already merged.
     """
     merged: list[AgentLoopOutput] = []
     for turn in turns:

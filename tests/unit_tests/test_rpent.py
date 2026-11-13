@@ -831,6 +831,7 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
     for name, value in {
         "runner.output_dir": "/test/training",
         "data.train_data_paths": ["/test/tasks.jsonl"],
+        "data.val_data_paths": ["/test/eval.jsonl"],
         "tools.rpent.python": "/test/env/bin/python",
         "tools.rpent.libero_config_path": "/test/libero-config",
         "tools.rpent.output_dir": "/test/episodes",
@@ -1645,7 +1646,7 @@ def test_image_references_preserve_order_and_survive_serialization(
     from PIL import Image
 
     from rlinf.agents.rpent.history import ImagePrompt
-    from rlinf.data.schema import reasoning_results
+    from rlinf.utils import multimodal
 
     def png(color):
         output = io.BytesIO()
@@ -1673,8 +1674,8 @@ def test_image_references_preserve_order_and_survive_serialization(
         }
 
     # Isolate the third-party image processor; file IO and row assembly are real.
-    monkeypatch.setattr(reasoning_results, "_image_processor", lambda path: processor)
-    materialize = reasoning_results.materialize_multimodal_inputs
+    monkeypatch.setattr(multimodal, "_image_processor", lambda path: processor)
+    materialize = multimodal.materialize_multimodal_inputs
     result = materialize([None, payload], "unused-model", "cpu")
     torch.testing.assert_close(
         result["pixel_values"],
@@ -1686,9 +1687,9 @@ def test_image_references_preserve_order_and_survive_serialization(
     torch.testing.assert_close(cached["pixel_values"], result["pixel_values"])
     torch.testing.assert_close(again["pixel_values"], result["pixel_values"])
     assert calls == [3, 3]  # Uncached baseline, then one cache fill.
-    assert reasoning_results._processed_image_cache.bytes <= 1024
+    assert multimodal._processed_image_cache.bytes <= 1024
     materialize([payload], "unused-model", "cpu", cache_bytes=1)
-    assert reasoning_results._processed_image_cache.bytes == 0
+    assert multimodal._processed_image_cache.bytes == 0
     payload["image_grid_thw"] = grid + 1
     with pytest.raises(ValueError, match="grid differs"):
         materialize([payload], "unused-model", "cpu", cache_bytes=1024)
@@ -1816,3 +1817,46 @@ def test_wrong_prompt_or_missing_engine_evidence_is_rejected():
         budget.response_mask([2, 3, 7, 4], [])
     with pytest.raises(ValueError, match="outside the thinking boundary"):
         budget.response_mask([2, 7, 4], [2])
+
+
+def test_multimodal_evaluation_uses_the_training_task_and_budget():
+    train = compose(config_name="train_qwen3.5_4b_libero_rl_sao_local")
+    evaluate = compose(config_name="eval_qwen3.5_4b_libero_rl")
+    for field in (
+        "runner.seq_length",
+        "algorithm.sampling_params.temperature",
+        "algorithm.sampling_params.top_p",
+        "algorithm.sampling_params.top_k",
+        "algorithm.sampling_params.presence_penalty",
+        "algorithm.sampling_params.repetition_penalty",
+        "algorithm.sampling_params.max_new_tokens",
+        "agentloop.max_turns",
+        "agentloop.prompt",
+        "agentloop.observation_mode",
+        "agentloop.chat_template_kwargs",
+        "agentloop.history_compaction",
+        "agentloop.episode_timeout_s",
+        "agentloop.max_infra_retry_rate",
+        "tools.rpent.libero_type",
+        "tools.rpent.max_episode_steps",
+        "tools.rpent.process_timeout_s",
+    ):
+        assert OmegaConf.select(evaluate, field) == OmegaConf.select(train, field), (
+            field
+        )
+    from hydra import compose as hydra_compose
+    from hydra import initialize_config_dir
+
+    config_dir = Path(__file__).parents[2] / "examples/agent/rpent/config"
+    with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
+        template = hydra_compose(config_name="eval_qwen3.5_4b_libero_rl")
+    for field in (
+        "runner.output_dir",
+        "data.val_data_paths",
+        "tools.rpent.python",
+        "tools.rpent.libero_config_path",
+        "tools.rpent.output_dir",
+        "rollout.model.model_path",
+    ):
+        parent, key = field.rsplit(".", 1)
+        assert OmegaConf.is_missing(OmegaConf.select(template, parent), key)

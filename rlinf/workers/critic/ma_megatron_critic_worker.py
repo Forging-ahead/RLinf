@@ -17,16 +17,14 @@ from megatron.core import parallel_state
 from megatron.training.training import unwrap_model
 from omegaconf import DictConfig
 
-from rlinf.data.schema.reasoning_results import (
-    DynamicRolloutResult,
-    materialize_multimodal_inputs,
-)
+from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_seqlen_balanced_partitions,
 )
 from rlinf.utils.distributed import RolloutDataBalance, compute_rollout_metrics_dynamic
+from rlinf.utils.multimodal import materialize_multimodal_inputs
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.utils import clear_memory, configure_batch_sizes, cpu_dict
 from rlinf.workers.critic.megatron_critic_worker import MegatronCritic

@@ -35,7 +35,7 @@ runner:
 
   resume_dir: null
   experiment_name: rpent-libero-rl-qwen3.5-4b-eval
-  output_dir: ./logs
+  output_dir: ???
 
 
 algorithm:
@@ -49,6 +49,7 @@ algorithm:
     temperature: 1.0
     top_k: 20
     top_p: 0.95
+    presence_penalty: 1.5
     repetition_penalty: 1.0
     # One planner response; the same budget the standalone planner requests.
     max_new_tokens: 32768
@@ -66,7 +67,7 @@ data:
   validation_shuffle: false
   seed: 1234
   # One RPent task per row, in the format of the training task file.
-  val_data_paths: ["/path/to/rpent/holdout.jsonl"]
+  val_data_paths: ???
 
 
 agentloop:
@@ -86,21 +87,21 @@ agentloop:
   # base_gripper_camera.
   prompt: simple
   model_request_timeout_s: 3600
-  episode_timeout_s: 7200
+  episode_timeout_s: 14400
   minimum_output_tokens: 1024
   merge_prefix_turns: true
   # The planner's native compaction. It counts message text only, so the
   # trigger leaves room for tool schemas and template tokens; the policy
   # endpoint rejects any request that still exceeds runner.seq_length.
   history_compaction:
-    max_messages: 49
-    keep_messages: 18
+    max_messages: 80
+    keep_messages: 40
     context_window: ${runner.seq_length}
     max_fraction: 0.7
     preserve_first_user_message: true
     receipts: false
   max_infra_retries: 1
-  max_infra_retry_rate: 0.05
+  max_infra_retry_rate: 1.0
 
 
 tools:
@@ -108,21 +109,22 @@ tools:
     workflow: libero_rl
     # Interpreter of the RPent environment on node 1; each episode runs as
     # `python -m robots.libero_rl.rl_episode` in its own process.
-    python: /path/to/rpent/.venv/bin/python
+    python: ???
     # SAM3 service on node 1, started before this job.
     sam3_endpoint: http://127.0.0.1:8101
-    libero_type: pro
-    max_episode_steps: 1200
+    libero_type: standard
+    libero_config_path: ???
+    max_episode_steps: 10000
     # Node-1 GPUs that render the simulators, and the episodes each agent worker
     # runs at once.
     env_gpus: [0, 1, 2, 3, 4, 5]
     episodes_per_worker: 8
     # Episode artifacts on node 1; failed episodes keep theirs.
-    output_dir: /path/to/rpent-episodes
+    output_dir: ???
     keep_episodes: failures
     # Stops an episode process that outlives its planner and environment limits.
     # Above agentloop.episode_timeout_s, so the planner ends an episode first.
-    process_timeout_s: 7800
+    process_timeout_s: 15000
 
 
 rollout:
@@ -132,7 +134,7 @@ rollout:
   gpu_memory_utilization: 0.8
   model:
     # A policy written by `checkpoint.py export`, or the served base model.
-    model_path: /path/to/exported/policy
+    model_path: ???
     model_type: qwen3_5
     precision: bf16
   enforce_eager: false

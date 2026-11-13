@@ -38,10 +38,7 @@ from rlinf.algorithms.utils import (
     truncated_importance_weights,
 )
 from rlinf.data.schema.reasoning_requests import get_seq_length
-from rlinf.data.schema.reasoning_results import (
-    DynamicRolloutResult,
-    materialize_multimodal_inputs,
-)
+from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.hybrid_engines.megatron.utils import (
     output_layer_positions,
     preprocess_packed_seqs,
@@ -60,6 +57,7 @@ from rlinf.utils.distributed import (
     vocab_parallel_log_probs_from_logits,
 )
 from rlinf.utils.metric_utils import CRITIC_EXPLAINED_VARIANCE_STAT_KEYS
+from rlinf.utils.multimodal import materialize_multimodal_inputs
 from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
     PlacementMode,
