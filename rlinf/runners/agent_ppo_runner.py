@@ -14,7 +14,7 @@
 
 """Synchronous PPO scheduling for multi-turn agents."""
 
-from typing import Any
+from typing import Any, Optional
 
 from rlinf.data.schema.agent_trajectory import prepare_agent_ppo_targets
 from rlinf.runners.agent_runner import AgentRunner
@@ -58,7 +58,7 @@ class AgentPPORunner(AgentRunner):
             )
 
     def _sync_weights(
-        self, do_offload: bool = True, weight_version: int | None = None
+        self, do_offload: bool = True, weight_version: Optional[int] = None
     ) -> None:
         if weight_version is None:
             weight_version = self.global_steps
@@ -79,7 +79,7 @@ class AgentPPORunner(AgentRunner):
 
     def _run_training(
         self, rollout_handle: Handle
-    ) -> tuple[dict | None, list[dict], dict]:
+    ) -> tuple[Optional[dict], list[dict], dict]:
         """Prepare fixed targets and update models on shared or separate devices."""
         if self.cfg.algorithm.adv_type == "gae_dynamic":
             return self._run_critic_owned_training(rollout_handle)
@@ -147,11 +147,9 @@ class AgentPPORunner(AgentRunner):
         actor_rollout_metrics = actor_metrics[0][0]
         actor_training_metrics = actor_metrics[0][1]
 
-        training_metrics = [dict(metrics) for metrics in actor_training_metrics]
-        for actor_metrics, critic_metrics in zip(
-            training_metrics, critic_training_metrics, strict=True
-        ):
-            actor_metrics.update(critic_metrics)
+        training_metrics = self._training_metrics(
+            actor_training_metrics, critic_training_metrics
+        )
         durations = {
             "training": actor_handle.consume_duration(),
             "critic/training": critic_handle.consume_duration(),
@@ -167,7 +165,7 @@ class AgentPPORunner(AgentRunner):
 
     def _run_critic_owned_training(
         self, rollout_handle: Handle
-    ) -> tuple[dict | None, list[dict], dict]:
+    ) -> tuple[Optional[dict], list[dict], dict]:
         """Compute fixed critic targets, update the critic, then update the actor."""
         critic_infer_handle = self.critic.run_inference(
             input_channel=self.rollout_channel,
@@ -194,10 +192,9 @@ class AgentPPORunner(AgentRunner):
             actor_input_channel = self.actor_inference_channel
         actor_handle = self.actor.run_training(input_channel=actor_input_channel)
         rollout_metrics, training_metrics = actor_handle.wait()[0]
-        for actor_metrics, critic_metrics in zip(
-            training_metrics, critic_training_metrics, strict=True
-        ):
-            actor_metrics.update(critic_metrics)
+        training_metrics = self._training_metrics(
+            training_metrics, critic_training_metrics
+        )
         durations = {
             "training": actor_handle.consume_duration(),
             "critic/training": critic_handle.consume_duration(),
@@ -210,3 +207,19 @@ class AgentPPORunner(AgentRunner):
                 reduction_type="min"
             )
         return rollout_metrics, training_metrics, durations
+
+    def _training_metrics(
+        self, actor_metrics: list[dict], critic_metrics: list[dict]
+    ) -> list[dict]:
+        """Report each minibatch and its critic metrics from the last update epoch.
+
+        Critic epochs can outnumber actor epochs. Keep the same logging unit as
+        the agent runner instead of pairing optimizer updates one for one.
+        """
+        minibatches = self.cfg.algorithm.n_minibatches
+        return [
+            {**actor, **critic}
+            for actor, critic in zip(
+                actor_metrics, critic_metrics[-minibatches:], strict=True
+            )
+        ]

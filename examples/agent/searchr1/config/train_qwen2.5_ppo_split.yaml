@@ -1,6 +1,8 @@
 defaults:
   - train_qwen2.5_ppo
   - _self_
+algorithm:
+  adv_type: actor_gae
 runner:
   experiment_name: searchr1-ppo-split
 cluster:

@@ -1,13 +1,7 @@
 defaults:
-  - train_qwen2.5_ppo
+  - train_qwen2.5_ppo_shared
   - _self_
 runner:
   experiment_name: searchr1-ppo-shared-nopack
-cluster:
-  component_placement:
-    actor: 0-7
-    critic: 0-7
-    rollout: 0-7
-    reward: 0-7
 actor:
   pack_traj: false

@@ -145,6 +145,10 @@ overrides, the recipes train for one dataset epoch. They save checkpoints every
 Rollout and Training Order
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+All three placement recipes use fixed targets and global advantage normalization
+with ``algorithm.adv_type=actor_gae``. The base configuration uses ``gae_dynamic``,
+which requires the actor, critic, and rollout to share the same GPUs.
+
 At each step, the runner publishes actor weights and waits for all episodes in the
 batch to finish. With shared rollout/training GPUs, it offloads the rollout engine
 before critic inference. The critic predicts old values; GAE then computes fixed
@@ -160,8 +164,8 @@ critic GPUs, their inference and training can run in parallel. Every layout wait
 for the current rollout batch before updating.
 
 The actor uses PPO clipping and the critic uses clipped Huber loss. With
-``algorithm.n_minibatches=1``, each rollout batch produces one actor optimizer
-update and one critic optimizer update. Megatron microbatches accumulate gradients
+``algorithm.n_minibatches=1`` and ``critic.update_epochs=1``, each rollout batch
+produces one actor optimizer update and one critic optimizer update. Megatron microbatches accumulate gradients
 within each update. Actor learning rate is ``1e-6``; critic learning rate is
 ``5e-6`` with 10 warmup updates. ``critic.value_head_init`` selects ``normal`` or
 ``zero`` initialization for the independent value head.
@@ -210,8 +214,9 @@ Training Metrics and Validation
 -----------------------------------
 
 Monitor ``rollout/reward_scores_traj`` in TensorBoard. ``Global Step`` advances once
-per completed rollout batch; training metrics use optimizer-step indices. With one
-minibatch these counts match. See :doc:`/rst_source/reference/metrics` for the shared
+per completed rollout batch; training metrics use actor optimizer-step indices.
+With one minibatch these counts match. If ``critic.update_epochs`` is greater than
+one, only the final critic epoch's metrics are logged for each minibatch. See :doc:`/rst_source/reference/metrics` for the shared
 metric conventions.
 
 The CI recipes exercise the three layouts with Qwen2.5-1.5B. On a machine with the

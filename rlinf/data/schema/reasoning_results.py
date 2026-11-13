@@ -1539,6 +1539,16 @@ class DynamicRolloutResult:
             res.multi_modal_inputs is not None for res in rollout_results
         )
 
+        carry_mask = any(res.response_mask is not None for res in rollout_results)
+        for name in ("rollout_weight_versions", "rollout_ids"):
+            if any(getattr(res, name) is not None for res in rollout_results):
+                if any(
+                    getattr(res, name) is None
+                    or len(getattr(res, name)) != res.num_sequence
+                    for res in rollout_results
+                ):
+                    raise ValueError(f"{name} must cover every row of every result")
+
         for res in rollout_results:
             # Merge required list fields (size: num_sequence)
             merged_result.idx_to_traj.extend(res.idx_to_traj)
@@ -1550,7 +1560,7 @@ class DynamicRolloutResult:
                 merged_result.rollout_logprobs = (
                     merged_result.rollout_logprobs or []
                 ) + list(res.rollout_logprobs)
-            if any(r.response_mask is not None for r in rollout_results):
+            if carry_mask:
                 # Results without a mask train every response token.
                 merged_result.response_mask = (merged_result.response_mask or []) + (
                     list(res.response_mask)

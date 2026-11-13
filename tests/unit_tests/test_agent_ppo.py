@@ -176,7 +176,6 @@ def test_critic_value_head_rejects_unknown_initialization():
 
 @pytest.mark.parametrize("collocated", [True, False])
 def test_synchronous_publication_labels_installed_weights_after_resume(collocated):
-    pytest.importorskip("megatron.training")
     from rlinf.runners.agent_ppo_runner import AgentPPORunner
 
     # Actor and rollout RPC boundaries: installation completes only on wait().
@@ -211,6 +210,117 @@ def test_synchronous_publication_labels_installed_weights_after_resume(collocate
         runner._sync_weights(do_offload=False)
         assert torch.equal(state["installed"], state["weight"])
     assert versions == [7, 8]
+
+
+@pytest.mark.parametrize("adv_type", ["actor_gae", "gae_dynamic"])
+def test_synchronous_runner_consumes_batches_with_multiple_critic_epochs(
+    monkeypatch, adv_type
+):
+    from omegaconf import OmegaConf
+
+    from rlinf.runners.agent_ppo_runner import AgentPPORunner
+
+    # Replace only distributed worker/Channel creation; targets and orchestration
+    # run on real CPU tensors and queues, without Megatron or a Ray cluster.
+    monkeypatch.setattr(Channel, "create", lambda *args, **kwargs: _local_channel())
+    cfg = OmegaConf.create(
+        {
+            "runner": {"max_epochs": 1, "logger": {"logger_backends": []}},
+            "data": {
+                "rollout_batch_size": 1,
+                "shuffle": False,
+                "num_workers": 0,
+                "val_rollout_batch_size": None,
+            },
+            "algorithm": {
+                "kl_beta": 0,
+                "recompute_logprobs": False,
+                "adv_type": adv_type,
+                "n_minibatches": 1,
+                "gamma": 1.0,
+                "gae_lambda": 1.0,
+                "normalize_advantages": False,
+            },
+        }
+    )
+    placement = SimpleNamespace(is_pipeline=False, get_hardware_ranks=lambda role: [0])
+    result = DynamicRolloutResult(
+        num_sequence=1,
+        group_size=1,
+        idx_to_traj=[0],
+        input_ids=[[1, 2, 3]],
+        prompt_lengths=[1],
+        response_lengths=[2],
+        is_end=[True],
+        rewards=[1.0],
+        rollout_logprobs=[[-0.1, -0.2]],
+    )
+
+    def handle(value=None):
+        return SimpleNamespace(
+            wait=lambda: value, consume_duration=lambda **kwargs: 0.0
+        )
+
+    def infer(input_channel, output_channel, **kwargs):
+        episode = input_channel.get_nowait()
+        episode.values = torch.tensor([[0.0, 0.25, 0.5]])
+        output_channel.put(episode)
+        return handle()
+
+    def critic_train(input_channel, output_channel=None, **kwargs):
+        episode = input_channel.get_nowait()
+        if output_channel is not None:
+            episode.advantages = torch.tensor([[0.0, 0.75, 0.5]])
+            output_channel.put(episode)
+        return handle([(None, [{"critic/loss": 0.3}, {"critic/loss": 0.1}])])
+
+    def actor_train(input_channel):
+        episode = input_channel.get_nowait()
+        torch.testing.assert_close(episode.advantages, torch.tensor([[0.0, 0.75, 0.5]]))
+        return handle([({"reward": 1.0}, [{"actor/loss": 0.2}])])
+
+    runner = AgentPPORunner(
+        cfg=cfg,
+        placement=placement,
+        train_dataset=[{}],
+        val_dataset=None,
+        rollout=SimpleNamespace(),
+        inference=None,
+        reward=None,
+        agent_loop=SimpleNamespace(_workers=[0]),
+        actor=SimpleNamespace(run_training=actor_train),
+        critic=SimpleNamespace(run_inference=infer, run_training=critic_train),
+    )
+    for channel in runner.rollout_output_channels:
+        channel.put(result)
+    metrics, updates, _ = runner._run_training(handle())
+    assert metrics == {"reward": 1.0}
+    assert updates == [{"actor/loss": 0.2, "critic/loss": 0.1}]
+    for channel in [
+        *runner.rollout_output_channels,
+        runner.value_channel,
+        runner.training_channel,
+        runner.critic_output_channel,
+    ]:
+        with pytest.raises(asyncio.QueueEmpty):
+            channel.get_nowait()
+
+
+@pytest.mark.parametrize("field", ["rollout_weight_versions", "rollout_ids"])
+def test_result_merge_rejects_partially_missing_row_metadata(field):
+    result = DynamicRolloutResult(
+        num_sequence=1,
+        group_size=1,
+        idx_to_traj=[0],
+        input_ids=[[1, 2]],
+        prompt_lengths=[1],
+        response_lengths=[1],
+        is_end=[True],
+    )
+    stamped = copy.deepcopy(result)
+    setattr(stamped, field, [[3]] if field == "rollout_weight_versions" else [9])
+    with pytest.raises(ValueError, match=field):
+        DynamicRolloutResult.merge_result_list([result, stamped])
 
 
 def test_checkpoint_loader_patch_is_released_after_a_failed_load(monkeypatch):
@@ -1206,16 +1316,21 @@ def test_rollout_config_needs_only_the_selected_backend(backend):
         "qwen2.5-1.5b-ppo-separate",
     ],
 )
-def test_searchr1_ci_recipes_validate(config_name):
+@pytest.mark.parametrize("source", ["examples", "tests/e2e_tests"])
+def test_searchr1_ppo_recipes_validate(config_name, source):
     from hydra import compose, initialize_config_dir
 
     from rlinf.config import validate_searchr1_cfg
 
-    config_dir = Path(__file__).resolve().parents[1] / "e2e_tests/agent/searchr1"
+    config_dir = Path(__file__).resolve().parents[2] / source / "agent/searchr1"
+    if source == "examples":
+        config_dir /= "config"
+        config_name = config_name.replace("qwen2.5-1.5b-ppo-", "train_qwen2.5_ppo_")
     with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
         cfg = compose(config_name=config_name)
     validate_searchr1_cfg(cfg)
     assert cfg.algorithm.n_minibatches == 1
+    assert cfg.algorithm.adv_type == "actor_gae"
     assert cfg.runner.synchronous
 
 
