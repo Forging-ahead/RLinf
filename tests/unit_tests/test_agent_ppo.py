@@ -103,7 +103,9 @@ def test_searchr1_response_processing_preserves_behavior_tokens(
 
 @pytest.mark.parametrize("truncate", [None, True, False])
 @pytest.mark.parametrize("recompute", [True, False])
-def test_searchr1_response_config_defaults_and_raw_logprobs(truncate, recompute):
+def test_searchr1_response_config_defaults_and_raw_logprobs(
+    truncate, recompute, monkeypatch
+):
     from omegaconf import OmegaConf
 
     from rlinf.config import validate_searchr1_cfg
@@ -111,6 +113,13 @@ def test_searchr1_response_config_defaults_and_raw_logprobs(truncate, recompute)
     cfg = OmegaConf.load(
         Path(__file__).resolve().parents[2]
         / "examples/agent/searchr1/config/train_qwen2.5_ppo.yaml"
+    )
+    # This test checks response configuration; placement has its own tests.
+    monkeypatch.setattr(
+        "rlinf.config.ModelParallelComponentPlacement",
+        lambda *_: SimpleNamespace(
+            is_collocated=True, get_hardware_ranks=lambda _: [0]
+        ),
     )
     cfg.agentloop.pop("truncate_response")
     if truncate is not None:
@@ -177,10 +186,10 @@ def test_synchronous_publication_labels_installed_weights_after_resume(collocate
     def prepare(**kwargs):
         state["pending"] = state["weight"].clone()
 
-    def install(weight_version=None):
+    def install(version=None):
         def wait():
             state["installed"] = state["pending"].clone()
-            versions.append(weight_version)
+            versions.append(version)
 
         return SimpleNamespace(wait=wait)
 
@@ -1123,7 +1132,7 @@ def test_ppo_batch_balance_before_minibatches_preserves_targets_and_loss(
         ("algorithm.loss_agg_func", "seq-mean-token-mean"),
         ("algorithm.use_valid_token_scale", False),
         ("algorithm.loss_scales", ["group_level"]),
-        ("actor.model.tensor_model_parallel_size", 2),
+        ("actor.model.pipeline_model_parallel_size", 2),
     ],
 )
 def test_searchr1_ppo_rejects_incompatible_options(option, value):

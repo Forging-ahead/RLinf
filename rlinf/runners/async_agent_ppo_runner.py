@@ -180,7 +180,8 @@ class AsyncAgentPPORunner(AgentPPORunner):
         with self.timer("initial_sync_weights" if initial else "sync_weights"):
             self._sync_weights(weight_version=self.actor_version)
             self.published_version = self.actor_version
-            self.rollout.resume_generation().wait()
+            if not initial:
+                self.rollout.continue_generation().wait()
 
     def _release_rollout_bytes(self, sample_ids: list[int]) -> None:
         if self.cfg.rollout.get("max_buffer_bytes", 0):
@@ -273,7 +274,8 @@ class AsyncAgentPPORunner(AgentPPORunner):
                         self._put_prompts()
                 if self.release_rollout:
                     with self.timer("pause_rollout"):
-                        paused_states = self.rollout.pause_generation().wait()
+                        self.rollout.pause_generation().wait()
+                        paused_states = self.rollout.get_async_rollout_state().wait()
                     with self.timer("offload_rollout"):
                         self.rollout.offload_engine().wait()
                 rollout_state_before = self.rollout.get_async_rollout_state().wait()
@@ -339,7 +341,8 @@ class AsyncAgentPPORunner(AgentPPORunner):
                         self._save_checkpoint()
                 if not self.release_rollout:
                     with self.timer("pause_rollout"):
-                        paused_states = self.rollout.pause_generation().wait()
+                        self.rollout.pause_generation().wait()
+                        paused_states = self.rollout.get_async_rollout_state().wait()
                 self._publish()
                 if self.drain_before_training and not (
                     is_train_end or run_time_exceeded
@@ -366,11 +369,13 @@ class AsyncAgentPPORunner(AgentPPORunner):
                 "async/critic_updates": self.critic_updates,
                 "async/oldest_lag": consumed_version - batch_state["oldest_version"],
                 "async/generated_during_training": sum(
-                    state["generated_tokens"] for state in rollout_state_after
+                    state.get("generated_tokens", 0) for state in rollout_state_after
                 )
-                - sum(state["generated_tokens"] for state in rollout_state_before),
+                - sum(
+                    state.get("generated_tokens", 0) for state in rollout_state_before
+                ),
                 "async/retracted_requests": sum(
-                    state["parked_requests"] for state in paused_states
+                    state.get("parked_requests", 0) for state in paused_states
                 ),
             }
             if self.cfg.rollout.get("max_buffer_bytes", 0):

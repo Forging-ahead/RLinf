@@ -87,6 +87,8 @@ class AgentRunner(ReasoningRunner):
         )
         self.agent_loop = agent_loop
         self.batch_split_num = len(agent_loop._workers)
+        self.rollout_output_channels = self.rollout_channel
+        self.release_rollout = not self.is_pipeline
         self.tool_workers = tool_workers
         self.solid_rollouts = solid_rollouts
         self.generate_input_channel = Channel.create("GenerateInput")
@@ -112,6 +114,13 @@ class AgentRunner(ReasoningRunner):
         self.tool_output_channel = Channel.create("ToolOutput")
         if self.recompute_logprobs:
             self.inference_channel = Channel.create("Inference", local=True)
+
+    def _stop_rollouts(self):
+        """Stop the main and solid rollout engines after training finishes."""
+        super()._stop_rollouts()
+        for solid_rollout in self.solid_rollouts.values():
+            if hasattr(solid_rollout, "stop"):
+                solid_rollout.stop().wait()
 
     def init_rollout_workers(self):
         """init rollout workers, tool workers and agent loop worker."""
@@ -169,10 +178,41 @@ class AgentRunner(ReasoningRunner):
             for handle in onload_handles:
                 handle.wait()
 
+    def _run_training(
+        self, rollout_handle: Handle
+    ) -> tuple[dict | None, list[dict], dict]:
+        """Update the actor and return rollout metrics, update metrics, and durations."""
+        handles = {}
+        input_channel = self.rollout_channel
+        if self.reward is not None:
+            handles["reward"] = self.reward.compute_rewards(
+                input_channel=input_channel, output_channel=self.reward_channel
+            )
+            input_channel = self.reward_channel
+        if self.recompute_logprobs:
+            handles["inference"] = self.inference.run_inference(
+                input_channel=input_channel,
+                output_channel=self.inference_channel,
+                compute_ref_logprobs=self.compute_ref_logprobs,
+            )
+            input_channel = self.inference_channel
+        if self.is_pipeline:
+            rollout_handle.wait()
+        handles["training"] = self.actor.run_training(input_channel=input_channel)
+        rollout_metrics, training_metrics = handles["training"].wait()[0]
+        durations = {
+            key: handle.consume_duration(reduction_type="min")
+            if key == "inference"
+            else handle.consume_duration()
+            for key, handle in handles.items()
+        }
+        return rollout_metrics, training_metrics, durations
+
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
-        if len(epoch_iter) <= 0:
+        if len(epoch_iter) <= 0 or self.global_steps >= self.max_steps:
             # epoch done
+            self._stop_rollouts()
             return
 
         global_pbar = tqdm(
@@ -206,49 +246,26 @@ class AgentRunner(ReasoningRunner):
                         # Rollout
                         rollout_handle: Handle = self.agent_loop.run_agentloop_rollout(
                             input_channel=self.dataloader_channel,
-                            output_channel=self.rollout_channel,
+                            output_channel=self.rollout_output_channels,
                         )
 
                         if not self.is_pipeline:
                             agent_metrics = rollout_handle.wait()[0]
-                            offload_handles = [self.rollout.offload_engine()]
-                            for solid_rollout in self.solid_rollouts.values():
-                                offload_handles.append(solid_rollout.offload_engine())
-                            for handle in offload_handles:
-                                handle.wait()
+                            if self.release_rollout:
+                                offload_handles = [self.rollout.offload_engine()]
+                                for solid_rollout in self.solid_rollouts.values():
+                                    offload_handles.append(
+                                        solid_rollout.offload_engine()
+                                    )
+                                for handle in offload_handles:
+                                    handle.wait()
 
-                        # Rewards
-                        if self.reward is not None:
-                            reward_handle: Handle = self.reward.compute_rewards(
-                                input_channel=self.rollout_channel,
-                                output_channel=self.reward_channel,
-                            )
-                            inference_input_channel = self.reward_channel
-                        else:
-                            inference_input_channel = self.rollout_channel
-
-                        if self.recompute_logprobs:
-                            # Inference prev/ref logprobs
-                            infer_handle: Handle = self.inference.run_inference(
-                                input_channel=inference_input_channel,
-                                output_channel=self.inference_channel,
-                                compute_ref_logprobs=self.compute_ref_logprobs,
-                            )
-                            inference_channel = self.inference_channel
-                        else:
-                            infer_handle = None
-                            inference_channel = inference_input_channel
-
-                        # Actor training, Advantages and returns
-                        if self.is_pipeline:
-                            agent_metrics = rollout_handle.wait()[0]
-                        actor_handle: Handle = self.actor.run_training(
-                            input_channel=inference_channel,
-                        )
-
-                        metrics = actor_handle.wait()
-                        actor_rollout_metrics = metrics[0][0]
-                        actor_training_metrics = metrics[0][1]
+                        (
+                            actor_rollout_metrics,
+                            actor_training_metrics,
+                            training_times,
+                        ) = self._run_training(rollout_handle)
+                        agent_metrics = rollout_handle.wait()[0]
                         self.global_steps += 1
 
                         run_time_exceeded = self.run_timer.is_finished()
@@ -264,30 +281,9 @@ class AgentRunner(ReasoningRunner):
                         if save_model:
                             self._save_checkpoint()
 
-                        if is_train_end:
-                            logging.info(
-                                f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
-                            )
-                            return
-
-                        if run_time_exceeded:
-                            logging.info(
-                                f"Time limit given by run_timer={self.run_timer} reached. Stopping run"
-                            )
-                            return
-
                     time_metrics = self.timer.consume_durations()
-                    time_metrics["training"] = actor_handle.consume_duration()
+                    time_metrics.update(training_times)
                     time_metrics["rollout"] = rollout_handle.consume_duration()
-                    if self.reward is not None:
-                        time_metrics["reward"] = reward_handle.consume_duration()
-                    if infer_handle is not None:
-                        # Inference time should be the min time across ranks, because different DP receive the rollout results differently
-                        # But at the begin of the pp schedule, there is a timer barrier
-                        # This makes all DP end at the same time, while they start at differnt times, and thus only the min time is correct
-                        time_metrics["inference"] = infer_handle.consume_duration(
-                            reduction_type="min"
-                        )
 
                     logging_steps = (
                         self.global_steps - 1
@@ -318,7 +314,14 @@ class AgentRunner(ReasoningRunner):
 
                     global_pbar.set_postfix(logging_metrics, refresh=False)
                     global_pbar.update(1)
+
+                    if is_train_end or run_time_exceeded:
+                        self._stop_rollouts()
+                        return
+
+            self._stop_rollouts()
         finally:
             for tool_worker in self.tool_workers:
                 tool_worker.stop_server()
+            global_pbar.close()
             self.metric_logger.finish()

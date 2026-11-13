@@ -17,13 +17,19 @@ from megatron.core import parallel_state
 from megatron.training.training import unwrap_model
 from omegaconf import DictConfig
 
+from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_seqlen_balanced_partitions,
 )
-from rlinf.utils.distributed import RolloutDataBalance, compute_rollout_metrics_dynamic
+from rlinf.utils.distributed import (
+    RolloutDataBalance,
+    compute_rollout_metrics_dynamic,
+    masked_stats,
+    normalize_from_stats,
+)
 from rlinf.utils.multimodal import materialize_multimodal_inputs
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.utils import clear_memory, configure_batch_sizes, cpu_dict
@@ -156,6 +162,39 @@ class MAMegatronCritic(MegatronCritic):
         )
         return cpu_dict(metrics)
 
+    @torch.no_grad()
+    def compute_advantages_and_returns(
+        self, batch: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Compute fixed episode targets before packing or updating the critic."""
+        if batch.get("advantages") is not None:
+            return batch
+        advantages, returns = calculate_adv_and_returns(
+            task_type=self.cfg.runner.task_type,
+            adv_type=self.cfg.algorithm.adv_type,
+            rewards=batch["rewards"],
+            values=batch["values"],
+            loss_mask=batch["response_mask"],
+            idx_to_traj=batch["idx_to_traj"],
+            prompt_lengths=batch["prompt_lengths"],
+            group_size=self.cfg.algorithm.group_size,
+            gamma=self.cfg.algorithm.gamma,
+            gae_lambda=self.cfg.algorithm.gae_lambda,
+            normalize_advantages=False,
+        )
+        if self.cfg.algorithm.normalize_advantages:
+            stats = masked_stats(advantages, batch["response_mask"])
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    stats, group=parallel_state.get_data_parallel_group()
+                )
+            advantages = normalize_from_stats(advantages, stats).masked_fill(
+                ~batch["response_mask"], 0.0
+            )
+        batch["advantages"] = advantages
+        batch["returns"] = returns
+        return batch
+
     def run_training(
         self,
         input_channel: Channel,
@@ -177,8 +216,18 @@ class MAMegatronCritic(MegatronCritic):
         batch = DynamicRolloutResult.merge_batches(
             batches, self.cfg.algorithm.group_size
         )
-        del batches
-        assert "returns" in batch, "Multi-agent critic requires fixed returns."
+        # SAO arrives with terminal returns and computes policy GAE only after
+        # the critic update. PPO fixes advantages from pre-update values.
+        if "returns" not in batch:
+            batch = self.compute_advantages_and_returns(batch)
+        if output_channel is not None and "advantages" in batch:
+            sizes = [result.num_sequence for result in results]
+            for result, advantages in zip(
+                results, batch["advantages"].cpu().split(sizes), strict=True
+            ):
+                result.advantages = advantages.clone()
+                # Values and returns belong to the critic's training batch.
+                result.values = result.returns = None
         rollout_metrics = (
             self._compute_rollout_metrics(batch) if compute_rollout_metrics else None
         )
@@ -273,6 +322,8 @@ class MAMegatronCritic(MegatronCritic):
         for rollout_result in DynamicRolloutResult.split_results(
             rollout_result, num_sequence_per_group
         ):
+            # Each channel payload owns its storage instead of the whole DP batch.
+            rollout_result.values = rollout_result.values.clone()
             self.put_result(rollout_result, output_channel)
         self.scheduler_offload_sync()
         if do_offload:

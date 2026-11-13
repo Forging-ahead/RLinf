@@ -207,7 +207,6 @@ def test_sglang_cpu_backup_loads_unsynchronized_weights(
         return cls(**kwargs)
 
     monkeypatch.setattr(sglang_worker, "ServerArgs", server_args)
-    monkeypatch.setattr(sglang_worker, "Engine", lambda **kwargs: kwargs)
     rollout = OmegaConf.create(
         {
             "enforce_eager": False,
@@ -223,6 +222,7 @@ def test_sglang_cpu_backup_loads_unsynchronized_weights(
                 "torch_compile_max_bs": 4,
                 "decode_log_interval": 100,
                 "attention_backend": "triton",
+                "disable_overlap_schedule": True,
             },
             "cuda_graph_max_bs": 4,
             "max_running_requests": 12,
@@ -241,11 +241,10 @@ def test_sglang_cpu_backup_loads_unsynchronized_weights(
         acquire_free_port=lambda: 12345,
         log_on_first_rank=lambda message: None,
     )
-    sglang_worker.SGLangWorker._init_engine(worker)
-    assert worker._engine["enable_weights_cpu_backup"] is bool(backup)
-    assert worker._engine["load_format"] == (
-        "auto" if backup or resume_dir is None else "dummy"
-    )
+    args = sglang_worker.SGLangWorker._build_server_args(worker)
+    assert args["disable_overlap_schedule"] is True
+    assert args["enable_weights_cpu_backup"] is bool(backup)
+    assert args["load_format"] == ("auto" if backup or resume_dir is None else "dummy")
 
 
 @pytest.mark.parametrize("num_nodes", [1, 2])
@@ -283,7 +282,6 @@ def test_sglang_replicas_reserve_both_initialization_ports(monkeypatch, num_node
         return cls(**kwargs)
 
     monkeypatch.setattr(sglang_worker, "ServerArgs", server_args)
-    monkeypatch.setattr(sglang_worker, "Engine", lambda **kwargs: kwargs)
 
     def initialize(rank):
         worker = SimpleNamespace(
@@ -321,8 +319,7 @@ def test_sglang_replicas_reserve_both_initialization_ports(monkeypatch, num_node
         port_lock._lock_manager = manager
         worker._port_lock = port_lock
         worker.acquire_free_port = lambda: Worker.acquire_free_port(worker)
-        sglang_worker.SGLangWorker._init_engine(worker)
-        return worker, worker._engine
+        return worker, sglang_worker.SGLangWorker._build_server_args(worker)
 
     with ThreadPoolExecutor(max_workers=16) as executor:
         results = list(executor.map(initialize, range(16)))
@@ -427,6 +424,7 @@ def test_sglang_running_state_uses_native_hybrid_pool_accounting(
 def test_serverless_shutdown_unblocks_the_replica_queue(replica_affinity):
     from omegaconf import OmegaConf
 
+    pytest.importorskip("sglang")
     from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
 
     Cluster(num_nodes=1)
@@ -435,13 +433,18 @@ def test_serverless_shutdown_unblocks_the_replica_queue(replica_affinity):
     assert incoming.qsize() == outgoing.qsize() == 0
     worker = object.__new__(SGLangWorker)
     worker._rank = 3
+    worker._is_model_instance_entry = True
+    worker._placement = SimpleNamespace(rollout_model_instance_id=lambda rank: rank)
+    worker._inflight_generates = set()
+    worker._dispatch_gate = asyncio.Event()
+    worker._dispatch_gate.set()
     worker._cfg_rollout = OmegaConf.create({"replica_affinity": replica_affinity})
     request_key = worker._rank if replica_affinity else "default_queue"
 
     async def run():
         consumer = asyncio.create_task(worker.rollout_serverless(incoming, outgoing))
         try:
-            while not hasattr(worker, "_serverless_group"):
+            while not hasattr(worker, "_serverless_input_channel"):
                 await asyncio.sleep(0)
             await asyncio.sleep(0.05)
             await worker.stop_serverless()
@@ -466,6 +469,7 @@ def test_serverless_shutdown_unblocks_the_replica_queue(replica_affinity):
 def test_sglang_sampling_keeps_explicit_presence_penalty(do_sample, presence_penalty):
     from omegaconf import OmegaConf
 
+    pytest.importorskip("sglang")
     from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
 
     params = {
@@ -549,3 +553,59 @@ def test_sglang_rejects_truncated_forced_token_metadata():
             },
             return_logprobs=False,
         )
+
+
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_sglang_weight_install_is_independent_of_graph_capture(
+    enforce_eager, monkeypatch
+):
+    pytest.importorskip("sglang")
+    from rlinf.hybrid_engines.sglang.common.io_struct import SyncHFWeightInput
+    from rlinf.hybrid_engines.sglang.common.sgl_scheduler import Scheduler
+    from rlinf.scheduler import Worker
+
+    monkeypatch.setattr(Worker.torch_platform, "synchronize", lambda: None)
+    received = {"weight": torch.tensor([1.0, 2.0])}
+    installed = {}
+    # Transport and model-loader boundaries; the scheduler owns publication.
+    scheduler = SimpleNamespace(
+        cfg=SimpleNamespace(rollout=SimpleNamespace(enforce_eager=enforce_eager)),
+        weight_reload="sync",
+        _rlinf_worker=SimpleNamespace(recv=lambda **kwargs: received),
+        _actor_group_name="actor",
+        actor_weight_rank=0,
+        is_weight_offloaded=False,
+        batch_load_hf_weight=installed.update,
+        weight_norm_dict=None,
+        flush_cache=lambda: True,
+        _handle_cache_after_sync=lambda mode: None,
+        _rlinf_weight_version=None,
+    )
+    result = Scheduler.sync_hf_weight(scheduler, SyncHFWeightInput(weight_version=7))
+    torch.testing.assert_close(installed["weight"], received["weight"])
+    assert result.weight_version == scheduler._rlinf_weight_version == 7
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_server_request_preserves_images_and_logit_processors(batched):
+    import base64
+    import copy
+
+    from rlinf.utils.http_client import InferenceHTTPClient
+
+    params = {"temperature": 0.7, "custom_logit_processor": "thinking-budget"}
+    if batched:
+        params = [params, {"temperature": 0.7}]
+    original = copy.deepcopy(params)
+    images = [[b"png-image"], []] if batched else [b"png-image"]
+    body = InferenceHTTPClient._generate_body(
+        None, [[1, 2], [3]] if batched else [1, 2], params, True, images
+    )
+    expected_processor = ["thinking-budget", None] if batched else "thinking-budget"
+    assert body["custom_logit_processor"] == expected_processor
+    clean_params = body["sampling_params"] if batched else [body["sampling_params"]]
+    assert all("custom_logit_processor" not in item for item in clean_params)
+    encoded = base64.b64encode(b"png-image").decode()
+    assert body["image_data"] == ([[encoded], []] if batched else [encoded])
+    assert params == original
+    assert images == ([[b"png-image"], []] if batched else [b"png-image"])

@@ -115,6 +115,10 @@ RLinf 仅在 token 前缀一致时合并多轮回复。训练行保留 prompt/re
 
 若要启用完整投影分块，设置 ``actor.model.lm_head_chunk_size=256``；默认 ``0`` 使用常规投影。分块路径按计分回复位置分批投影，并在反向时重算，支持 PP1/CP1 的 MBridge Qwen3.5，包括 TP 和 sequence parallel。使用安装页记录的 Megatron 版本；此路径会临时替换该模型的 postprocess。Entropy 只作为 detached 诊断指标，不支持 entropy loss bonus；该模式也不支持 FP8、MTP、延迟 embedding 梯度、muP 和 autocast。这些约束界定受支持的执行方式，不代表已有吞吐或学习收益。
 
+这些配置默认使用进程内 SGLang 后端。在相同启动命令中添加 ``+rollout.sglang.backend_type=server``，可改用主干的 HTTP server 后端。两个后端都传递图像、Thinking 预算处理器和已安装的权重版本。server 作为本地子进程运行，仅绑定回环地址；Actor 权重仍由 scheduler 直接接收。
+
+这里的 SAO 使用 Partial rollout 和 Critic，训练与推理共用 GPU。已完成轨迹保存在缓冲区中，输入游标随 checkpoint 保存。完全异步 Search-R1 使用独立推理 GPU 和主干的分组缓冲区，不能直接替代这里的 Critic 更新顺序。对应示例见 :doc:`searchr1/async`。
+
 SAO 允许最多 256 条在途 episode，按完成顺序收集下一批 128 条轨迹，不再等待某个固定同步 batch 的全部轨迹。Episode 槽位包含等待模型与执行工具的时间；八个 worker 各 32 个槽位，足以同时展开全部 256 条在途轨迹。``max_env_initializations_per_worker=8`` 将八个 worker 的同时冷启动数量限制为 64；保存首次环境状态后立即释放冷启动槽位，不等 episode 结束，因此预热后仍可保持 256 个活跃环境。这只约束 CPU、import 和 CUDA context 初始化压力，不降低 rollout 容量。Buffer 保存已完成轨迹；额外排队的 prompt 不会提高在途上限。每个 episode 通常只有一个未完成模型请求，因此每副本 128 是准入上限，并不表示每张 GPU 始终都有 128 个活跃请求。
 
 共享 GPU 仍需切换阶段：暂停并收回模型请求、卸载 rollout 显存、依次训练 critic 和 actor、同步权重，再恢复等待中的请求。训练时环境动作可以继续，但模型生成暂停。SAO 的学习规则也有变化：DIS actor loss、0.3/5.0 clip 边界、alpha 为 1.5 的 ``sao_gae`` 和 SAO critic 目标；它直接使用 rollout 保存的 behavior logprob，不重算旧 policy 的 logprob。任务、模型、prompt、采样和压缩参数均继承多模态 PPO 配置。
@@ -168,7 +172,7 @@ Hydra 覆盖参数放在配置名之后，例如 ``rollout.model.model_path="$ST
 
 使用 Hydra 覆盖参数运行独立短 smoke，无须单独维护 smoke YAML。检查 loss/梯度是否有限、参数是否实际更新、模型副本活动、任务成功率及基础设施错误。短 smoke 通过证明连通和优化器执行，不代表最长 262144-token 工作负载一定能放入显存。遇到显存限制先保留证据并诊断，再决定切分或预算调整。
 
-独立评测统一使用 ``run_eval.sh eval_qwen3.5_4b_libero_rl``，在另行分配的可用资源上运行。模板的任务、采样、episode 预算和历史窗口与训练一致，只需填写部署和数据路径。如果训练覆盖了这些参数，评测也须同步调整。默认 placement 是一台八卡模型节点和独立环境节点，请按实际资源修改。RPent 的独立 batch 工具用于模型服务与数据采集；原有 ``eval_qwen3.5_4b`` 对应原始 LIBERO 工作流。
+独立评测使用下方命令，在另行分配的可用资源上运行。模板的任务、采样、episode 预算和历史窗口与训练一致，只需填写部署和数据路径。如果训练覆盖了这些参数，评测也须同步调整。默认 placement 是一台八卡模型节点和独立环境节点，请按实际资源修改。RPent 的独立 batch 工具用于模型服务与数据采集；原有 ``eval_qwen3.5_4b`` 对应原始 LIBERO 工作流。
 
 导出时 ``--vlm`` 必须指向训练初始化所用的完整模型，以保留冻结的视觉权重和 processor。从 SFT 开始训练时相应替换路径。导出目录必须是新目录；HF 导出只用于推理，不能替代包含优化器和队列的恢复 checkpoint。
 

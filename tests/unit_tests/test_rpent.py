@@ -601,6 +601,7 @@ def make_agent(tmp_path, monkeypatch):
                 },
                 "rollout": {
                     "return_logprobs": True,
+                    "replica_affinity": True,
                     "model": {"model_path": "toy", "trust_remote_code": False},
                 },
                 "agentloop": {
@@ -632,7 +633,9 @@ def make_agent(tmp_path, monkeypatch):
                 },
             }
         )
-        worker = RPentAgentLoopWorker(cfg, SimpleNamespace(rollout_dp_size=1))
+        worker = RPentAgentLoopWorker(
+            cfg, SimpleNamespace(rollout_num_model_instances=1)
+        )
         tokenizer = worker.tokenizer
         worker.prompts = []
 

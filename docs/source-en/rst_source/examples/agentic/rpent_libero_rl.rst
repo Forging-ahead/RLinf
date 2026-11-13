@@ -122,6 +122,18 @@ To cap the first thinking span already opened by the chat template, set ``agentl
 
 For full projection chunking, set ``actor.model.lm_head_chunk_size=256``; the default ``0`` retains the normal projection. The chunked path projects scored response positions in blocks and recomputes them during backward. It supports MBridge Qwen3.5 with PP1/CP1, including TP and sequence parallel. Use the recorded Megatron version; this path replaces that model's postprocess operation temporarily. Entropy is a detached diagnostic only, so an entropy loss bonus is unsupported. FP8, MTP, deferred embedding gradients, muP and autocast are also rejected for this mode. These constraints protect supported execution semantics; they do not establish a throughput gain or learning benefit.
 
+These recipes use the in-process SGLang backend by default. To use the main
+branch's HTTP server backend, add ``+rollout.sglang.backend_type=server`` to the
+same launcher. Both paths carry images, thinking-budget processors and installed
+weight versions. The server runs as a local child process and binds to loopback;
+actor weights still transfer directly through the scheduler.
+
+These SAO recipes use Partial rollout with a Critic and shared training GPUs.
+They retain their completed-episode buffer and checkpointed prompt cursor.
+The fully asynchronous Search-R1 recipe uses separate rollout GPUs and the main
+branch's group buffer; it is not a replacement for this Critic update schedule.
+See :doc:`searchr1/async` for that recipe.
+
 SAO keeps up to 256 episodes in flight and consumes the next 128 completed trajectories, rather than waiting for a fixed synchronous batch to finish. An episode's slot includes model waits and tool execution; eight workers with 32 slots can start all 256 in-flight episodes. ``max_env_initializations_per_worker=8`` bounds cold starts to 64 processes across the eight workers. A permit is released after the first environment state is saved, not at episode completion, so all 256 environments can remain active after warmup. This limits CPU/import/CUDA-context pressure without reducing rollout capacity. The buffer holds complete trajectories. Additional pending prompts can be queued, but do not increase the in-flight limit. Each episode normally has one outstanding model request, so a per-replica limit of 128 is an admission ceiling, not 128 continuously active requests on every GPU.
 
 Shared GPUs still require a phase switch: pause/retract model requests, offload rollout memory, train the critic and actor, synchronize weights, then resume the waiting requests. Environment work may continue during training, but model generation pauses. SAO also changes the learning rules: DIS actor loss, clip bounds 0.3/5.0, ``sao_gae`` with alpha 1.5, and the SAO critic objective. It uses behavior logprobs saved during rollout instead of recomputing old-policy logprobs. The task, model, prompt, sampling and compression settings remain inherited from clean PPO.
@@ -173,7 +185,7 @@ Hydra overrides follow the config name, for example ``rollout.model.model_path="
 
 Check finite losses/gradients, nonzero parameter updates, actual replica activity, task success and infrastructure errors. Use Hydra overrides for an isolated short smoke run, rather than maintaining another smoke YAML. A successful short smoke test establishes connectivity and optimizer execution; it does not establish that the longest 262144-token workload fits in memory. Keep failure evidence and diagnose memory limits before changing sharding or budgets.
 
-For independent evaluation, use ``run_eval.sh eval_qwen3.5_4b_libero_rl`` on a separate available deployment. This template matches the training task, sampling, episode budgets and history window; only deployment and dataset paths need filling. If training used overrides, apply the corresponding settings to evaluation too. Its default placement expects one eight-GPU model node and a separate environment node; adjust placement to the resources assigned to evaluation. RPent's standalone batch collector is for serving/data collection, and the original ``eval_qwen3.5_4b`` is for the original LIBERO workflow.
+For independent evaluation, run the evaluation command below on a separate available deployment. This template matches the training task, sampling, episode budgets and history window; only deployment and dataset paths need filling. If training used overrides, apply the corresponding settings to evaluation too. Its default placement expects one eight-GPU model node and a separate environment node; adjust placement to the resources assigned to evaluation. RPent's standalone batch collector is for serving/data collection, and the original ``eval_qwen3.5_4b`` is for the original LIBERO workflow.
 
 The export needs the same full VLM used to initialize training, because it retains the frozen vision weights and processor. Replace ``--vlm`` accordingly when training from SFT. Use a new output directory; an HF export is for inference and cannot replace the optimizer/queue checkpoint for resume.
 
