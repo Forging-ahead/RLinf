@@ -22,21 +22,26 @@ The separate `libero_rl` workflow uses a **complete multimodal** Qwen checkpoint
 
 This branch is based on zhexuan's `rpent-ppo` commit `f351c57e62818b18315ed4b2194312a44cafb697`. It adds image-token preservation and lazy image loading, assigned-row exchange, chunked logprob recomputation, bounded rollout admission and producer-order recovery, bounded port allocation, and request/evaluation diagnostics. The changes are separate signed-off commits; inspect `git log --reverse f351c57e..HEAD` for their ownership and dependencies.
 
-The running Batch64/Env128 experiment has additional launch-time overrides and deployment code. This portable recipe defaults to Batch128/Env256, one SAM3 service, 100 turns and unrestricted thinking within the response budget. It does not include the experiment's forced Thinking512 closure, remote H/GD transport, four-SAM layout, CP3-specific recovery wrapper, or maintenance/audit scripts. It does not claim to reproduce that experiment by running this YAML unchanged. Existing experiment checkouts and artifacts remain separate.
+Historical Batch64/Env128 runs used additional launch overrides and deployment code. This portable recipe defaults to Batch128/Env256, one SAM3 service, 100 turns and unrestricted thinking within the response budget. Optional thinking closure and full LM Head chunking are available in this branch and disabled by default. The recipe does not include H/GD transport, the four-SAM layout, CP3-specific recovery wrappers or maintenance scripts. Preserve each experiment's configuration and source manifest when comparing results; this YAML alone does not reproduce a historical run.
+
+The LIBERO training recipe sets `agentloop.max_infra_retry_rate=1.0`: a complete, valid batch can proceed after recovered infrastructure retries. Retry metrics and per-episode retry limits remain active; an exhausted retry or invalid native result still fails the episode. Other recipes retain their own retry policy.
 
 The package versions below describe prior runtime compatibility. A clean install, real SGLang image/logprob request, learner update and checkpoint recovery on the recipient's machines still need validation. CPU tests alone do not establish GPU capacity or learning benefit.
 
+This is a development handoff, not a completed infrastructure or learning acceptance. Use shared Actor/Critic placement for synchronous multimodal PPO: the separate-inference join still matches token IDs and can misassociate different-image samples with identical tokens. Cross-backend numerical checks remain open; a synthetic forced-close probe exceeded its diagnostic tolerance. Optional thinking closure and LM Head chunking remain disabled by default.
+
 ## Install code and environments
 
-Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL libraries, Git and `uv`. Choose a shared root, or reproduce the same paths on every node. Clone the development branch from the personal fork below and use the pinned RPent revision. Record `rev-parse HEAD` before installation so collaborators can reproduce the same source revision.
+Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL libraries, Git and `uv`. Keep the same paths across nodes. The published branches below contain the paired source; no external patch is needed. Record the RLinf revision before installation and retain the pinned RPent revision.
 
 ```bash
 export STACK_ROOT="$HOME/rpent-stack"
 mkdir -p "$STACK_ROOT/repos" "$STACK_ROOT/envs" "$STACK_ROOT/models" "$STACK_ROOT/data"
-git clone --branch dev/rpent-rlinf-baseline https://github.com/Sonorous281/RLinf.git "$STACK_ROOT/repos/RLinf"
+git clone --branch fix/rpent-infra-cleanup https://github.com/Sonorous281/RLinf.git "$STACK_ROOT/repos/RLinf"
+git clone --branch fix/rpent-infra-cleanup https://github.com/Sonorous281/RPent.git "$STACK_ROOT/repos/RPent"
+git -C "$STACK_ROOT/repos/RPent" checkout --detach dce07b9717cab06eb32d0b80c91c0117c13a57f1
 git -C "$STACK_ROOT/repos/RLinf" rev-parse HEAD
-git clone --branch rpent-ppo https://github.com/zhexuanxu/RPent.git "$STACK_ROOT/repos/RPent"
-git -C "$STACK_ROOT/repos/RPent" checkout f11eee5910b74d132363a526ad385fa828ad4a26
+git -C "$STACK_ROOT/repos/RPent" rev-parse HEAD
 git clone https://github.com/NVIDIA/Megatron-LM.git "$STACK_ROOT/repos/Megatron-LM"
 git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
 export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
@@ -75,6 +80,8 @@ The tested stack uses these versions. This table records compatibility, rather t
 | Simulator environment | Torch 2.11.0+cu128; Transformers 4.57.6; NumPy 1.26.4; MuJoCo 3.3.0; robosuite 1.5.2; rpent-libero/rpent-liberopro 0.2.0; SAM3 0.1.0 |
 
 Check the active environment with `uv pip freeze`, `python -c 'import torch; print(torch.__version__, torch.version.cuda)'` and `git -C "$MEGATRON_PATH" rev-parse HEAD`. Preserve a package inventory after validating it. A matching CUDA compiler is needed for source builds; a networked CPU-only machine can download wheels/sources, but does not necessarily build the CUDA extensions. For offline nodes, prepare the complete dependency set on a compatible Linux/Python/CUDA build host, transfer it and the Git sources, then install with `uv pip install --no-index --find-links /path/to/wheelhouse ...`. A partial wheel cache is not a complete offline installation.
+
+The bounded infrastructure checks on 2026-11-13 reused a separate simulator environment with Python 3.11.14 and Torch 2.7.1. They validate the native environment interface on that stack, not a fresh installation of the Python 3.12 / Torch 2.11 simulator recipe above. The checks did not start a learning-effect run.
 
 All Ray nodes need the same RLinf environment, source revision and model files. Keep RPent in its own environment; do not upgrade the RLinf Transformers installation to match RPent's. When supplying custom activation profiles, preserve the installer's Megatron, CUDA and NCCL paths. This recipe uses FA2 and disables Torch compilation; set `NVTE_FLASH_ATTN=1`, `NVTE_FUSED_ATTN=0` and `TORCH_COMPILE_DISABLE=1` before starting Ray. EGL must work on the environment node.
 
@@ -159,6 +166,12 @@ trajectory or its recorded behavior logprobs.
 which targets 256 reasoning tokens per decision without forcing decoder tokens.
 It requires an RPent version that provides this prompt variant. Keep thinking
 history and compare native success and measured cost before adopting it.
+
+### Optional thinking and projection limits
+
+To cap the first thinking span already opened by the chat template, set `agentloop.thinking_token_budget=512` and `rollout.sglang.enable_custom_logit_processor=true`, keeping `enable_thinking=true`. The default budget is `null`. The engine records which closing token it forces; that token has zero training mask, while a naturally generated closing token remains trainable. A later reopened thinking span is not capped by this option. Keep the returned IDs, behavior logprobs, forced-token flags and weight versions together through trajectory assembly.
+
+For full projection chunking, set `actor.model.lm_head_chunk_size=256`; the default `0` retains the normal projection. The chunked path projects scored response positions in blocks and recomputes them during backward. It supports MBridge Qwen3.5 with PP1/CP1, including TP and sequence parallel. Use the recorded Megatron version; this path replaces that model's postprocess operation temporarily. Entropy is a detached diagnostic only, so an entropy loss bonus is unsupported. FP8, MTP, deferred embedding gradients, muP and autocast are also rejected for this mode. These constraints protect supported execution semantics; they do not establish a throughput gain or learning benefit.
 
 SAO keeps up to 256 episodes in flight and consumes the next 128 completed trajectories, rather than waiting for a fixed synchronous batch to finish. An episode's slot includes model waits and tool execution; eight workers with 32 slots can start all 256 in-flight episodes. `max_env_initializations_per_worker=8` bounds cold starts to 64 processes across the eight workers. A permit is released after the first environment state is saved, not at episode completion, so all 256 environments can remain active after warmup. This limits CPU/import/CUDA-context pressure without reducing rollout capacity. The buffer holds complete trajectories. Additional pending prompts can be queued, but do not increase the in-flight limit. Each episode normally has one outstanding model request, so a per-replica limit of 128 is an admission ceiling, not 128 continuously active requests on every GPU.
 

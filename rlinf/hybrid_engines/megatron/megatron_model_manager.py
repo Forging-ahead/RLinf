@@ -36,6 +36,7 @@ from rlinf.utils.logging import get_logger
 from rlinf.utils.profiler import PyTorchProfiler, PyTorchProfilerFunc
 from rlinf.utils.utils import clear_memory
 
+from .lm_head import forward_qwen_vl_with_chunked_log_probs
 from .utils import (
     postprocess_packed_seqs,
     preprocess_packed_seqs,
@@ -202,8 +203,10 @@ def patch_load_checkpoint_to_be_non_strict(enable: bool):
         load_checkpoint_orig = megatron.training.training.load_checkpoint
         load_checkpoint_patched = partial(load_checkpoint_orig, strict=False)
         megatron.training.training.load_checkpoint = load_checkpoint_patched
-        yield
-        megatron.training.training.load_checkpoint = load_checkpoint_orig
+        try:
+            yield
+        finally:
+            megatron.training.training.load_checkpoint = load_checkpoint_orig
 
     if enable:
         return context()
@@ -791,11 +794,19 @@ class MegatronModelManager:
         padding_seqlen: Optional[int] = None,
         keep_left_padding: bool = False,
         trim_right_padding: bool = False,
+        lm_head_chunk_size: int = 0,
+        calculate_entropy: bool = False,
         **model_forward_kwargs,
     ):
         """Default forward pass for GPT models with optional sequence packing."""
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+        if lm_head_chunk_size and (
+            value_model or logits_processor is None or not pack_seqs
+        ):
+            raise ValueError(
+                "Qwen-VL chunked scoring requires a packed Actor scoring forward"
+            )
         if pack_seqs:
             # Bridge Qwen-VL embeds images before its own THD/CP packing.
             packs_in_model = any(
@@ -825,14 +836,13 @@ class MegatronModelManager:
                 input_ids_rmpad = input_ids_rmpad[:, :used].contiguous()
                 model_attention_mask = attention_mask[:, :used].contiguous()
                 model_position_ids = position_ids[..., :used].contiguous()
-            output_orig = model(
+            model_inputs = dict(
                 input_ids=input_ids_rmpad,
                 attention_mask=model_attention_mask,
                 position_ids=model_position_ids,
                 packed_seq_params=packed_seq_params,
                 **model_forward_kwargs,
             )
-            output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(
@@ -843,7 +853,28 @@ class MegatronModelManager:
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-                output_dict = logits_processor(output_orig, **args)
+            if post_process and lm_head_chunk_size:
+                if not packs_in_model:
+                    raise ValueError(
+                        "This chunked scoring path requires the Qwen-VL wrapper"
+                    )
+                output_orig = forward_qwen_vl_with_chunked_log_probs(
+                    model,
+                    unwrap_model(model),
+                    **args,
+                    chunk_size=lm_head_chunk_size,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    **model_inputs,
+                )
+            else:
+                output_orig = model(**model_inputs)
+                output_orig /= temperature
+            if post_process and logits_processor is not None:
+                if lm_head_chunk_size:
+                    output_dict = output_orig
+                else:
+                    output_dict = logits_processor(output_orig, **args)
                 output = {
                     k: postprocess_packed_seqs(
                         v,

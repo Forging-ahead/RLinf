@@ -226,6 +226,9 @@ class SGLangWorker(Worker):
             mem_fraction_static=self._cfg_rollout.gpu_memory_utilization,
             enable_memory_saver=use_cudagraph,
             enable_weights_cpu_backup=enable_weights_cpu_backup,
+            enable_custom_logit_processor=self._cfg_rollout.sglang.get(
+                "enable_custom_logit_processor", False
+            ),
             enable_torch_compile=self._cfg_rollout.sglang.use_torch_compile,
             torch_compile_max_bs=min(
                 self._cfg_rollout.sglang.torch_compile_max_bs,
@@ -568,10 +571,15 @@ class SGLangWorker(Worker):
             for key, value in sampling_params.items():
                 final_sampling_params[key] = value
 
+        custom_processor = None
+        if "custom_logit_processor" in final_sampling_params:
+            final_sampling_params = final_sampling_params.copy()
+            custom_processor = final_sampling_params.pop("custom_logit_processor")
         try:
             result = await self._engine.async_generate(
                 input_ids=prompt_ids,
                 sampling_params=final_sampling_params,
+                custom_logit_processor=custom_processor,
                 image_data=image_data or None,
                 return_logprob=self._return_logprobs,
             )
@@ -590,6 +598,17 @@ class SGLangWorker(Worker):
             "finish_reason": result["meta_info"]["finish_reason"]["type"],
             "prompt_tokens": result["meta_info"]["prompt_tokens"],
         }
+        if "forced_token_mask" in result["meta_info"]:
+            flags = result["meta_info"]["forced_token_mask"]
+            if len(flags) != len(result_dict["output_ids"]) or any(
+                type(flag) is not bool for flag in flags
+            ):
+                raise ValueError(
+                    "Engine forced-token metadata must align with output IDs"
+                )
+            result_dict["forced_token_positions"] = [
+                index for index, forced in enumerate(flags) if forced
+            ]
         if self._return_logprobs:
             result_dict["logprobs"] = [
                 item[0] for item in result["meta_info"]["output_token_logprobs"]

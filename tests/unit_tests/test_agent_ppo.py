@@ -17,6 +17,8 @@
 import asyncio
 import copy
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -33,6 +35,26 @@ from rlinf.data.schema.agent_trajectory import prepare_agent_ppo_targets
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.scheduler import Channel, Cluster
 from rlinf.scheduler.channel.channel_worker import LocalChannel
+
+
+def test_sglang_scheduler_wrapper_keeps_the_vendor_entrypoint():
+    pytest.importorskip("sglang")
+    # Engine installation rewrites imported aliases. Check in a fresh process
+    # so global patches neither hide this regression nor leak into other tests.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from rlinf.hybrid_engines.sglang.common import sgl_engine, sgl_scheduler; "
+            "from sglang.srt.managers import scheduler; "
+            "assert scheduler.run_scheduler_process is sgl_scheduler.run_scheduler_process; "
+            "assert sgl_scheduler.ORIG__run_scheduler_process is not scheduler.run_scheduler_process; "
+            "assert sgl_scheduler.ORIG__run_scheduler_process.__module__ == 'sglang.srt.managers.scheduler'",
+        ],
+        check=True,
+        timeout=60,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
 
 
 @pytest.fixture
@@ -306,6 +328,62 @@ def test_critic_value_head_rejects_unknown_initialization():
         LinearForLastLayer(8, 1, sequence_parallel=False, weight_init="uniform")
 
 
+@pytest.mark.parametrize("collocated", [True, False])
+def test_synchronous_publication_labels_installed_weights_after_resume(collocated):
+    pytest.importorskip("megatron.training")
+    from rlinf.runners.agent_ppo_runner import AgentPPORunner
+
+    # Actor and rollout RPC boundaries: installation completes only on wait().
+    state = {"weight": torch.tensor([1.0]), "pending": None, "installed": None}
+    versions = []
+
+    def prepare(**kwargs):
+        state["pending"] = state["weight"].clone()
+
+    def install(weight_version=None):
+        def wait():
+            state["installed"] = state["pending"].clone()
+            versions.append(weight_version)
+
+        return SimpleNamespace(wait=wait)
+
+    def release():
+        assert torch.equal(state["installed"], state["weight"])
+        state["pending"] = None
+        return SimpleNamespace(wait=lambda: None)
+
+    runner = object.__new__(AgentPPORunner)
+    runner.has_dedicated_actor_inference = runner.has_dedicated_critic_inference = False
+    runner.component_placement = SimpleNamespace(is_collocated=collocated)
+    runner.actor = SimpleNamespace(
+        sync_model_to_rollout=prepare, del_reshard_state_dict=release
+    )
+    runner.rollout = SimpleNamespace(sync_model_from_actor=install)
+    for step in (7, 8):
+        runner.global_steps = step
+        state["weight"].add_(1)
+        runner._sync_weights(do_offload=False)
+        assert torch.equal(state["installed"], state["weight"])
+    assert versions == [7, 8]
+
+
+def test_checkpoint_loader_patch_is_released_after_a_failed_load(monkeypatch):
+    training = pytest.importorskip("megatron.training.training")
+    from rlinf.hybrid_engines.megatron.megatron_model_manager import (
+        patch_load_checkpoint_to_be_non_strict,
+    )
+
+    def loader(*, strict=True):
+        return strict
+
+    monkeypatch.setattr(training, "load_checkpoint", loader)
+    with pytest.raises(OSError, match="checkpoint unavailable"):
+        with patch_load_checkpoint_to_be_non_strict(True):
+            assert training.load_checkpoint() is False
+            raise OSError("checkpoint unavailable")
+    assert training.load_checkpoint() is True
+
+
 def test_checkpoint_context_keeps_resident_state_trainable(tmp_path):
     pytest.importorskip("megatron.training")
     from omegaconf import OmegaConf
@@ -435,6 +513,8 @@ def test_megatron_valid_token_scale_matches_unsplit_gradient(
         worker.cfg = OmegaConf.create(
             {
                 "runner": {"task_type": "reasoning"},
+                "rollout": {"model": {"model_path": "/test/model"}},
+                "tools": {},
                 "critic": {},
                 "algorithm": {
                     "loss_type": "actor",
@@ -454,6 +534,7 @@ def test_megatron_valid_token_scale_matches_unsplit_gradient(
         worker.value_clip = 0.5
         worker.num_microbatches = 1
         worker.response_only_logits = False
+        worker.lm_head_chunk_size = 0
         input_ids = torch.arange(128).reshape(32, 4) % 7 + 1
         positions = torch.arange(4).expand_as(input_ids).clone()
         mask = (positions > 0) & (positions <= (torch.arange(32) % 3 + 1)[:, None])
@@ -668,8 +749,11 @@ def test_batch_merge_pads_rows_for_a_text_only_batch():
         assert sum(entry is not None for entry in payloads) == 1
 
 
-def test_actor_batch_keeps_payloads_when_the_first_row_is_text():
+def test_actor_batch_keeps_payloads_when_the_first_row_is_text(monkeypatch):
     """A text-only leading row must not hide the later rows' images."""
+    from rlinf.scheduler import Worker
+
+    monkeypatch.setattr(Worker, "torch_device_type", "cpu")
     result = make_result()
     result.multi_modal_inputs = [None, {"tag": torch.tensor([5.0])}, None]
     batch = result.to_actor_batch(6, 0)
@@ -768,6 +852,8 @@ def test_multiturn_critic_preserves_values_loss_and_update_with_packing(
         worker.cfg = OmegaConf.create(
             {
                 "critic": {"model": {"encoder_seq_length": 6}},
+                "rollout": {"model": {"model_path": "/test/model"}},
+                "tools": {},
                 "algorithm": {"use_valid_token_scale": True},
             }
         )
@@ -1508,6 +1594,44 @@ def test_tis_weights_only_response_tokens_and_truncates_large_ratios():
         truncated_importance_weights(
             torch.tensor([[float("nan")]]), torch.zeros(1, 1), mask[:, :1], 2.0
         )
+
+
+@pytest.mark.parametrize("presence_penalty", [0.0, 1.5])
+def test_tis_corrects_penalized_behavior_without_differentiating_the_weights(
+    presence_penalty,
+):
+    """Enumerating the vocabulary gives an exact expected policy gradient."""
+    from rlinf.algorithms.utils import truncated_importance_weights
+
+    temperature, clip = 0.7, 2.0
+    logits = torch.tensor([[0.4, -0.2, 0.8, 0.1]], requires_grad=True)
+    seen = torch.tensor([[True, False, True, False]])
+    target = (logits / temperature).log_softmax(-1)
+    behavior = ((logits.detach() - presence_penalty * seen) / temperature).softmax(-1)
+    mask = torch.ones_like(seen)
+    weights = truncated_importance_weights(target, behavior.log(), mask, clip)
+    assert not weights.requires_grad
+    torch.testing.assert_close(
+        weights, (target.detach().exp() / behavior).clamp(max=clip)
+    )
+
+    advantages = torch.tensor([[1.0, -0.5, -1.0, 0.25]])
+    loss, _ = compute_ppo_actor_loss(
+        logprobs=target,
+        old_logprobs=target.detach(),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        advantages=advantages * weights,
+        loss_mask=mask,
+        loss_agg_func=lambda values, loss_mask, *args: (
+            values * behavior * loss_mask
+        ).sum(),
+    )
+    gradient = torch.autograd.grad(loss, logits)[0]
+    probabilities = target.detach().exp()
+    mass = torch.minimum(probabilities, clip * behavior) * advantages
+    expected = -(mass - probabilities * mass.sum()) / temperature
+    torch.testing.assert_close(gradient, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_behavior_metrics_report_mismatch_without_stopping(single_process_group):
@@ -2434,4 +2558,184 @@ def test_dynamic_balance_exchanges_only_assigned_rows(tmp_path):
         _dynamic_balance_partition_rank,
         args=(str(tmp_path / "balance-store"),),
         nprocs=3,
+    )
+
+
+@pytest.mark.parametrize(
+    "chunk_size,temperature,dtype,entropy",
+    [
+        (1, 0.7, torch.float32, False),
+        (4, 1.3, torch.float32, True),
+        (3, 1.0, torch.bfloat16, False),
+        (32, 1.0, torch.float16, False),
+    ],
+)
+def test_chunked_lm_head_matches_dense_values_and_gradients(
+    chunk_size, temperature, dtype, entropy
+):
+    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
+
+    torch.manual_seed(81)
+    hidden = torch.randn(2, 7, 5, dtype=dtype, requires_grad=True)
+    weight = torch.randn(19, 5, dtype=dtype, requires_grad=True)
+    bias = torch.randn(19, dtype=dtype, requires_grad=True)
+    labels = torch.randint(19, (2, 7))
+    mask = torch.rand(2, 7) > 0.3
+    scale = torch.randn(2, 7)
+    dense = torch.nn.functional.linear(hidden, weight, bias).float() / temperature
+    dense_log_probs = dense.log_softmax(-1)
+    expected = (
+        dense_log_probs.gather(-1, labels.unsqueeze(-1))
+        .squeeze(-1)
+        .masked_fill(~mask, 0)
+    )
+    reference_grads = torch.autograd.grad(
+        (expected * scale).sum(), (hidden, weight, bias)
+    )
+    actual = chunked_vocab_parallel_log_probs(
+        hidden,
+        weight,
+        labels,
+        mask,
+        chunk_size=chunk_size,
+        temperature=temperature,
+        bias=bias,
+        calculate_entropy=entropy,
+    )
+    torch.testing.assert_close(actual["log_probs"], expected, atol=2e-6, rtol=2e-6)
+    actual_grads = torch.autograd.grad(
+        (actual["log_probs"] * scale).sum(), (hidden, weight, bias)
+    )
+    tolerance = 0.02 if dtype in (torch.bfloat16, torch.float16) else 2e-6
+    for got, want in zip(actual_grads, reference_grads):
+        torch.testing.assert_close(got, want, atol=tolerance, rtol=tolerance)
+    if entropy:
+        assert not actual["entropy"].requires_grad
+        torch.testing.assert_close(
+            actual["entropy"], -(dense_log_probs.exp() * dense_log_probs).sum(-1)
+        )
+
+
+def test_chunked_lm_head_empty_mask_and_frozen_weight():
+    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
+
+    hidden = torch.randn(2, 4, 3, requires_grad=True)
+    weight = torch.randn(11, 3)
+    labels = torch.full((2, 4), -100)
+    mask = torch.zeros_like(labels, dtype=torch.bool)
+    output = chunked_vocab_parallel_log_probs(
+        hidden, weight, labels, mask, chunk_size=3
+    )
+    output["log_probs"].sum().backward()
+    torch.testing.assert_close(output["log_probs"], torch.zeros(2, 4))
+    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
+
+
+def test_chunked_lm_head_accumulates_main_grad_without_double_add():
+    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
+
+    torch.manual_seed(93)
+    weight = torch.nn.Parameter(torch.randn(17, 5))
+    weight.main_grad = torch.ones_like(weight)
+    weight.grad_added_to_main_grad = False
+    expected = weight.main_grad.clone()
+    for _ in range(2):
+        hidden = torch.randn(7, 5, requires_grad=True)
+        labels = torch.randint(17, (7,))
+        dense = torch.nn.functional.linear(hidden, weight).log_softmax(-1)
+        expected += torch.autograd.grad(dense.gather(1, labels[:, None]).sum(), weight)[
+            0
+        ]
+        result = chunked_vocab_parallel_log_probs(
+            hidden,
+            weight,
+            labels,
+            torch.ones(7, dtype=torch.bool),
+            chunk_size=3,
+            gradient_accumulation_fusion=True,
+        )
+        result["log_probs"].sum().backward()
+    torch.testing.assert_close(weight.main_grad, expected, atol=3e-6, rtol=3e-6)
+    assert weight.grad_added_to_main_grad
+    torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+
+
+def test_chunked_lm_head_does_not_save_vocabulary_activations():
+    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
+
+    hidden = torch.randn(23, 5, requires_grad=True)
+    weight = torch.randn(29, 5, requires_grad=True)
+    labels = torch.arange(23)
+    saved = []
+
+    def record(tensor):
+        saved.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(record, lambda tensor: tensor):
+        output = chunked_vocab_parallel_log_probs(
+            hidden,
+            weight,
+            labels,
+            torch.ones(23, dtype=torch.bool),
+            chunk_size=4,
+        )
+    output["log_probs"].sum().backward()
+    assert (29, 5) in saved
+    assert not any(len(shape) >= 2 and shape[-1] == 29 for shape in saved), saved
+
+
+def _chunked_lm_head_tp_reference(rank, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
+
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.manual_seed(17)
+        hidden = torch.randn(9, 5, requires_grad=True)
+        full_weight = torch.randn(22, 5, requires_grad=True)
+        labels = torch.tensor([0, 10, 11, 21, 3, 16, 7, 18, 20])
+        mask = torch.tensor([True, False, True, True, True, True, False, True, True])
+        scales = torch.randn(9)
+        reference = (hidden @ full_weight.t() / 0.7).log_softmax(-1)
+        reference = (
+            reference.gather(1, labels[:, None]).squeeze(1).masked_fill(~mask, 0)
+        )
+        dh, dw = torch.autograd.grad((reference * scales).sum(), (hidden, full_weight))
+        shard = full_weight.detach().chunk(2)[rank].clone().requires_grad_()
+        actual = chunked_vocab_parallel_log_probs(
+            hidden,
+            shard,
+            labels,
+            mask,
+            chunk_size=3,
+            temperature=0.7,
+            tp_group=dist.group.WORLD,
+        )
+        (actual["log_probs"] * scales).sum().backward()
+        dist.all_reduce(hidden.grad)
+        torch.testing.assert_close(actual["log_probs"], reference, atol=3e-6, rtol=3e-6)
+        torch.testing.assert_close(hidden.grad, dh, atol=3e-6, rtol=3e-6)
+        torch.testing.assert_close(shard.grad, dw.chunk(2)[rank], atol=3e-6, rtol=3e-6)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_chunked_lm_head_two_rank_vocab_shards(tmp_path):
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+
+    if not dist.is_gloo_available():
+        pytest.skip("The TP reference test requires Gloo")
+    mp.spawn(
+        _chunked_lm_head_tp_reference, args=((tmp_path / "tp-init").as_uri(),), nprocs=2
     )

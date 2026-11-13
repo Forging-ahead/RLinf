@@ -34,6 +34,10 @@ from rlinf.agents.rpent.history import (
     AppendOnlyHistory,
     request_has_images,
 )
+from rlinf.agents.rpent.thinking_budget import (
+    ThinkingBudget,
+    serialized_thinking_processor,
+)
 from rlinf.agents.tokenization import get_agentic_tokenizer
 from rlinf.scheduler import Channel
 from rlinf.utils.placement import ModelParallelComponentPlacement
@@ -88,6 +92,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         super().__init__(cfg, placement)
         # Training compares these logprobs with its own recomputation (TIS).
         self.return_logprobs = cfg.rollout.return_logprobs
+        self._thinking_limit = cfg.agentloop.get("thinking_token_budget")
         if self.tokenizer.eos_token_id is None:
             raise ValueError("RPent chat tokenizer must define an EOS token")
         template_kwargs = cfg.agentloop.get("chat_template_kwargs")
@@ -414,6 +419,16 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             # and the model config's EOS can differ from the chat EOS.
             "stop_token_ids": [self.tokenizer.eos_token_id],
         }
+        budget = None
+        if self._thinking_limit is not None:
+            budget = ThinkingBudget.from_prompt(
+                prompt_ids,
+                self._thinking_limit,
+                self.tokenizer.convert_tokens_to_ids("<think>"),
+                self.tokenizer.convert_tokens_to_ids("</think>"),
+            )
+            sampling_params["custom_params"] = budget.custom_params()
+            sampling_params["custom_logit_processor"] = serialized_thinking_processor()
         # A text turn keeps the plain request; only an image turn carries bytes.
         extra = {"image_data": images} if images else {}
         generated = await self.generate(
@@ -425,20 +440,28 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             response_ids, request.get("tools"), turn_idx
         )
         episode.history.record(request, prompt_ids, response_ids, message)
+        extra_fields = {
+            "turn_id": turn_idx,
+            "tool_names": [call["name"] for call in calls],
+            "chain_id": episode.history.chain_id,
+        }
+        if budget is not None:
+            extra_fields["forced_token_positions"] = generated["forced_token_positions"]
         episode.turns.append(
             AgentLoopOutput(
                 prompt_ids=prompt_ids,
                 response_ids=response_ids,
                 response_text=response_text,
+                response_mask=None
+                if budget is None
+                else budget.response_mask(
+                    response_ids, generated["forced_token_positions"]
+                ),
                 response_logprobs=generated.get("logprobs"),
                 response_weight_versions=generated.get("weight_versions"),
                 response_images=image_grid_thw,
                 is_end=generated["finish_reason"] == "stop",
-                extra_fields={
-                    "turn_id": turn_idx,
-                    "tool_names": [call["name"] for call in calls],
-                    "chain_id": episode.history.chain_id,
-                },
+                extra_fields=extra_fields,
             )
         )
         if generated["finish_reason"] == "length":

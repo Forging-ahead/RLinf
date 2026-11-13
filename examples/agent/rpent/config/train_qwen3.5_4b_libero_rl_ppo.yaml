@@ -25,6 +25,10 @@ data:
   shuffle: true
 
 agentloop:
+  # Count recovered retries without rejecting a complete, valid training batch.
+  max_infra_retry_rate: 1.0
+  # Optional forced closure of the first open thinking span; null disables it.
+  thinking_token_budget: null
   chat_template_kwargs:
     enable_thinking: true
     preserve_thinking: true
@@ -73,12 +77,15 @@ rollout:
   sglang:
     context_length: 262144
     mamba_full_memory_ratio: 0.2
+    enable_custom_logit_processor: false
 
 actor:
   expect_multi_modal_inputs: true
   trim_right_padding: true
   model:
     attention_backend: flash
+    # Zero keeps the normal projection; positive values chunk scored positions.
+    lm_head_chunk_size: 0
     freeze_vision_model: true
     freeze_vision_projection: true
   tokenizer:

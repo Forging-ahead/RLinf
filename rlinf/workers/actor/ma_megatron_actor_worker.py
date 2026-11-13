@@ -99,6 +99,7 @@ class MAMegatronActor(MegatronActor):
     def __init__(
         self, cfg: DictConfig, placement: ModelParallelComponentPlacement, role="actor"
     ):
+        self.lm_head_chunk_size = cfg.actor.model.get("lm_head_chunk_size", 0)
         super().__init__(cfg, placement)
         self._init_auto_scheduler(role)
         self.is_dynamic_rollout_batch = self.cfg.agentloop.is_dynamic_rollout_batch
@@ -216,7 +217,12 @@ class MAMegatronActor(MegatronActor):
             # response_mask needs to be shifted left by 1 to align with the shifted labels
             # because response_mask[i] indicates whether position i is a response token in input_ids
             # but label[i] = input_ids[i+1], so we need to shift response_mask left to align
-            label_mask = copy.deepcopy(batch["attention_mask"])
+            mask_source = (
+                batch["response_mask"]
+                if self.lm_head_chunk_size
+                else batch["attention_mask"]
+            )
+            label_mask = copy.deepcopy(mask_source)
             label_mask[:, :-1] = label_mask[:, 1:].clone()  # Shift left by 1
             label_mask[:, -1] = False
             chunked_logprobs = self.response_only_logits and not self.calculate_entropy
@@ -249,7 +255,11 @@ class MAMegatronActor(MegatronActor):
 
             logits_processor_args = {"label": label, "label_mask": label_mask}
 
-            positions = self._scored_positions(batch, attention_mask)
+            positions = (
+                None
+                if self.lm_head_chunk_size
+                else self._scored_positions(batch, attention_mask)
+            )
             if positions is not None:
                 logits_processor = _at_positions(logits_processor, positions)
             with self._output_positions(model, positions):
@@ -263,13 +273,21 @@ class MAMegatronActor(MegatronActor):
                     logits_processor_args=logits_processor_args,
                     # Float16Module otherwise upcasts the entire vocabulary
                     # output. Scale only each FP32 chunk, including at T != 1.
-                    temperature=1.0
-                    if chunked_logprobs
-                    else self.cfg.algorithm.sampling_params.temperature,
+                    temperature=self.cfg.algorithm.sampling_params.temperature
+                    if self.lm_head_chunk_size or not chunked_logprobs
+                    else 1.0,
                     trim_right_padding=self.cfg.get("actor", {}).get(
                         "trim_right_padding", False
                     ),
                     **self._forward_multimodal_inputs(batch),
+                    **(
+                        {
+                            "lm_head_chunk_size": self.lm_head_chunk_size,
+                            "calculate_entropy": self.calculate_entropy,
+                        }
+                        if self.lm_head_chunk_size
+                        else {}
+                    ),
                     **({"fp32_output": False} if chunked_logprobs else {}),
                 )
 

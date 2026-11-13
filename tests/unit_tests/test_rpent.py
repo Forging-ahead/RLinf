@@ -24,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from _qwen35_chat import Qwen35ToyTokenizer, qwen35_agentic_tokenizer
 from omegaconf import OmegaConf
 
@@ -34,6 +35,7 @@ from rlinf.agents.rpent.history import (
     template_messages,
 )
 from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker
+from rlinf.agents.rpent.thinking_budget import ThinkingBudget, apply_thinking_budget
 from rlinf.workers.agent.agent_loop import AgentLoopOutput
 
 TOOLS = [
@@ -784,9 +786,14 @@ def test_episodes_render_on_slot_gpus_and_successes_drop_artifacts(make_agent):
     assert list((fake.state_dir / "episodes").iterdir()) == []
 
 
-@pytest.mark.parametrize("retried,stops", [(2, False), (3, True)])
-def test_retry_rate_above_the_limit_stops_the_update(make_agent, retried, stops):
+@pytest.mark.parametrize(
+    "retried,threshold,stops", [(2, 0.05, False), (3, 0.05, True), (10, 1.0, False)]
+)
+def test_retry_rate_above_the_limit_stops_the_update(
+    make_agent, retried, threshold, stops
+):
     worker = make_agent(FakeRPent())
+    worker.cfg.agentloop.max_infra_retry_rate = threshold
     error = {"type": "RPentEpisodeError", "kind": "process", "message": "lost"}
 
     def episode(retries):
@@ -807,10 +814,10 @@ def test_retry_rate_above_the_limit_stops_the_update(make_agent, retried, stops)
         with pytest.raises(RuntimeError, match="retry rate 30.00%"):
             worker.post_process_metric(metrics)
     else:
-        # Too few retried episodes to stop on, even above the rate limit.
+        # Recovered episodes remain counted even when the batch is accepted.
         result = worker.post_process_metric(metrics)
-        assert result["rpent/infra_retry_rate"] == 0.2
-        assert result["rpent/infra_retries/process"] == 0.2
+        assert result["rpent/infra_retry_rate"] == retried / 10
+        assert result["rpent/infra_retries/process"] == retried / 10
 
 
 def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
@@ -849,6 +856,57 @@ def test_example_config_satisfies_the_rpent_contract(config_name):
     from rlinf.config import validate_rpent_cfg
 
     validate_rpent_cfg(compose(config_name=config_name))
+
+
+@pytest.mark.parametrize(
+    "overrides, error",
+    [
+        (["agentloop.thinking_token_budget=-1"], "nonnegative integer"),
+        (["agentloop.thinking_token_budget=true"], "nonnegative integer"),
+        (["agentloop.thinking_token_budget=0"], "enable_custom_logit_processor"),
+        (
+            [
+                "agentloop.thinking_token_budget=512",
+                "rollout.sglang.enable_custom_logit_processor=true",
+                "agentloop.chat_template_kwargs.enable_thinking=false",
+            ],
+            "enable_thinking=True",
+        ),
+    ],
+)
+def test_thinking_budget_rejects_configs_that_cannot_enforce_it(overrides, error):
+    from rlinf.config import validate_rpent_cfg
+
+    with pytest.raises(ValueError, match=error):
+        validate_rpent_cfg(
+            compose(overrides, config_name="train_qwen3.5_4b_libero_rl_ppo")
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides, error",
+    [
+        (["+actor.model.lm_head_chunk_size=-1"], "nonnegative integer"),
+        (["actor.megatron.mbridge=false"], "MBridge Qwen3.5"),
+        (["actor.model.pipeline_model_parallel_size=2"], "PP1 and CP1"),
+        (
+            ["algorithm.calculate_entropy=true", "algorithm.entropy_bonus=0.01"],
+            "entropy metrics only",
+        ),
+        (["algorithm.sampling_params.temperature=0"], "finite positive"),
+    ],
+)
+def test_chunked_scoring_rejects_unsupported_training_modes(overrides, error):
+    from rlinf.config import validate_qwen_vl_chunked_cfg
+
+    cfg = compose(config_name="train_qwen3.5_4b_libero_rl_ppo")
+    OmegaConf.update(cfg, "actor.model.lm_head_chunk_size", 256, force_add=True)
+    for override in overrides:
+        key, value = override.lstrip("+").split("=", 1)
+        update = OmegaConf.from_dotlist([f"{key}={value}"])
+        OmegaConf.update(cfg, key, OmegaConf.select(update, key), force_add=True)
+    with pytest.raises(ValueError, match=error):
+        validate_qwen_vl_chunked_cfg(cfg)
 
 
 @pytest.mark.parametrize(
@@ -1648,3 +1706,104 @@ def test_image_storage_requires_retained_episode_assets():
     )
     with pytest.raises(ValueError, match="keep_episodes=all"):
         validate_rpent_cfg(cfg)
+
+
+def _thinking_params(budget, output):
+    # SGLang's external Req object supplies these three fields to its hook.
+    request = SimpleNamespace(
+        origin_input_ids=[0] * budget.prompt_tokens,
+        output_ids=output,
+        customized_info=None,
+    )
+    return {**budget.custom_params(), "__req__": request}
+
+
+def test_preserved_history_and_current_tokenizer_ids():
+    start, end = 248068, 248069
+    prompt = [start, 8, end, 12, start, 198]
+    budget = ThinkingBudget.from_prompt(prompt, 512, start, end)
+    params = _thinking_params(budget, [7] * 512)
+    logits = torch.ones(1, 248320)
+    apply_thinking_budget(logits, [params])
+    assert torch.isfinite(logits).sum().item() == 1
+    assert logits[0, end].item() == 0
+    assert params["__req__"].customized_info["forced_token_mask"] == [False] * 512 + [
+        True
+    ]
+
+
+def test_natural_end_keeps_every_sampled_token():
+    budget = ThinkingBudget(4, 7, 100000)
+    output = [2, 7, 3, 4, 5, 6]
+    logits = torch.randn(1, 9)
+    original = logits.clone()
+    params = _thinking_params(budget, output)
+    apply_thinking_budget(logits, [params])
+    torch.testing.assert_close(logits, original)
+    assert budget.response_mask(output, []) == [1] * len(output)
+
+
+def test_retracted_request_and_tool_continuation():
+    budget = ThinkingBudget(2, 7, 100)
+    params = _thinking_params(budget, [2, 3])
+    apply_thinking_budget(torch.zeros(1, 9), [params])
+    apply_thinking_budget(torch.zeros(1, 9), [params])
+    request = params["__req__"]
+    assert request.customized_info["forced_token_mask"] == [False, False, True]
+    request.output_ids.extend([7, 4, 5, 6])
+    logits = torch.randn(1, 9)
+    original = logits.clone()
+    apply_thinking_budget(logits, [params])
+    torch.testing.assert_close(logits, original)
+    assert budget.response_mask(request.output_ids, [2]) == [1, 1, 0, 1, 1, 1]
+    assert request.output_ids == [2, 3, 7, 4, 5, 6]
+
+
+def test_forced_token_has_zero_loss_gradient_and_preserves_normalization():
+    budget = ThinkingBudget(2, 5, 10)
+    ids = torch.tensor([1, 2, 5, 3])
+    mask = torch.tensor(budget.response_mask(ids.tolist(), [2]))
+    logits = torch.arange(32, dtype=torch.float64).reshape(4, 8).requires_grad_()
+    logprobs = logits.log_softmax(-1).gather(-1, ids[:, None]).squeeze(-1)
+    loss = -(logprobs * mask).sum() / mask.sum()
+    reference = -logprobs[[0, 1, 3]].mean()
+    grad = torch.autograd.grad(loss, logits, retain_graph=True)[0]
+    reference_grad = torch.autograd.grad(reference, logits)[0]
+    torch.testing.assert_close(loss, reference)
+    torch.testing.assert_close(grad, reference_grad)
+    assert torch.count_nonzero(grad[2]).item() == 0
+    assert all(torch.count_nonzero(grad[row]).item() for row in [0, 1, 3])
+
+
+def test_batch_requests_have_independent_budgets_and_disabled_path():
+    params = [_thinking_params(ThinkingBudget(2, 7, 10), [3, 4]), None]
+    logits = torch.randn(2, 9)
+    baseline = logits.clone()
+    apply_thinking_budget(logits, params)
+    assert torch.isfinite(logits[0]).sum().item() == 1
+    torch.testing.assert_close(logits[1], baseline[1])
+    original = baseline.clone()
+    apply_thinking_budget(baseline, None)
+    torch.testing.assert_close(baseline, original)
+
+
+@pytest.mark.parametrize("limit", [-1, True, 2.5])
+def test_invalid_limits_are_rejected(limit):
+    with pytest.raises(ValueError, match="nonnegative int"):
+        ThinkingBudget(limit, 7, 10)
+
+
+def test_wrong_prompt_or_missing_engine_evidence_is_rejected():
+    with pytest.raises(ValueError, match="open thinking span"):
+        ThinkingBudget.from_prompt([6, 2, 7], 2, 6, 7)
+    budget = ThinkingBudget(2, 7, 10)
+    params = _thinking_params(budget, [2, 3])
+    params["__req__"].origin_input_ids.append(0)
+    with pytest.raises(ValueError, match="prompt length"):
+        apply_thinking_budget(torch.zeros(1, 9), [params])
+    with pytest.raises(ValueError, match="closing token"):
+        budget.response_mask([2, 3, 4], [2])
+    with pytest.raises(ValueError, match="did not record"):
+        budget.response_mask([2, 3, 7, 4], [])
+    with pytest.raises(ValueError, match="outside the thinking boundary"):
+        budget.response_mask([2, 7, 4], [2])

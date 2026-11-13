@@ -66,6 +66,8 @@ class AgentPPORunner(AgentRunner):
     def _sync_weights(
         self, do_offload: bool = True, weight_version: int | None = None
     ) -> None:
+        if weight_version is None:
+            weight_version = self.global_steps
         if self.component_placement.is_collocated:
             super()._sync_weights(do_offload=do_offload, weight_version=weight_version)
             return

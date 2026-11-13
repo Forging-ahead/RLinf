@@ -22,21 +22,26 @@
 
 本分支基于 zhexuan 的 `rpent-ppo` commit `f351c57e62818b18315ed4b2194312a44cafb697`。新增内容按职责拆成带 sign-off 的提交：图像 Token 保真及延迟加载、按目标交换 rollout 行、分块重算 logprob、rollout 准入背压与生产顺序恢复、端口范围分配，以及请求和评测诊断。用 `git log --reverse f351c57e..HEAD` 查看改动归属与依赖顺序。
 
-正在运行的 Batch64/Env128 实验还有启动覆盖项和部署代码。这份可移植模板默认 Batch128/Env256、一个 SAM3 服务、100 轮，Thinking 只受总回复预算约束；不包含实验的 Thinking512 强制闭合、H/GD 远程传输、四 SAM 布局、CP3 专用恢复包装，以及维护和审计脚本。因此直接运行此 YAML 不等于复现当前实验。原实验 checkout 和产物保持独立。
+历史 Batch64/Env128 实验还使用了启动覆盖项和部署代码。这份可移植模板默认 Batch128/Env256、一个 SAM3 服务、100 轮，Thinking 只受总回复预算约束。本分支提供可选的 Thinking 强制闭合和完整 LM Head 分块，默认均关闭；不包含 H/GD 远程传输、四 SAM 布局、CP3 专用恢复包装或维护脚本。比较结果时应保留各实验的配置和源码清单，不能仅凭此 YAML 复现历史实验。
+
+LIBERO 训练模板设置 `agentloop.max_infra_retry_rate=1.0`：基础设施故障经重试恢复后，完整且有效的批次可继续更新。重试指标和单局重试次数限制仍保留；重试耗尽或原生结果无效仍会失败。其他模板保留各自的重试策略。
 
 下方软件版本记录历史运行兼容性。接收方仍需在自己的机器验证干净安装、SGLang 图像请求与 logprob、完整 learner update 和 checkpoint 恢复；CPU 测试不能证明 GPU 容量或学习效果。
 
+这是开发交接版本，尚未完成全部 infra 与学习效果验收。同步多模态 PPO 请使用 Actor/Critic 共卡布局：独立推理路径仍按 token ID 匹配结果，相同 token、不同图片的样本可能串配。跨后端数值检查仍未结束，一组人工强制闭合探针超出诊断容差。可选 Thinking 强制闭合和 LM Head 分块默认保持关闭。
+
 ## 安装代码与环境
 
-使用 Linux NVIDIA 主机，准备兼容驱动、CUDA 12.8 toolkit、EGL/OpenGL 库、Git 和 `uv`。选择共享根目录；无共享存储时，各节点需保持相同路径。从下方个人仓库克隆开发分支，并使用固定的 RPent commit。安装前记录 `rev-parse HEAD`，便于协作者复现同一份源码。
+使用 Linux NVIDIA 主机，准备兼容驱动、CUDA 12.8 toolkit、EGL/OpenGL 库、Git 和 `uv`，各节点保持相同路径。下方已发布分支包含配套源码，无需额外 patch。安装前记录 RLinf commit，并保留固定的 RPent commit。
 
 ```bash
 export STACK_ROOT="$HOME/rpent-stack"
 mkdir -p "$STACK_ROOT/repos" "$STACK_ROOT/envs" "$STACK_ROOT/models" "$STACK_ROOT/data"
-git clone --branch dev/rpent-rlinf-baseline https://github.com/Sonorous281/RLinf.git "$STACK_ROOT/repos/RLinf"
+git clone --branch fix/rpent-infra-cleanup https://github.com/Sonorous281/RLinf.git "$STACK_ROOT/repos/RLinf"
+git clone --branch fix/rpent-infra-cleanup https://github.com/Sonorous281/RPent.git "$STACK_ROOT/repos/RPent"
+git -C "$STACK_ROOT/repos/RPent" checkout --detach dce07b9717cab06eb32d0b80c91c0117c13a57f1
 git -C "$STACK_ROOT/repos/RLinf" rev-parse HEAD
-git clone --branch rpent-ppo https://github.com/zhexuanxu/RPent.git "$STACK_ROOT/repos/RPent"
-git -C "$STACK_ROOT/repos/RPent" checkout f11eee5910b74d132363a526ad385fa828ad4a26
+git -C "$STACK_ROOT/repos/RPent" rev-parse HEAD
 git clone https://github.com/NVIDIA/Megatron-LM.git "$STACK_ROOT/repos/Megatron-LM"
 git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
 export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
@@ -75,6 +80,8 @@ python -c 'import rlinf, robots.libero_rl; print(rlinf.__file__, robots.libero_r
 | 环境模拟器 | Torch 2.11.0+cu128；Transformers 4.57.6；NumPy 1.26.4；MuJoCo 3.3.0；robosuite 1.5.2；rpent-libero/rpent-liberopro 0.2.0；SAM3 0.1.0 |
 
 使用 `uv pip freeze`、`python -c 'import torch; print(torch.__version__, torch.version.cuda)'` 和 `git -C "$MEGATRON_PATH" rev-parse HEAD` 核对并在验证后保留版本清单。源码编译需要匹配的 CUDA 编译器；可联网的纯 CPU 节点适合下载 wheels/源码，但不一定能编译 CUDA 扩展。离线计算节点应先在兼容 Linux/Python/CUDA 构建机准备完整依赖，再传输 wheels 和 Git 源码，通过 `uv pip install --no-index --find-links /path/to/wheelhouse ...` 安装。部分 wheel 缓存不等于完整离线安装包。
+
+2026-11-13 的有限 infra 验证复用了独立模拟器环境，实际为 Python 3.11.14、Torch 2.7.1。这些结果验证了该环境中的原生接口，不代表上方 Python 3.12 / Torch 2.11 模拟器方案已完成全新安装验收；验证没有启动效果训练。
 
 所有 Ray 节点必须有相同的 RLinf 环境、源码和模型文件。RPent 保留独立环境，不要为了统一版本把 RLinf 的 Transformers 升级为 RPent 版本。若使用自定义激活脚本，保留安装器设置的 Megatron、CUDA、NCCL 路径。本方案使用 FA2 并关闭 Torch 编译，在启动 Ray 前设置 `NVTE_FLASH_ATTN=1`、`NVTE_FUSED_ATTN=0`、`TORCH_COMPILE_DISABLE=1`。环境节点还需要可用的 EGL。
 
@@ -152,6 +159,12 @@ Clean workflow 只保留四份依次继承的训练配置：`libero_rl_ppo` → 
 `agentloop.chat_template_kwargs.enable_thinking` 支持 `true` 和 `false`，本配方默认为 `true`。改变训练模式前，应固定 checkpoint 和任务 seed，对比原生成功率与生成成本。对照必须从新的 episode 开始，不能删除已有轨迹中的 thinking token 或行为 logprob。
 
 `agentloop.prompt=simple_brief` 选择 RPent 的可选简短推理提示词，目标是每次决策约 256 个推理 token，不强制插入解码 token。RPent 版本需支持此变体。保留历史 thinking，并比较原生成功率与实际成本后再采用。
+
+### 可选的 Thinking 与投影限制
+
+若要限制 chat template 已开启的首段 Thinking，设置 `agentloop.thinking_token_budget=512` 和 `rollout.sglang.enable_custom_logit_processor=true`，并保持 `enable_thinking=true`。预算默认是 `null`。引擎记录实际强制插入的闭合 Token，该 Token 的训练 mask 为零；自然生成的闭合 Token 仍参与训练。此选项不限制后续重新开启的 Thinking 段。组装轨迹时必须保持返回的 Token ID、behavior logprob、强制标记和权重版本的对应关系。
+
+若要启用完整投影分块，设置 `actor.model.lm_head_chunk_size=256`；默认 `0` 使用常规投影。分块路径按计分回复位置分批投影，并在反向时重算，支持 PP1/CP1 的 MBridge Qwen3.5，包括 TP 和 sequence parallel。使用上文记录的 Megatron 版本；此路径会临时替换该模型的 postprocess。Entropy 只作为 detached 诊断指标，不支持 entropy loss bonus；该模式也不支持 FP8、MTP、延迟 embedding 梯度、muP 和 autocast。这些约束界定受支持的执行方式，不代表已有吞吐或学习收益。
 
 SAO 允许最多 256 条在途 episode，按完成顺序收集下一批 128 条轨迹，不再等待某个固定同步 batch 的全部轨迹。Episode 槽位包含等待模型与执行工具的时间；八个 worker 各 32 个槽位，足以同时展开全部 256 条在途轨迹。`max_env_initializations_per_worker=8` 将八个 worker 的同时冷启动数量限制为 64；保存首次环境状态后立即释放冷启动槽位，不等 episode 结束，因此预热后仍可保持 256 个活跃环境。这只约束 CPU、import 和 CUDA context 初始化压力，不降低 rollout 容量。Buffer 保存已完成轨迹；额外排队的 prompt 不会提高在途上限。每个 episode 通常只有一个未完成模型请求，因此每副本 128 是准入上限，并不表示每张 GPU 始终都有 128 个活跃请求。
 
