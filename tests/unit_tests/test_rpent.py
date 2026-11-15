@@ -1887,3 +1887,262 @@ def test_multimodal_evaluation_uses_the_training_task_and_budget():
     ):
         parent, key = field.rsplit(".", 1)
         assert OmegaConf.is_missing(OmegaConf.select(template, parent), key)
+
+
+def test_token_space_history_preserves_sampled_ids_and_expands_only_new_images(qwen35):
+    import base64
+    import io
+
+    from PIL import Image
+
+    from rlinf.agents.rpent.history import TemplateMessageError
+
+    def image_part(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64,"
+                + base64.b64encode(buffer.getvalue()).decode()
+            },
+        }
+
+    history = AppendOnlyHistory(qwen35)
+    first_request = {"messages": [{"role": "user", "content": [image_part("red")]}]}
+    compact = history.render_token_space(first_request)
+    start, end = compact.image_spans[0]
+    expanded = (
+        compact.input_ids[:start]
+        + compact.input_ids[start:end] * 4
+        + compact.input_ids[end:]
+    )
+    history.accept_token_space(
+        {
+            "prompt_token_ids": expanded,
+            "image_spans": [(start, start + 4)],
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        }
+    )
+    response = qwen35.tokenizer("look again<|im_end|>")["input_ids"]
+    assistant = {"role": "assistant", "content": "look again"}
+    history.record(first_request, expanded, response, assistant)
+    next_request = {
+        "messages": [
+            *first_request["messages"],
+            assistant,
+            {"role": "user", "content": [image_part("blue")]},
+        ]
+    }
+    following = history.render_token_space(next_request)
+    assert following.input_ids[: len(expanded + response)] == expanded + response
+    assert following.prefix_length == len(expanded + response)
+    assert following.image_spans[0] == (start, start + 4)
+    assert following.image_spans[1][1] - following.image_spans[1][0] == 1
+    assert following.pixel_values is None
+    # Compaction starts a new chain; previous image occurrences cannot leak in.
+    reset = history.render_token_space(
+        {"messages": [{"role": "user", "content": [image_part("blue")]}]}
+    )
+    assert reset.prefix_length == 0 and len(reset.images) == 1
+    with pytest.raises(TemplateMessageError, match="Literal vision"):
+        history.render_token_space(
+            {"messages": [{"role": "user", "content": "print <|image_pad|>"}]}
+        )
+
+
+def test_token_space_checks_exact_served_prompt_ids(make_agent):
+    worker = make_agent(FakeRPent(turns=1))
+    worker.cfg.rollout.sglang = {"enable_token_space_processor": True}
+    generated = {
+        "output_ids": [9],
+        "prompt_tokens": 2,
+        "prompt_token_ids": [1, 3],
+        "logprobs": [-0.2],
+        "weight_versions": [0],
+    }
+    with pytest.raises(ValueError, match="different prompt IDs"):
+        worker._check_generation(generated, [1, 2])
+    generated["prompt_token_ids"] = [1, 2]
+    worker._check_generation(generated, [1, 2])
+    generated["output_ids"] = [worker.tokenizer.convert_tokens_to_ids("<|image_pad|>")]
+    with pytest.raises(ValueError, match="Generated vision markers"):
+        worker._check_generation(generated, [1, 2])
+    del generated["prompt_token_ids"]
+    with pytest.raises(ValueError, match="different prompt IDs"):
+        worker._check_generation(generated, [1, 2])
+
+
+def test_token_space_rejects_ambiguous_spans_and_changed_training_prefix():
+    from rlinf.hybrid_engines.sglang.multimodal.token_space import collapse_image_spans
+    from rlinf.utils.multimodal import materialize_multimodal_inputs
+
+    assert collapse_image_spans([1, 9, 9, 2, 9, 3], [(1, 3), (4, 5)], 9) == [
+        1,
+        9,
+        2,
+        9,
+        3,
+    ]
+    for spans in ([(1, 2)], [(1, 4), (4, 5)], [(4, 5), (1, 3)]):
+        with pytest.raises(ValueError):
+            collapse_image_spans([1, 9, 9, 2, 9, 3], spans, 9)
+    row = {
+        "format": "sglang-token-space-v1",
+        "prompt_token_ids": [1, 2],
+        "image_refs": [],
+    }
+    ids = torch.tensor([[1, 3, 7]])
+    with pytest.raises(ValueError, match="Training tokens"):
+        materialize_multimodal_inputs(
+            [row],
+            "unused",
+            "cpu",
+            input_ids=ids,
+            attention_mask=ids.ne(0),
+            token_space=True,
+        )
+    with pytest.raises(ValueError, match="Legacy media"):
+        materialize_multimodal_inputs(
+            [{"image_grid_thw": torch.tensor([[1, 4, 4]])}],
+            "unused",
+            "cpu",
+            input_ids=ids,
+            attention_mask=ids.ne(0),
+            token_space=True,
+        )
+    with pytest.raises(ValueError, match="requires token-space training"):
+        materialize_multimodal_inputs([row], "unused", "cpu")
+
+
+def test_token_space_text_only_rows_keep_padding_out_of_positions():
+    from rlinf.utils.multimodal import materialize_multimodal_inputs
+
+    ids = torch.tensor([[1, 2, 3, 0], [0, 4, 5, 6]])
+    inputs = materialize_multimodal_inputs(
+        [], "unused", "cpu", input_ids=ids, attention_mask=ids.ne(0), token_space=True
+    )
+    expected = torch.tensor([[0, 1, 2, 0], [0, 0, 1, 2]])
+    assert set(inputs) == {"multimodal_position_ids"}
+    assert torch.equal(inputs["multimodal_position_ids"], expected.expand(3, -1, -1))
+
+
+def test_token_space_config_requires_bridge_and_compatible_parallelism():
+    from rlinf.config import validate_rpent_cfg
+
+    cfg = compose(
+        [
+            "rollout.sglang.enable_token_space_processor=true",
+            "tools.rpent.store_images_on_disk=true",
+            "~rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE",
+        ]
+    )
+    validate_rpent_cfg(cfg)
+    cfg.critic.model.context_parallel_size = 2
+    with pytest.raises(ValueError, match="PP=1 and CP=1"):
+        validate_rpent_cfg(cfg)
+    cfg.critic.model.context_parallel_size = 1
+    cfg.actor.megatron.mbridge = False
+    with pytest.raises(ValueError, match="Megatron-Bridge"):
+        validate_rpent_cfg(cfg)
+
+
+def test_native_token_space_multiturn_replay_and_cache(tmp_path):
+    """Optional CPU integration: real SGLang core and local Qwen processor assets."""
+    model_path = os.environ.get("RLINF_TOKEN_SPACE_TEST_MODEL")
+    if not model_path:
+        pytest.skip(
+            "Set RLINF_TOKEN_SPACE_TEST_MODEL to local Qwen3.5 processor assets"
+        )
+    import io
+
+    from PIL import Image
+    from transformers import AutoConfig
+
+    from rlinf.agents.rpent.history import ImagePrompt
+    from rlinf.hybrid_engines.sglang.multimodal.token_space import SGLangTokenSpace
+    from rlinf.utils.multimodal import materialize_multimodal_inputs
+
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    settings = {
+        "model_path": model_path,
+        "tokenizer_path": model_path,
+        "tokenizer_mode": "auto",
+        "tokenizer_backend": "huggingface",
+        "trust_remote_code": False,
+        "revision": None,
+        "model_config_parser": "auto",
+        "json_model_override_args": "{}",
+        "image_processor_backend": "pil",
+        "disable_fast_image_processor": True,
+        "mm_process_config": {},
+    }
+    processor = SGLangTokenSpace(settings)
+    images = []
+    for mode, size, color in [
+        ("RGB", (64, 96), "red"),
+        ("RGBA", (96, 64), (0, 0, 255, 80)),
+    ]:
+        data = io.BytesIO()
+        Image.new(mode, size, color).save(data, format="PNG")
+        images.append(data.getvalue())
+    marker = [
+        config.vision_start_token_id,
+        config.image_token_id,
+        config.vision_end_token_id,
+    ]
+    first = asyncio.run(
+        processor.prepare(
+            [42, *marker, 43], images[:1], {"prefix_length": 0, "image_spans": [(2, 3)]}
+        )
+    )
+    sampled = first["prompt_token_ids"] + [44, 45]
+    compact = sampled + marker + [46]
+    second = asyncio.run(
+        processor.prepare(
+            compact,
+            images,
+            {
+                "prefix_length": len(sampled),
+                "image_spans": [
+                    *first["image_spans"],
+                    (len(sampled) + 1, len(sampled) + 2),
+                ],
+            },
+        )
+    )
+    assert second["prompt_token_ids"][: len(sampled)] == sampled
+    assert second["image_spans"][0] == first["image_spans"][0]
+    assert len(second["image_spans"]) == 2
+    refs = ImagePrompt(
+        second["prompt_token_ids"], images, second["image_grid_thw"]
+    ).store_images(tmp_path)
+    entry = {**refs, **second}
+    ids = torch.tensor([second["prompt_token_ids"] + [47, 48, 0, 0]])
+    mask = ids.ne(0)
+
+    def materialize(value):
+        return materialize_multimodal_inputs(
+            [value],
+            model_path,
+            "cpu",
+            cache_bytes=8 * 1024 * 1024,
+            input_ids=ids,
+            attention_mask=mask,
+            token_space=True,
+        )
+
+    first_inputs = materialize(entry)
+    again = materialize(entry)
+    for key in first_inputs:
+        assert torch.equal(first_inputs[key], again[key])
+    assert first_inputs["multimodal_position_ids"].shape == (3, 1, ids.shape[1])
+    # Cache reuse cannot hide changed placement, pixels, or files.
+    with pytest.raises(ValueError, match="pixel_values differs"):
+        materialize({**entry, "pixel_values_sha256": "changed"})
+    with pytest.raises(ValueError, match="mrope_positions differs"):
+        materialize({**entry, "mrope_sha256": "changed"})
+    Path(entry["image_refs"][1]["path"]).write_bytes(b"changed")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        materialize(entry)
+    processor.shutdown()

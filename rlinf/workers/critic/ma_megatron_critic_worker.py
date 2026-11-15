@@ -81,6 +81,13 @@ class MAMegatronCritic(MegatronCritic):
                 batch.get("multi_modal_inputs") or [],
                 self.cfg.rollout.model.model_path,
                 self.torch_device_type,
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_space=OmegaConf.select(
+                    self.cfg,
+                    "rollout.sglang.enable_token_space_processor",
+                    default=False,
+                ),
                 cache_bytes=OmegaConf.select(
                     self.cfg, "tools.rpent.training_image_cache_bytes", default=0
                 ),

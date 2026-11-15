@@ -2502,6 +2502,36 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             "tools.rpent.store_images_on_disk requires keep_episodes=all; "
             "training and checkpoint recovery still reference episode images."
         )
+    if OmegaConf.select(
+        cfg, "rollout.sglang.enable_token_space_processor", default=False
+    ):
+        if cfg.rollout.rollout_backend != "sglang" or not rpent.get(
+            "store_images_on_disk", False
+        ):
+            raise ValueError(
+                "Token-space RPent requires SGLang and store_images_on_disk=True"
+            )
+        if cfg.rollout.get("env_vars", {}).get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"):
+            raise ValueError(
+                "Remove SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE when enabling token-space processing"
+            )
+        for role in ("actor", "critic"):
+            worker = cfg[role]
+            if (
+                worker.training_backend != "megatron"
+                or not worker.megatron.get("mbridge", False)
+                or worker.model.model_type != "qwen3_5"
+            ):
+                raise ValueError(
+                    "Token-space training currently requires Qwen3.5 Megatron-Bridge actor/critic"
+                )
+            if (
+                worker.model.pipeline_model_parallel_size != 1
+                or worker.model.get("context_parallel_size", 1) != 1
+            ):
+                raise ValueError(
+                    "Token-space position verification currently requires PP=1 and CP=1"
+                )
     cache_bytes = rpent.get("training_image_cache_bytes", 0)
     if type(cache_bytes) is not int or cache_bytes < 0:
         raise ValueError(

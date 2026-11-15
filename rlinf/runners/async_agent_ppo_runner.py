@@ -20,6 +20,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from rlinf.data.schema.agent_trajectory import (
@@ -137,6 +138,11 @@ class AsyncAgentPPORunner(AgentPPORunner):
         return {
             "dataloader": self.train_dataloader.state_dict(),
             "async_rollout": {
+                "token_space": OmegaConf.select(
+                    self.cfg,
+                    "rollout.sglang.enable_token_space_processor",
+                    default=False,
+                ),
                 "buffer": buffer,
                 "pending": [
                     prompt
@@ -160,6 +166,13 @@ class AsyncAgentPPORunner(AgentPPORunner):
                 "Async resume requires a checkpoint containing buffered rollout state."
             )
         rollout = state["async_rollout"]
+        token_space = OmegaConf.select(
+            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        )
+        if rollout.get("token_space", False) != token_space:
+            raise ValueError(
+                "Checkpoint rollout input contract changed; start with fresh rollout state"
+            )
         if len(rollout["buffer"]) > self.cfg.rollout.rollout_buffer_capacity:
             raise ValueError(
                 "Restored trajectories exceed rollout.rollout_buffer_capacity."

@@ -197,6 +197,8 @@ jobs:
               - *shared
               # Unit tests import these agentic, Megatron actor and runner
               # modules, and load the RPent checkpoint tool and configs.
+              - 'rlinf/hybrid_engines/sglang/multimodal/**'
+              - 'rlinf/hybrid_engines/megatron/qwen_vl_inputs.py'
               - 'rlinf/agents/rpent/**'
               - 'rlinf/agents/tokenization/**'
               - 'rlinf/agents/tool_call/parsers.py'

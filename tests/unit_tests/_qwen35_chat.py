@@ -20,7 +20,16 @@ from pathlib import Path
 from transformers.utils.chat_template_utils import render_jinja_template
 
 TEMPLATE = (Path(__file__).parent / "assets/qwen3_5_chat_template.jinja").read_text()
-SPECIAL = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"]
+SPECIAL = [
+    "<|im_start|>",
+    "<|im_end|>",
+    "<think>",
+    "</think>",
+    "<|image_pad|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|video_pad|>",
+]
 # Special tokens are atomic and "ab" is one canonical token.
 VOCABULARY = [*SPECIAL, "ab"]
 _SPLIT = re.compile("(" + "|".join(map(re.escape, VOCABULARY)) + ")")

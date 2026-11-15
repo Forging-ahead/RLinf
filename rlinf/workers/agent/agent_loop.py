@@ -191,26 +191,55 @@ class AgentLoopWorker(Worker):
         sampling_params: Optional[dict] = None,
         rollout_name: Optional[str] = None,
         image_data: Optional[list[bytes]] = None,
+        return_prompt_token_ids: bool = False,
+        mm_token_expansion_start_len: Optional[int] = None,
     ):
         """Sample one turn; images the prompt stands for ride with the request.
 
         The rollout engine expands the image markers in ``prompt_ids`` from
         ``image_data`` itself, so the tokens stay the ones this turn trains on.
         """
+        request = {
+            "prompt_ids": prompt_ids,
+            "sampling_params": sampling_params,
+        }
+        if image_data:
+            request["image_data"] = image_data
+        if return_prompt_token_ids:
+            request["return_prompt_token_ids"] = True
+        if mm_token_expansion_start_len is not None:
+            request["mm_token_expansion_start_len"] = mm_token_expansion_start_len
+        return await self._request_rollout(request, rollout_name)
+
+    async def prepare_multimodal(
+        self,
+        prompt_ids: list[int],
+        image_data: list,
+        *,
+        prefix_length: int,
+        image_spans: list,
+    ) -> dict:
+        """Resolve image expansion before calculating this turn's output budget."""
+        return await self._request_rollout(
+            {
+                "prompt_ids": prompt_ids,
+                "image_data": image_data,
+                "prepare_multimodal": {
+                    "prefix_length": prefix_length,
+                    "image_spans": image_spans,
+                },
+            }
+        )
+
+    async def _request_rollout(self, request: dict, rollout_name=None) -> dict:
         channel_key = uuid4().hex
+        request["channel_key"] = channel_key
         if rollout_name is None:
             input_channel = self.generate_input_channel
             request_key = self.rollout_request_key
         else:
             input_channel = self.solid_generate_input_channels[rollout_name]
             request_key = DEFAULT_KEY
-        request = {
-            "channel_key": channel_key,
-            "prompt_ids": prompt_ids,
-            "sampling_params": sampling_params,
-        }
-        if image_data:
-            request["image_data"] = image_data
         await input_channel.put(
             request,
             key=request_key,

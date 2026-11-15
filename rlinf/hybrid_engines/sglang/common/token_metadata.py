@@ -41,6 +41,8 @@ def decode_generation_result(result: dict, *, return_logprobs: bool) -> dict:
         "finish_reason": result["meta_info"]["finish_reason"]["type"],
         "prompt_tokens": result["meta_info"]["prompt_tokens"],
     }
+    if "prompt_token_ids" in result:
+        result_dict["prompt_token_ids"] = result["prompt_token_ids"]
     if "forced_token_mask" in result["meta_info"]:
         flags = result["meta_info"]["forced_token_mask"]
         if len(flags) != len(result_dict["output_ids"]) or any(

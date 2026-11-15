@@ -14,6 +14,7 @@
 
 """Materialize immutable image references for learner microbatches."""
 
+import asyncio
 import hashlib
 import io
 import json
@@ -67,8 +68,74 @@ class _ProcessedImageCache:
 _processed_image_cache = _ProcessedImageCache()
 
 
+def _materialize_image_refs(entry, model_path, cache_bytes, processor=None):
+    """Read immutable media and cache the complete, validated image sequence."""
+    grid = entry["image_grid_thw"]
+    token_space = processor is not None
+    from PIL import Image
+
+    contents = []
+    for reference in entry["image_refs"]:
+        content = Path(reference["path"]).read_bytes()
+        if hashlib.sha256(content).hexdigest() != reference["sha256"]:
+            raise ValueError(f"Training image checksum mismatch: {reference['path']}")
+        contents.append(content)
+    if not token_space:
+        processor = _image_processor(model_path)
+    # Cache the complete image sequence: generic processors can depend
+    # on batch composition. Never assume per-image preprocessing commutes.
+    cached = None
+    if cache_bytes:
+        key = (
+            model_path,
+            id(processor),
+            json.dumps(
+                {
+                    key: value
+                    for key, value in entry.items()
+                    if key not in ("image_refs", "image_grid_thw")
+                },
+                sort_keys=True,
+            )
+            if token_space
+            else None,
+            tuple(grid.flatten().tolist()),
+            json.dumps(processor.to_dict(), sort_keys=True)
+            if hasattr(processor, "to_dict")
+            else None,
+            tuple(reference["sha256"] for reference in entry["image_refs"]),
+        )
+        cached = _processed_image_cache.get(key)
+    if cached is None:
+        images = []
+        for content in contents:
+            with Image.open(io.BytesIO(content)) as image:
+                # Preserve alpha/mode for SGLang's own conversion rules.
+                images.append(image.copy() if token_space else image.convert("RGB"))
+        if token_space:
+            cached = asyncio.run(processor.replay(entry, images))
+        else:
+            processed = processor(images=images, return_tensors="pt")
+            cached = (
+                processed["pixel_values"].to(torch.bfloat16),
+                processed["image_grid_thw"],
+            )
+        if cache_bytes:
+            _processed_image_cache.put(key, cached, cache_bytes)
+    if not torch.equal(grid, cached[1]):
+        raise ValueError("Training image grid differs from the recorded rollout grid")
+    return cached[0]
+
+
 def materialize_multimodal_inputs(
-    payloads: list[dict], model_path: str, device, cache_bytes: int = 0
+    payloads: list[dict],
+    model_path: str,
+    device,
+    cache_bytes: int = 0,
+    *,
+    input_ids=None,
+    attention_mask=None,
+    token_space: bool = False,
 ) -> dict:
     """Build one microbatch's pixels in row order from tensors or immutable images.
 
@@ -76,59 +143,71 @@ def materialize_multimodal_inputs(
     changed or differently processed image is rejected before model forward.
     """
     pixels, grids = [], []
+    positions = (
+        torch.zeros((3, *input_ids.shape), dtype=torch.long) if token_space else None
+    )
+    if token_space and not payloads:
+        payloads = [None] * input_ids.shape[0]
+    if token_space and len(payloads) != input_ids.shape[0]:
+        raise ValueError("Token-space media rows must align with the training batch")
     _processed_image_cache.trim(cache_bytes)
-    for entry in payloads:
+    for row, entry in enumerate(payloads):
+        if token_space:
+            row_mask = attention_mask[row].bool().cpu()
+            row_ids = input_ids[row].detach().cpu()[row_mask].tolist()
+            if not entry:
+                positions[:, row, row_mask] = torch.arange(len(row_ids))
+            elif entry.get("format") != "sglang-token-space-v1":
+                raise ValueError(
+                    "Legacy media cannot enter a token-space batch; generate fresh rollouts"
+                )
+        elif entry and entry.get("format") == "sglang-token-space-v1":
+            raise ValueError(
+                "Token-space media requires token-space training to be enabled"
+            )
         if not entry:
             continue
+        if token_space:
+            if (
+                "image_refs" not in entry
+                or row_ids[: len(entry["prompt_token_ids"])]
+                != entry["prompt_token_ids"]
+            ):
+                raise ValueError(
+                    "Training tokens or immutable media references differ from rollout"
+                )
+            from rlinf.hybrid_engines.sglang.multimodal.token_space import (
+                token_space_processor,
+            )
+
+            if entry["processor_settings"]["model_path"] != model_path:
+                raise ValueError("Training and rollout token-space model paths differ")
+            processor = token_space_processor(
+                json.dumps(entry["processor_settings"], sort_keys=True)
+            )
+            if processor.fingerprint != entry["processor_fingerprint"]:
+                raise ValueError(
+                    "Token-space processor changed; generate fresh rollouts"
+                )
+            positions[:, row, row_mask] = processor.positions(entry, row_ids)
         grid = entry["image_grid_thw"]
         if "image_refs" in entry:
-            from PIL import Image
-
-            contents = []
-            for reference in entry["image_refs"]:
-                content = Path(reference["path"]).read_bytes()
-                if hashlib.sha256(content).hexdigest() != reference["sha256"]:
-                    raise ValueError(
-                        f"Training image checksum mismatch: {reference['path']}"
-                    )
-                contents.append(content)
-            processor = _image_processor(model_path)
-            # Cache the complete image sequence: generic processors can depend
-            # on batch composition. Never assume per-image preprocessing commutes.
-            cached = None
-            if cache_bytes:
-                key = (
+            pixels.append(
+                _materialize_image_refs(
+                    entry,
                     model_path,
-                    id(processor),
-                    json.dumps(processor.to_dict(), sort_keys=True)
-                    if hasattr(processor, "to_dict")
-                    else None,
-                    tuple(reference["sha256"] for reference in entry["image_refs"]),
+                    cache_bytes,
+                    processor if token_space else None,
                 )
-                cached = _processed_image_cache.get(key)
-            if cached is None:
-                images = []
-                for content in contents:
-                    with Image.open(io.BytesIO(content)) as image:
-                        images.append(image.convert("RGB"))
-                processed = processor(images=images, return_tensors="pt")
-                cached = (
-                    processed["pixel_values"].to(torch.bfloat16),
-                    processed["image_grid_thw"],
-                )
-                if cache_bytes:
-                    _processed_image_cache.put(key, cached, cache_bytes)
-            if not torch.equal(grid, cached[1]):
-                raise ValueError(
-                    "Training image grid differs from the recorded rollout grid"
-                )
-            pixels.append(cached[0])
+            )
         else:
             pixels.append(entry["pixel_values"])
         grids.append(grid)
+    result = {"multimodal_position_ids": positions.to(device)} if token_space else {}
     if not pixels:
-        return {}
+        return result
     return {
+        **result,
         "pixel_values": torch.cat(pixels).to(device),
         "image_grid_thw": torch.cat(grids).to(device),
     }

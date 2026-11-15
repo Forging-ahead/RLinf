@@ -386,6 +386,28 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         stays a token prefix of the next and consecutive turns can merge into
         one training row. Text-only turns append to the sampled tokens as usual.
         """
+        if OmegaConf.select(
+            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        ):
+            rendered = await asyncio.to_thread(
+                episode.history.render_token_space, request
+            )
+            if not rendered.images:
+                return rendered.input_ids, [], None
+            prepared = await self.prepare_multimodal(
+                rendered.input_ids,
+                rendered.images,
+                prefix_length=rendered.prefix_length,
+                image_spans=rendered.image_spans,
+            )
+            rendered = episode.history.accept_token_space(prepared)
+            directory = (
+                Path(self.cfg.tools.rpent.output_dir)
+                / episode.episode_id
+                / "training_images"
+            )
+            payload = await asyncio.to_thread(rendered.store_images, directory)
+            return rendered.input_ids, rendered.images, {**payload, **prepared}
         if not request_has_images(request):
             prompt_ids = await asyncio.to_thread(episode.history.render, request)
             return prompt_ids, [], None
@@ -431,6 +453,11 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             sampling_params["custom_logit_processor"] = serialized_thinking_processor()
         # A text turn keeps the plain request; only an image turn carries bytes.
         extra = {"image_data": images} if images else {}
+        if OmegaConf.select(
+            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        ):
+            extra["return_prompt_token_ids"] = True
+            extra["mm_token_expansion_start_len"] = len(prompt_ids)
         generated = await self.generate(
             prompt_ids, sampling_params=sampling_params, **extra
         )
@@ -496,6 +523,26 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
 
     def _check_generation(self, generated: dict, prompt_ids: list[int]) -> None:
         """Reject a response that cannot be trained against its behavior policy."""
+        if OmegaConf.select(
+            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        ):
+            if generated.get("prompt_token_ids") != prompt_ids:
+                raise ValueError(
+                    "SGLang consumed different prompt IDs from the recorded trajectory"
+                )
+            vision_ids = {
+                self.tokenizer.convert_tokens_to_ids(marker)
+                for marker in (
+                    "<|image_pad|>",
+                    "<|video_pad|>",
+                    "<|vision_start|>",
+                    "<|vision_end|>",
+                )
+            }
+            if vision_ids.intersection(generated["output_ids"]):
+                raise ValueError(
+                    "Generated vision markers are unsupported in token-space chats"
+                )
         response_ids = generated["output_ids"]
         if not response_ids:
             raise RuntimeError("rollout returned an empty response")

@@ -59,6 +59,33 @@ RPent 安装与部署
 
 精确复现某次运行时，安装前将两个仓库 checkout 到该次记录的 commit。分支名用于获取交付代码，不能代替实验的固定版本记录。
 
+试用 TokenSpace 图像输入
+--------------------------
+
+TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核对推理返回的实际使用的 prompt token ID，从带校验和的文件重建图像，并在训练模型的语言输入处核对 M-RoPE。此模式支持 Qwen3.5 图像输入，使用 PIL 预处理和 Megatron-Bridge，要求 PP=1、CP=1。文字和生成回复中不能包含视觉特殊标记；这条路径不支持视频和音频。
+
+.. warning::
+
+   这条路径仍处于实验阶段。上面的默认 SGLang 0.5.12.post1 环境不能运行它。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
+
+新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同路径访问 ``output_dir``。
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_token_space_processor: true
+   tools:
+     rpent:
+       store_images_on_disk: true
+       keep_episodes: all
+
+缺少 TokenSpace 接口时，rollout 初始化会报错。Server 和 Engine 都必须返回实际使用的 prompt token ID。采样前先预处理一次图像，再按展开后的 prompt 长度计算输出和思考的 token 预算。这一步对吞吐的影响尚未测量。
+
+切换模式时使用全新的 rollout 状态。异步 checkpoint 恢复会拒绝不同模式，训练端也会拒绝 Processor 指纹变化或混合图像格式。Torch 和内核升级后，不能直接假定旧 optimizer 状态仍然兼容。恢复 checkpoint 前须保留其引用的图像文件。
+
+训练验收前，先在部署环境验证多轮图像、历史压缩和打包后的 M-RoPE。再按固定的 96 点方案比较 logprob，要求平均绝对误差不超过 0.03，最大绝对误差不超过 0.10。基础模型 logprob 与经过采样惩罚、top-k、top-p 修改的概率须分开比较。CPU 输入检查不能证明 GPU 数值对齐。
+
 准备模型和标准 LIBERO 资产
 ----------------------------------
 

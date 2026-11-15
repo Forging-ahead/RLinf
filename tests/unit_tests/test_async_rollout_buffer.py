@@ -560,3 +560,23 @@ def test_stale_retry_releases_byte_admission_before_requeue(producer_worker):
     )
     assert state["stale_dropped"] == 2
     assert state["sample_ids"] == [0, 1]
+
+
+@pytest.mark.parametrize("saved,current", [(False, True), (True, False)])
+def test_resume_rejects_changed_multimodal_contract(saved, current):
+    pytest.importorskip("megatron.training")
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    from rlinf.runners.async_agent_ppo_runner import AsyncAgentPPORunner
+
+    runner = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {"rollout": {"sglang": {"enable_token_space_processor": current}}}
+        )
+    )
+    with pytest.raises(ValueError, match="rollout input contract changed"):
+        AsyncAgentPPORunner._load_data_state(
+            runner, {"async_rollout": {"token_space": saved}}
+        )

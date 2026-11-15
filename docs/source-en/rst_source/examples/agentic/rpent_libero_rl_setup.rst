@@ -59,6 +59,33 @@ All Ray nodes need the same RLinf environment, source revision and model files. 
 
 For an exact replay, check out the two commit IDs recorded with that run before installing. A branch name identifies the delivery channel, not an immutable experiment version.
 
+Try Token-Space Image Inputs (Experimental)
+-------------------------------------------
+
+Token-space mode uses SGLang's image preprocessing for rollout and training. It checks the prompt IDs returned by inference, replays images from checksum-protected files, and checks the M-RoPE positions at the training model's language input. This mode supports Qwen3.5 image inputs with PIL preprocessing and Megatron-Bridge. It requires PP=1 and CP=1. Literal vision markers in text and generated responses are unsupported; video and audio are outside this path.
+
+.. warning::
+
+   This path is experimental. The default SGLang 0.5.12.post1 environment above cannot run it. The candidate dependency file, ``requirements/agentic/sglang-token-space.txt``, pins SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``, Torch 2.14.1 and Transformers 5.19.0. Prepare a separate environment with matching CUDA and Megatron-Bridge kernels; GPU serving, weight synchronization and training still need to be validated together in this environment. Keep the existing training environment unchanged.
+
+After validating that environment, enable the following settings in the deployment profile. Remove ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`` from the rollout environment, including inherited shell settings. Keep ``output_dir`` accessible at the same path on rollout, actor and critic nodes.
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_token_space_processor: true
+   tools:
+     rpent:
+       store_images_on_disk: true
+       keep_episodes: all
+
+Rollout initialization fails if the TokenSpace APIs are unavailable. Both Server and Engine must return the prompt token IDs they actually use. An image preprocessing pass runs before sampling to calculate output and thinking budgets from the expanded prompt; its throughput cost has not been measured.
+
+Start with fresh rollout state when switching modes. Async checkpoint recovery rejects a different mode, and the learner rejects changed processor fingerprints or mixed media formats. Do not assume optimizer state is portable across the Torch/kernel upgrade. Retain image files for checkpoint recovery.
+
+To validate the stack for training, first verify multi-turn images, compaction and packed M-RoPE in the deployment environment. Then run the fixed 96-point logprob comparison. The mean absolute error must not exceed 0.03, and the maximum absolute error must not exceed 0.10. Compare base model logprobs separately from probabilities modified by sampling penalties, top-k and top-p. CPU input checks do not establish GPU numerical parity.
+
 Prepare Models And Standard LIBERO Assets
 -----------------------------------------
 

@@ -75,6 +75,8 @@ rollout:
   max_running_requests: 128
   replica_affinity: false
   sglang:
+    # Experimental; see the deployment guide for dependency and media requirements.
+    enable_token_space_processor: false
     context_length: 262144
     mamba_full_memory_ratio: 0.2
     # Presence penalties and thinking limits require the current token history.

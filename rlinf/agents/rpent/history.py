@@ -130,6 +130,10 @@ class ImagePrompt:
     """Processor token grid of the images, kept for the training forward."""
     pixel_values: Any = None
     """Processor pixels, used directly when retaining an in-memory row."""
+    image_spans: list[tuple[int, int]] = field(default_factory=list)
+    """Half-open image spans; new images initially occupy one placeholder."""
+    prefix_length: int = 0
+    """Number of already expanded tokens preserved from the previous turn."""
 
     def store_images(self, directory: Path) -> dict:
         """Store immutable image bytes once per episode for lazy training reads.
@@ -332,6 +336,83 @@ class AppendOnlyHistory:
         prompt_ids = self.tokenizer.join_increment(self._ids, increment.input_ids)
         self._image_prompt = _extend_image_prompt(
             self._image_prompt, increment, prompt_ids
+        )
+        return self._image_prompt
+
+    def render_token_space(self, request: dict) -> ImagePrompt:
+        """Append compact image markers without processing images on the agent."""
+        continues = self._continues(request)
+        messages = template_messages(
+            request["messages"][len(self._messages) + 1 :]
+            if continues
+            else request["messages"]
+        )
+        # The serving API locates media by special tokens. Literal markers must
+        # not acquire image semantics, including in tool schemas or responses.
+        text_parts = []
+        for message in messages:
+            message = dict(message)
+            if isinstance(message["content"], list):
+                message["content"] = [
+                    part for part in message["content"] if part["type"] != "image_url"
+                ]
+            text_parts.append(message)
+        literals = json.dumps([text_parts, request.get("tools")], ensure_ascii=False)
+        if any(
+            marker in literals
+            for marker in (
+                "<|image_pad|>",
+                "<|video_pad|>",
+                "<|vision_start|>",
+                "<|vision_end|>",
+            )
+        ):
+            raise TemplateMessageError(
+                "Literal vision markers are unsupported in token-space chats"
+            )
+        images = message_images(messages)
+        if continues:
+            increment = self.tokenizer.render_incremental(messages)
+            ids = self.tokenizer.join_increment(self._ids, increment)
+            offset = len(ids) - len(increment)
+            prior = self._image_prompt
+            old_images = prior.images if prior is not None else []
+            old_spans = prior.image_spans if prior is not None else []
+            prefix_length = len(self._ids)
+        else:
+            self._begin_chain()
+            ids = render_prompt(self.tokenizer, request)
+            increment, offset = ids, 0
+            old_images, old_spans, prefix_length = [], [], 0
+        image_id = self.tokenizer.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        spans = [
+            (offset + i, offset + i + 1)
+            for i, token in enumerate(increment)
+            if token == image_id
+        ]
+        if len(spans) != len(images):
+            raise TemplateMessageError(
+                "Structured images and compact image markers disagree"
+            )
+        self._image_prompt = ImagePrompt(
+            ids,
+            old_images + images,
+            image_spans=[*old_spans, *spans],
+            prefix_length=prefix_length,
+        )
+        return self._image_prompt
+
+    def accept_token_space(self, prepared: dict) -> ImagePrompt:
+        """Adopt rollout expansion while preserving the sampled history exactly."""
+        prompt = self._image_prompt
+        ids = prepared["prompt_token_ids"]
+        if ids[: prompt.prefix_length] != prompt.input_ids[: prompt.prefix_length]:
+            raise ValueError("Token-space expansion changed the sampled prefix")
+        self._image_prompt = replace(
+            prompt,
+            input_ids=ids,
+            image_spans=[tuple(span) for span in prepared["image_spans"]],
+            image_grid_thw=prepared["image_grid_thw"],
         )
         return self._image_prompt
 

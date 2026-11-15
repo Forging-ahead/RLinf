@@ -15,9 +15,11 @@
 import asyncio
 import copy
 import dataclasses
+import os
 import sys
 from typing import Any, Literal, Optional
 
+import msgspec
 from omegaconf import DictConfig
 from sglang.srt.server_args import ServerArgs
 from transformers import AutoTokenizer
@@ -48,7 +50,14 @@ from rlinf.workers.rollout.utils import (
     print_sglang_outputs,
 )
 
-_SERVER_ARGS_FIELDS = {f.name for f in dataclasses.fields(ServerArgs)}
+_SERVER_ARGS_FIELDS = {
+    f.name
+    for f in (
+        dataclasses.fields(ServerArgs)
+        if dataclasses.is_dataclass(ServerArgs)
+        else msgspec.structs.fields(ServerArgs)
+    )
+}
 
 
 class SGLangWorker(Worker):
@@ -78,6 +87,7 @@ class SGLangWorker(Worker):
         )
         # Set in init_worker(); declared here so RPC methods can check it.
         self._backend = None
+        self._token_space = None
         # Weight version of this instance (advanced training step count).
         self._weight_version: int = 0
         # Pause mode of the current pause, None when not paused. Remembered
@@ -225,6 +235,32 @@ class SGLangWorker(Worker):
                     f"the configured value {value!r} is ignored"
                 )
 
+        if self._cfg_rollout.sglang.get("enable_token_space_processor", False):
+            from rlinf.hybrid_engines.sglang.multimodal.token_space import (
+                require_token_space_support,
+            )
+
+            if os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"):
+                raise ValueError(
+                    "Token-space processing requires removing SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"
+                )
+            require_token_space_support()
+            version_dependent_args.update(
+                enable_token_space_processor=True,
+                disable_fast_image_processor=True,
+                image_processor_backend="pil",
+            )
+
+        graph_limit_name = (
+            "cuda_graph_max_bs"
+            if "cuda_graph_max_bs" in _SERVER_ARGS_FIELDS
+            else "cuda_graph_max_bs_decode"
+        )
+        version_dependent_args[graph_limit_name] = min(
+            self._cfg_rollout.cuda_graph_max_bs,
+            self._cfg_rollout.max_running_requests,
+        )
+
         # Back up pretrained parameters that the actor does not synchronize.
         if enable_weights_cpu_backup:
             load_format = "auto"
@@ -232,10 +268,6 @@ class SGLangWorker(Worker):
         server_args = ServerArgs(
             model_path=self._cfg_rollout.model.model_path,
             disable_cuda_graph=not use_cudagraph,
-            cuda_graph_max_bs=min(
-                self._cfg_rollout.cuda_graph_max_bs,
-                self._cfg_rollout.max_running_requests,
-            ),
             tp_size=self._cfg_rollout.tensor_parallel_size,
             # Expert parallel: pass ep_size explicitly. sglang derives
             # moe_tp = tp // ep // moe_dp itself. ep_size defaults to
@@ -296,7 +328,10 @@ class SGLangWorker(Worker):
             server_args.skip_server_warmup = True
 
         self.log_on_first_rank(f"{server_args=}")
-        return dataclasses.asdict(server_args)
+        if dataclasses.is_dataclass(server_args):
+            return dataclasses.asdict(server_args)
+        server_args.resolve_once()
+        return server_args.resolved_dict()
 
     async def stop(self):
         """Stop the SGLang engine and finalize stats collectors."""
@@ -318,6 +353,8 @@ class SGLangWorker(Worker):
             await asyncio.gather(*self._inflight_generates, return_exceptions=True)
         self._inflight_generates.clear()
 
+        if self._token_space is not None:
+            self._token_space.shutdown()
         self.log_info(f"Stopping SGLang worker {self._rank} ...")
         if self._backend is not None:
             self._backend.shutdown()
@@ -412,9 +449,17 @@ class SGLangWorker(Worker):
                     "nnodes": nnodes,
                     "node_rank": node_rank,
                 }
+        server_args = self._build_server_args()
+        if self._cfg_rollout.sglang.get("enable_token_space_processor", False):
+            from rlinf.hybrid_engines.sglang.multimodal.token_space import (
+                SGLangTokenSpace,
+                processor_settings,
+            )
+
+            self._token_space = SGLangTokenSpace(processor_settings(server_args))
         self._backend = make_backend(
             backend_type,
-            server_args=self._build_server_args(),
+            server_args=server_args,
             rlinf_ctx=RlinfContext(
                 parent_address=self.worker_address,
                 weight_reload=self.weight_reload,
@@ -790,6 +835,9 @@ class SGLangWorker(Worker):
         prompt_ids: list[int],
         sampling_params: Optional[dict] = None,
         image_data: Optional[list] = None,
+        prepare_multimodal: Optional[dict] = None,
+        return_prompt_token_ids: bool = False,
+        mm_token_expansion_start_len: Optional[int] = None,
     ):
         # Backstop for rollout_serverless's entry-rank gate; return instead
         # of raising because nobody awaits this task.
@@ -802,12 +850,28 @@ class SGLangWorker(Worker):
                 final_sampling_params[key] = value
 
         try:
+            if prepare_multimodal is not None:
+                if self._token_space is None:
+                    raise ValueError("Token-space preprocessing is not enabled")
+                prepared = await self._token_space.prepare(
+                    prompt_ids, image_data, prepare_multimodal
+                )
+                await output_channel.put(
+                    prepared, key=channel_key, async_op=True
+                ).async_wait()
+                return
+            extra = {}
+            if return_prompt_token_ids:
+                extra["return_prompt_token_ids"] = True
+            if mm_token_expansion_start_len is not None:
+                extra["mm_token_expansion_start_len"] = mm_token_expansion_start_len
             version_start = self._weight_version
             result = await self._backend.async_generate(
                 input_ids=prompt_ids,
                 sampling_params=final_sampling_params,
                 image_data=image_data or None,
                 return_logprob=self._return_logprobs,
+                **extra,
             )
             result_dict = decode_generation_result(
                 result, return_logprobs=self._return_logprobs
@@ -855,6 +919,13 @@ class SGLangWorker(Worker):
                     prompt_ids=request["prompt_ids"],
                     sampling_params=request.get("sampling_params"),
                     image_data=request.get("image_data"),
+                    prepare_multimodal=request.get("prepare_multimodal"),
+                    return_prompt_token_ids=request.get(
+                        "return_prompt_token_ids", False
+                    ),
+                    mm_token_expansion_start_len=request.get(
+                        "mm_token_expansion_start_len"
+                    ),
                 )
             )
             self._inflight_generates.add(task)

@@ -794,6 +794,7 @@ class MegatronModelManager:
         keep_left_padding: bool = False,
         trim_right_padding: bool = False,
         scoring_forward: Optional[Callable] = None,
+        multimodal_position_ids: Optional[torch.Tensor] = None,
         **model_forward_kwargs,
     ):
         """Pack model inputs and restore outputs to the caller's padded layout.
@@ -809,6 +810,10 @@ class MegatronModelManager:
         ):
             raise ValueError(
                 "A scoring forward requires packed Actor inputs and logits processor arguments"
+            )
+        if multimodal_position_ids is not None and not pack_seqs:
+            raise ValueError(
+                "Token-space verification requires the packed Bridge forward"
             )
         if pack_seqs:
             # Bridge Qwen-VL embeds images before its own THD/CP packing.
@@ -856,17 +861,29 @@ class MegatronModelManager:
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-            if post_process and scoring_forward is not None:
-                output_orig = scoring_forward(
-                    model,
-                    unwrap_model(model),
-                    **args,
-                    temperature=temperature,
-                    **model_inputs,
+            verification = nullcontext()
+            if multimodal_position_ids is not None:
+                from rlinf.hybrid_engines.megatron.qwen_vl_inputs import (
+                    verify_qwen_vl_positions,
                 )
-            else:
-                output_orig = model(**model_inputs)
-                output_orig /= temperature
+
+                verification = verify_qwen_vl_positions(
+                    unwrap_model(model),
+                    multimodal_position_ids[..., : input_ids_rmpad.shape[1]],
+                    model_attention_mask,
+                )
+            with verification:
+                if post_process and scoring_forward is not None:
+                    output_orig = scoring_forward(
+                        model,
+                        unwrap_model(model),
+                        **args,
+                        temperature=temperature,
+                        **model_inputs,
+                    )
+                else:
+                    output_orig = model(**model_inputs)
+                    output_orig /= temperature
             if post_process and logits_processor is not None:
                 if scoring_forward is not None:
                     output_dict = output_orig

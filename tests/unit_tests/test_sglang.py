@@ -609,3 +609,40 @@ def test_server_request_preserves_images_and_logit_processors(batched):
     assert body["image_data"] == ([[encoded], []] if batched else [encoded])
     assert params == original
     assert images == ([[b"png-image"], []] if batched else [b"png-image"])
+
+
+def test_token_space_http_and_generation_metadata_preserve_prompt_ids():
+    from rlinf.hybrid_engines.sglang.common.token_metadata import (
+        decode_generation_result,
+    )
+    from rlinf.utils.http_client import InferenceHTTPClient
+
+    body = InferenceHTTPClient._generate_body(
+        None,
+        [1, 9, 9, 2],
+        {"max_new_tokens": 2},
+        True,
+        [b"image"],
+        True,
+        4,
+    )
+    assert body["return_prompt_token_ids"] is True
+    assert body["mm_token_expansion_start_len"] == 4
+    assert body["image_data"] == ["aW1hZ2U="]
+    result = decode_generation_result(
+        {
+            "output_ids": [3],
+            "prompt_token_ids": body["input_ids"],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 4,
+                "output_token_logprobs": [(-0.5, 3, None)],
+            },
+        },
+        return_logprobs=True,
+    )
+    assert result["prompt_token_ids"] == [1, 9, 9, 2]
+    assert result["logprobs"] == [-0.5]
+    legacy = InferenceHTTPClient._generate_body(None, [1, 2], {}, False)
+    assert "return_prompt_token_ids" not in legacy
+    assert "mm_token_expansion_start_len" not in legacy
