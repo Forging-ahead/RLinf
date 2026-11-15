@@ -20,12 +20,16 @@ RPent 安装与部署
    git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
    export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
    cd "$STACK_ROOT/repos/RLinf"
+   git -C "$MEGATRON_PATH" apply \
+     "$STACK_ROOT/repos/RLinf/requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch"
    UV_TORCH_BACKEND=cu128 UNINSTALL_FA4=1 bash requirements/install.sh agentic \
      --venv "$STACK_ROOT/envs/rlinf" --python 3.12.12 --torch 2.11.0 \
      --engine sglang --sglang 0.5.12.post1 --transformers 5.6.1 \
      --use-mirror --no-root --install-rlinf
 
 安装器复用已有的 ``MEGATRON_PATH``。它在解析依赖时会临时修改依赖元数据，因此请使用空闲 checkout 和新环境。``--no-root`` 要求原生系统依赖已准备好；``UNINSTALL_FA4=1`` 选择经过验证的 FA2 路径。其他平台参数见 ``bash requirements/install.sh --help``。
+
+这份补丁修复从 checkpoint 恢复 CPU offload 主权重和 Adam 步数的问题。使用前，在固定版本的 Megatron checkout 上应用一次。未设置 ``MEGATRON_PATH`` 时，安装器会为自己创建的 Megatron Core 0.18 checkout 自动应用补丁；设置了 ``MEGATRON_PATH`` 时，需手动应用补丁。补丁覆盖本示例使用的 Torch 格式 checkpoint，其他格式仍需单独验证。
 
 从配套 RPent checkout 安装独立的模拟器／SAM3 环境。它的 requirements 从同级目录安装 RLinf，保证两套环境使用相同的源码版本。启动前核对输出的模块路径：
 

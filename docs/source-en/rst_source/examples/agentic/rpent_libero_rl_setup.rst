@@ -20,12 +20,16 @@ Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL l
    git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
    export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
    cd "$STACK_ROOT/repos/RLinf"
+   git -C "$MEGATRON_PATH" apply \
+     "$STACK_ROOT/repos/RLinf/requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch"
    UV_TORCH_BACKEND=cu128 UNINSTALL_FA4=1 bash requirements/install.sh agentic \
      --venv "$STACK_ROOT/envs/rlinf" --python 3.12.12 --torch 2.11.0 \
      --engine sglang --sglang 0.5.12.post1 --transformers 5.6.1 \
      --use-mirror --no-root --install-rlinf
 
 The installer honors an existing ``MEGATRON_PATH``. It temporarily edits dependency metadata while resolving, so use an idle checkout and a new environment. ``--no-root`` requires native system dependencies to be installed already. ``UNINSTALL_FA4=1`` selects the validated FA2 route. See ``bash requirements/install.sh --help`` for other platforms.
+
+The patch above preserves CPU-offloaded master weights and Adam step counters when restoring a checkpoint. Apply it once to the pinned Megatron checkout before use. The installer applies it automatically to its own Megatron Core 0.18 checkout when ``MEGATRON_PATH`` is unset. If you set ``MEGATRON_PATH``, apply the patch yourself. The patch covers the Torch-format checkpoint path used by this recipe. Other checkpoint formats require separate validation.
 
 Install the separate simulator/SAM3 environment from the paired RPent checkout. Its requirements install RLinf from the sibling checkout, so both environments use the same source revision. Verify the printed module paths before launching:
 
