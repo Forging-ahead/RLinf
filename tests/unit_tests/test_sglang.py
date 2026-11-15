@@ -19,12 +19,33 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from rlinf.scheduler import Channel, Cluster
+
+
+@pytest.mark.parametrize("namespace_package", [False, True])
+def test_bundled_cudart_preserves_library_search_paths(
+    tmp_path, monkeypatch, namespace_package
+):
+    from rlinf.workers.rollout.sglang.process import _pin_bundled_cudart
+
+    # Isolate the installed wheel layout, including namespace-only CUDA wheels.
+    nvidia = ModuleType("nvidia")
+    runtime = ModuleType("nvidia.cuda_runtime")
+    runtime.__path__ = [str(tmp_path)]
+    runtime.__file__ = None if namespace_package else str(tmp_path / "__init__.py")
+    nvidia.cuda_runtime = runtime
+    monkeypatch.setitem(sys.modules, "nvidia", nvidia)
+    monkeypatch.setitem(sys.modules, "nvidia.cuda_runtime", runtime)
+    library = tmp_path / "lib"
+    library.mkdir()
+    monkeypatch.setenv("LD_LIBRARY_PATH", f"/existing:{library}:/another")
+    _pin_bundled_cudart()
+    assert os.environ["LD_LIBRARY_PATH"] == f"{library}:/existing:/another"
 
 
 def test_sglang_scheduler_wrapper_keeps_the_vendor_entrypoint():
