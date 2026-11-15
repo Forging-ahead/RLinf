@@ -2282,7 +2282,7 @@ clone_or_reuse_repo() {
         target_dir="$env_value"
         if [ ! -d "$target_dir" ]; then
             echo "$env_var_name=$target_dir does not exist yet; cloning $git_url into it..." >&2
-            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2
+            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2 || return $?
         else
             echo "Reusing existing checkout at $env_var_name=$target_dir." >&2
             local want_ref="" prev="" arg current_ref
@@ -2300,7 +2300,7 @@ clone_or_reuse_repo() {
     else
         target_dir="$default_dir"
         if [ ! -d "$target_dir" ]; then
-            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2
+            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2 || return $?
         elif [ -d "$target_dir/.git" ]; then
             echo "Checking git repo $target_dir..." >&2
             local git_intact=1
@@ -2310,12 +2310,12 @@ clone_or_reuse_repo() {
             else
                 echo "Git repo $target_dir is corrupted. Re-cloning..." >&2
                 rm -rf "$target_dir"
-                git_clone_with_retry "$@" "$git_url" "$target_dir" >&2
+                git_clone_with_retry "$@" "$git_url" "$target_dir" >&2 || return $?
             fi
         fi
     fi
 
-    printf '%s\n' "$(realpath "$target_dir")"
+    realpath "$target_dir"
 }
 
 #=======================EMBODIED INSTALLERS=======================
