@@ -13,9 +13,10 @@ runner:
 algorithm:
   sampling_params:
     temperature: 1.0
-    top_k: 20
-    top_p: 0.95
-    presence_penalty: 1.5
+    # Keep rollout probabilities on the full model support for PPO/SAO ratios.
+    top_k: -1
+    top_p: 1.0
+    presence_penalty: 0.0
     repetition_penalty: 1.0
     max_new_tokens: 32768
 

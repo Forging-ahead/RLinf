@@ -59,6 +59,8 @@ RPent 安装与部署
 
 精确复现某次运行时，安装前将两个仓库 checkout 到该次记录的 commit。分支名用于获取交付代码，不能代替实验的固定版本记录。
 
+PPO 和 SAO 训练默认使用全词表采样：temperature 为 1、top-k 为 -1、top-p 为 1、presence penalty 为 0、repetition penalty 为 1。评测保留独立 Planner 的采样配置；对比 policy 时，应显式使用相同的采样参数。默认启用 Thinking，且不强制限制思考 token 数（\ ``agentloop.thinking_token_budget: null``\ ）。需要限制时再设置该选项。
+
 试用 TokenSpace 图像输入
 --------------------------
 

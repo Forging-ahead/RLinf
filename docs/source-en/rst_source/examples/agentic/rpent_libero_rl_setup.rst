@@ -59,6 +59,8 @@ All Ray nodes need the same RLinf environment, source revision and model files. 
 
 For an exact replay, check out the two commit IDs recorded with that run before installing. A branch name identifies the delivery channel, not an immutable experiment version.
 
+PPO and SAO training use full-vocabulary sampling by default, with temperature 1, top-k -1, top-p 1, presence penalty 0 and repetition penalty 1. Evaluation retains the standalone planner sampling settings; explicitly use the same sampling settings when comparing policies. Thinking is enabled, with no forced thinking-token limit by default (``agentloop.thinking_token_budget: null``). Set this option explicitly to impose a limit.
+
 Try Token-Space Image Inputs (Experimental)
 -------------------------------------------
 

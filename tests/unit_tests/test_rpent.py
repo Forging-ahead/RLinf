@@ -956,11 +956,17 @@ def test_chunked_scoring_rejects_unsupported_training_modes(overrides, error):
         "train_qwen3.5_4b_libero_rl_sao_3node",
     ],
 )
-def test_example_configs_match_the_standalone_planner(config_name):
-    """The served policy sees what the standalone RPent planner sends its model."""
+def test_example_configs_preserve_planner_and_training_contracts(config_name):
+    """Training ratios use full support; evaluation keeps planner sampling."""
     cfg = compose(config_name=config_name)
     sampling = cfg.algorithm.sampling_params
-    assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 0.95, 20)
+    if config_name.startswith("train_"):
+        assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 1.0, -1)
+        assert sampling.presence_penalty == 0.0
+        assert sampling.repetition_penalty == 1.0
+        assert cfg.agentloop.thinking_token_budget is None
+    else:
+        assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 0.95, 20)
     assert sampling.max_new_tokens == 32768
     assert cfg.agentloop.max_turns == 100
     assert cfg.agentloop.observation_mode == "adaptive"
@@ -1364,7 +1370,7 @@ def test_distributed_recipe_matches_adaptive_student_evaluation():
     assert cfg.tools.rpent.episodes_per_worker == 32
     assert cfg.tools.rpent.max_episode_steps == 10000
     assert cfg.agentloop.episode_timeout_s == 14400
-    assert cfg.algorithm.sampling_params.presence_penalty == 1.5
+    assert cfg.algorithm.sampling_params.presence_penalty == 0.0
     assert cfg.algorithm.sampling_params.repetition_penalty == 1.0
     assert not cfg.runner.synchronous
     assert cfg.rollout.tensor_parallel_size == 1
@@ -1852,9 +1858,6 @@ def test_multimodal_evaluation_uses_the_training_task_and_budget():
     for field in (
         "runner.seq_length",
         "algorithm.sampling_params.temperature",
-        "algorithm.sampling_params.top_p",
-        "algorithm.sampling_params.top_k",
-        "algorithm.sampling_params.presence_penalty",
         "algorithm.sampling_params.repetition_penalty",
         "algorithm.sampling_params.max_new_tokens",
         "agentloop.max_turns",
