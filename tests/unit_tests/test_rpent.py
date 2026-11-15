@@ -965,6 +965,7 @@ def test_example_configs_preserve_planner_and_training_contracts(config_name):
         assert sampling.presence_penalty == 0.0
         assert sampling.repetition_penalty == 1.0
         assert cfg.agentloop.thinking_token_budget is None
+        assert cfg.rollout.sglang.backend_type == "server"
     else:
         assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 0.95, 20)
     assert sampling.max_new_tokens == 32768

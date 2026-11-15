@@ -61,6 +61,8 @@ For an exact replay, check out the two commit IDs recorded with that run before 
 
 PPO and SAO training use full-vocabulary sampling by default, with temperature 1, top-k -1, top-p 1, presence penalty 0 and repetition penalty 1. Evaluation retains the standalone planner sampling settings; explicitly use the same sampling settings when comparing policies. Thinking is enabled, with no forced thinking-token limit by default (``agentloop.thinking_token_budget: null``). Set this option explicitly to impose a limit.
 
+Training uses the SGLang Server backend by default. Set ``rollout.sglang.backend_type=engine`` to use the in-process Engine backend. Both use the same rollout and weight synchronization interfaces. The SAO recipe collects episodes asynchronously with ``runner.synchronous: false``; actor and critic updates remain sequential. Rollout can overlap training when they use separate GPUs. Shared GPUs require rollout to pause and offload before training. This recipe does not use the critic-free ``runner.async_mode`` path.
+
 Try Token-Space Image Inputs (Experimental)
 -------------------------------------------
 
@@ -68,7 +70,7 @@ Token-space mode uses SGLang's image preprocessing for rollout and training. It 
 
 .. warning::
 
-   This path is experimental. The default SGLang 0.5.12.post1 environment above cannot run it. The candidate dependency file, ``requirements/agentic/sglang-token-space.txt``, pins SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``, Torch 2.14.1 and Transformers 5.19.0. Prepare a separate environment with matching CUDA and Megatron-Bridge kernels; GPU serving, weight synchronization and training still need to be validated together in this environment. Keep the existing training environment unchanged.
+   This path is experimental. The default SGLang 0.5.12.post1 environment above cannot run it. The candidate dependency file, ``requirements/agentic/sglang-token-space.txt``, pins SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``, Torch 2.14.1 and Transformers 5.19.0. Source installation requires a Rust toolchain. The pinned dependency profile uses CUDA 13; check driver compatibility before installing it. Prepare a separate environment with matching CUDA and Megatron-Bridge kernels; GPU serving, weight synchronization and training still need to be validated together in this environment. Keep the existing training environment unchanged.
 
 After validating that environment, enable the following settings in the deployment profile. Remove ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`` from the rollout environment, including inherited shell settings. Keep ``output_dir`` accessible at the same path on rollout, actor and critic nodes.
 

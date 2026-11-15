@@ -61,6 +61,8 @@ RPent 安装与部署
 
 PPO 和 SAO 训练默认使用全词表采样：temperature 为 1、top-k 为 -1、top-p 为 1、presence penalty 为 0、repetition penalty 为 1。评测保留独立 Planner 的采样配置；对比 policy 时，应显式使用相同的采样参数。默认启用 Thinking，且不强制限制思考 token 数（\ ``agentloop.thinking_token_budget: null``\ ）。需要限制时再设置该选项。
 
+训练默认使用 SGLang Server 后端。设置 ``rollout.sglang.backend_type=engine`` 可切换到进程内 Engine 后端，两者复用相同的 rollout 和权重同步接口。SAO 配方通过 ``runner.synchronous: false`` 异步采集 episode，actor 和 critic 仍依次更新。rollout 与训练使用独立 GPU 时可以重叠执行；共卡时，rollout 必须先暂停并卸载，再开始训练。本配方不使用无 critic 的 ``runner.async_mode``\ 路径。
+
 试用 TokenSpace 图像输入
 --------------------------
 
@@ -68,7 +70,7 @@ TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核�
 
 .. warning::
 
-   这条路径仍处于实验阶段。上面的默认 SGLang 0.5.12.post1 环境不能运行它。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
+   这条路径仍处于实验阶段。上面的默认 SGLang 0.5.12.post1 环境不能运行它。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。源码安装需要 Rust 工具链。此依赖配置使用 CUDA 13，安装前须核对驱动兼容性。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
 
 新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同路径访问 ``output_dir``。
 

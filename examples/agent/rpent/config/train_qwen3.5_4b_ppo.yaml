@@ -187,6 +187,7 @@ rollout:
 
   rollout_backend: sglang
   sglang:
+    backend_type: server
     # Preserve parameters absent from the language-only actor across offload.
     enable_weights_cpu_backup: true
     attention_backend: triton
