@@ -83,6 +83,17 @@ class AsyncAgentPPORunner(AgentPPORunner):
         self._restored_buffer = []  # finished trajectories that were not consumed at checkpoint time
         self._stale_count = 0
 
+    def init_workers(self) -> None:
+        """Require a completed checkpoint before starting an explicit resume."""
+        resume_dir = self.cfg.runner.resume_dir
+        if resume_dir is not None and resume_dir != "auto":
+            if not self._is_complete_checkpoint(resume_dir):
+                raise ValueError(
+                    f"Incomplete async checkpoint at {resume_dir}. "
+                    "Restore requires Actor and Critic state and data/data.pt."
+                )
+        super().init_workers()
+
     def _next_prompt(self) -> tuple[int, list[int], Any] | None:
         if self._next_sample_id >= self.max_steps * self.cfg.data.rollout_batch_size:
             return None

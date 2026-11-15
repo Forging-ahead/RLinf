@@ -92,7 +92,7 @@ def _read_bddl_language_and_goal(
     return language, goal
 
 
-def _init_libero() -> None:
+def initialize_libero() -> None:
     """Load the selected simulator and configure its asset paths."""
     libero_type = get_libero_type()
 
@@ -148,7 +148,7 @@ class LiberoEnv(gym.Env):
         total_num_processes: int,
         worker_info: WorkerInfo,
     ) -> None:
-        _init_libero()
+        initialize_libero()
         self.seed_offset = seed_offset
         self.cfg = cfg
         self.is_libero_mem = cfg.task_suite_name.lower() == "libero_mem"

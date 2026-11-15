@@ -15,7 +15,7 @@
 import torch
 from megatron.core import parallel_state
 from megatron.training.training import unwrap_model
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
@@ -81,8 +81,8 @@ class MAMegatronCritic(MegatronCritic):
                 batch.get("multi_modal_inputs") or [],
                 self.cfg.rollout.model.model_path,
                 self.torch_device_type,
-                cache_bytes=self.cfg.tools.get("rpent", {}).get(
-                    "training_image_cache_bytes", 0
+                cache_bytes=OmegaConf.select(
+                    self.cfg, "tools.rpent.training_image_cache_bytes", default=0
                 ),
             )
             output = self.custom_forward(

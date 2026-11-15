@@ -80,6 +80,9 @@ class BufferedTrajectory:
     @property
     def oldest_version(self) -> int:
         """Return the oldest weight version that generated an action token."""
+        return self._oldest_version()
+
+    def _oldest_version(self, published_version: int | None = None) -> int:
         versions = self.result.rollout_weight_versions
         if versions is None or len(versions) != self.result.num_sequence:
             raise ValueError(
@@ -89,6 +92,10 @@ class BufferedTrajectory:
             if turn is None or len(turn) != length or not turn or min(turn) < 0:
                 raise ValueError(
                     "Each generated token must have a nonnegative weight version."
+                )
+            if published_version is not None and max(turn) > published_version:
+                raise ValueError(
+                    "A rollout version cannot be newer than the published version."
                 )
         return min(min(turn) for turn in versions)
 
@@ -139,12 +146,8 @@ def construct_rollout_batch(
     stale_count = 0
     while len(entries) < batch_size:
         entry: BufferedTrajectory = input_channel.get()
-        version = entry.oldest_version
+        version = entry._oldest_version(published_version)
         lag = published_version - version
-        if lag < 0:
-            raise ValueError(
-                "A rollout version cannot be newer than the published version."
-            )
         if max_weight_staleness is not None and lag > max_weight_staleness:
             # Release the old admission charge before the same ID can be retried.
             if release_samples is not None:

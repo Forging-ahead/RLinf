@@ -25,7 +25,7 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.training.training import unwrap_model
 from megatron.training.utils import average_losses_across_data_parallel_group
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import (
@@ -153,8 +153,8 @@ class MAMegatronActor(MegatronActor):
             batch.get("multi_modal_inputs") or [],
             self.cfg.rollout.model.model_path,
             self.torch_device_type,
-            cache_bytes=self.cfg.tools.get("rpent", {}).get(
-                "training_image_cache_bytes", 0
+            cache_bytes=OmegaConf.select(
+                self.cfg, "tools.rpent.training_image_cache_bytes", default=0
             ),
         )
 

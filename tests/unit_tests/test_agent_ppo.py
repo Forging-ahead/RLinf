@@ -1806,6 +1806,18 @@ def test_dynamic_balance_without_a_megatron_host_group_uses_nccl(tmp_path):
         torch.distributed.destroy_process_group()
 
 
+@pytest.mark.parametrize("config", [{}, {"tools": {"rpent": None}}])
+def test_text_actor_forward_does_not_require_rpent_config(config):
+    pytest.importorskip("megatron.training")
+    from omegaconf import OmegaConf
+
+    from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
+
+    cfg = OmegaConf.create({"rollout": {"model": {"model_path": "unused"}}, **config})
+    actor = SimpleNamespace(cfg=cfg, torch_device_type="cpu")
+    assert MAMegatronActor._forward_multimodal_inputs(actor, {}) == {}
+
+
 @pytest.mark.parametrize("kind", ["actor", "critic"])
 @pytest.mark.parametrize("mrope", [False, True])
 @pytest.mark.parametrize("tp", [1, 2])

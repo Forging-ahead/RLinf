@@ -77,6 +77,12 @@ def template_messages(messages: list[dict]) -> list[dict]:
     """
     messages = copy.deepcopy(messages)
     for message in messages:
+        # The planner omits empty reasoning when it echoes an assistant reply.
+        if (
+            message.get("role") == "assistant"
+            and message.get("reasoning_content") == ""
+        ):
+            del message["reasoning_content"]
         if message.get("content") is None:
             message["content"] = ""
         if not isinstance(message["content"], str):

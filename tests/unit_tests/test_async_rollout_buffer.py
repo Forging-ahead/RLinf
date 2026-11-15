@@ -180,9 +180,10 @@ def test_consumption_rejects_missing_or_misaligned_behavior_provenance(versions)
     assert incoming.empty() and output.empty() and retry.empty()
 
 
-def test_consumption_rejects_unpublished_weights():
+@pytest.mark.parametrize("versions", [[[2, 2], [2]], [[0, 2], [0]]])
+def test_consumption_rejects_unpublished_weights(versions):
     incoming, output, retry = channel(1), channel(), channel()
-    incoming.put(trajectory(versions=[[2, 2], [2]]))
+    incoming.put(trajectory(versions=versions))
     with pytest.raises(ValueError, match="newer than the published version"):
         consume(incoming, output, retry, published_version=1)
     assert output.empty() and retry.empty()
@@ -501,6 +502,23 @@ def test_async_resume_preserves_producer_sampler_order(
 
     assert [restored._next_prompt() for _ in range(48)] == expected
     assert restored._restored_pending == [prompt]
+
+
+def test_explicit_async_resume_requires_completed_checkpoint(
+    async_data_runner, tmp_path
+):
+    runner = async_data_runner(False)
+    checkpoint = tmp_path / "global_step_1"
+    (checkpoint / "actor").mkdir(parents=True)
+    (checkpoint / "critic").mkdir()
+    runner.cfg.runner.resume_dir = str(checkpoint)
+    runner.critic = object()
+    runner.init_rollout_workers = lambda: pytest.fail(
+        "rollout started from incomplete checkpoint"
+    )
+
+    with pytest.raises(ValueError, match="data/data.pt"):
+        runner.init_workers()
 
 
 def test_critic_discounts_only_generated_tokens():

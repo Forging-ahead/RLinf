@@ -149,6 +149,30 @@ def test_prompts_append_new_messages_to_the_sampled_tokens(qwen35):
         assert following != render_prompt(qwen35, request)
 
 
+def test_history_continues_when_planner_omits_empty_reasoning(qwen35):
+    history = AppendOnlyHistory(qwen35)
+    messages = [{"role": "user", "content": "task"}]
+    request = {"messages": messages, "tools": TOOLS}
+    prompt = history.render(request)
+    response = qwen35.tokenizer(
+        "</think>\n\nstep 0\n<tool_call>\n<function=look>\n<parameter=x>\n1\n"
+        "</parameter>\n</function>\n</tool_call><|im_end|>"
+    )["input_ids"]
+    assistant = tool_reply(0)
+    history.record(request, prompt, response, {**assistant, "reasoning_content": ""})
+    following = history.render(
+        {
+            "messages": [
+                *messages,
+                assistant,
+                {"role": "tool", "tool_call_id": "c", "content": "seen"},
+            ],
+            "tools": TOOLS,
+        }
+    )
+    assert following[: len(prompt) + len(response)] == prompt + response
+
+
 def test_rewritten_histories_are_rendered_in_full(qwen35):
     history = AppendOnlyHistory(qwen35)
     _, messages = sample_turns(history, qwen35.tokenizer)
