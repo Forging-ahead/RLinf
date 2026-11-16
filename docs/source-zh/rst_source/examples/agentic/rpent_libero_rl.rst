@@ -64,7 +64,7 @@ RPent 多模态强化学习
 
 使用 ``Sonorous281/RLinf`` 与 ``Sonorous281/RPent`` 配套的 ``dev/rpent-rlinf-integration`` 分支。先完成 :doc:`rpent_libero_rl_setup`，准备两个 Python 环境、完整模型、SAM3 权重、模拟器资源、任务数据和 Ray 服务。旧 baseline 分支 README 指定的是另一套 RPent 版本，不适用于本部署。
 
-安装页以三台八卡机器为例。启动前按已分配资源调整 placement 与并发；模板不保证最低显存需求。RPent 独立采集器使用另一套模型服务环境，默认基准也为 LIBERO-PRO。
+安装页以三台八卡机器为例。启动前按已分配资源调整 placement 与并发；显存需求须按实际工作负载测量。RPent 独立采集器使用另一套模型服务环境，默认基准也为 LIBERO-PRO。
 
 准备任务数据
 ------------
@@ -139,7 +139,7 @@ RPent 多模态强化学习
    * - CPU 组件回归
      - 覆盖前缀、mask、轨迹合并、Gloo 数据交换、进程清理和配置组合；未安装 Megatron/SGLang 的测试会跳过，不能计为通过。
    * - 真实 GPU 数值
-     - 未验收。默认与 TokenSpace 路径须分别验证固定 96 点（mean ≤ 0.03、max ≤ 0.10）、多轮图像及 M-RoPE。重算或 TIS 不等于消除原生 logprob 误差。
+     - 未验收。默认与 TokenSpace 路径须分别验证固定 96 点（报告 mean/P95/max，0.03/0.10 为诊断参考）、多轮图像及 M-RoPE。重算或 TIS 不等于消除原生 logprob 误差。
    * - Checkpoint 与恢复
      - 未完成本分支真实训练验收。须验证两套优化器、更新后权重同步及新进程恢复；SAO 还须核对 buffered/pending 状态与 policy 版本。
    * - 独立效果评测
@@ -201,72 +201,30 @@ RPent 多模态强化学习
 
 启动器默认仍为原版 ``libero``，必须显式传入 ``libero_rl`` 配置名。PPO → SAO → 三节点 → local 配置依次继承公共设置。
 
-.. list-table::
-   :header-rows: 1
-
-   * - 项目
-     - 模板值
-   * - 模型布局
-     - 节点 0–1：Actor、Critic 与 rollout 分阶段共享 16 卡。Learner 使用 TP2/CP1/DP8、sequence parallel；rollout 为 16 个 TP1 副本。
-   * - 环境布局
-     - 节点 2：八个 worker，每个 32 个 episode 槽位；GPU 0 运行 SAM3。每个 worker 最多同时初始化八个环境，限制冷启动压力。
-   * - 调度
-     - Batch 128，在途 episode 和 buffer 容量均为 256。SAO 按完成顺序取样；共享 GPU 上更新模型时暂停生成，环境动作可继续。
-   * - 训练
-     - 10 个数据 epoch，每五次更新保存。1,280 条任务对应 100 次 learner 更新。Actor LR 1e-6、Critic LR 5e-6；每次 SAO 更新含一个 actor minibatch、两个 critic epoch。
-   * - Episode
-     - 100 turns、10,000 env steps、四小时预算；context 262144，output 32768。
-   * - 采样
-     - 开启 thinking；temperature 1、top-p 0.95、top-k 20、presence penalty 1.5、repetition penalty 1.0。
-   * - 历史
-     - 消息窗口 80→40，达到 context 的 70% 时压缩，不额外生成摘要。
-   * - 推理容量
-     - 每副本显存比例 0.7、最多 128 个请求是准入设置，不代表实测吞吐或显存容量。
-
-SAO 使用 DIS actor loss（clip 边界 0.3/5.0）、``sao_gae``，alpha 为 1.5、SAO critic loss 和采样时记录的 behavior logprob。:doc:`完全异步 Search-R1 <searchr1/async>` 使用独立推理卡，更新调度不同。
+SAO 使用 DIS actor loss（clip 边界 0.3/5.0）、``sao_gae``\ （alpha 为 1.5）、SAO critic loss 和采样时记录的 behavior logprob。:doc:`完全异步 Search-R1 <searchr1/async>` 使用独立推理卡，更新调度不同。
 
 更新耗时较长时，可设置 ``rollout.drain_before_training=true``，先完成在途 episode 再暂停生成。Buffer 容量必须覆盖在途上限；该选项不改变任务超时预算。
 
-可选运行设置
+重算与 TIS、Thinking 预算、TokenSpace、缓存和预取的设置见 :doc:`../../guides/agent-workflows/rpent-multimodal`。SAO 默认 ``recompute_logprobs=false``、``importance_sampling_fix=false``，直接使用采样 logprob，不校正后端差异与 policy 滞后。扩批前需在目标工作负载上验证这一选择。
+
+保留复现记录
 ------------
 
-训练和评测默认设置 ``rollout.sglang.disable_overlap_schedule=true``，供 presence penalty 和可选 Thinking 限制读取当前 CPU token 历史。修改前需在目标 SGLang 版本验证采样 logprob 与强制 token 对齐。
+.. list-table::
+   :header-rows: 1
 
-``agentloop.chat_template_kwargs.enable_thinking=false`` 可关闭 thinking；``agentloop.prompt=simple_brief`` 则用提示词引导每次决策约 256 个推理 token，不强制改变解码。切换前固定模型和任务 seed，从新 episode 对比原生成功率与成本；不能删除已有轨迹中的 thinking token 或 behavior logprob。
-
-若要限制 chat template 已开启的首段 Thinking，设置 ``agentloop.thinking_token_budget=512`` 和 ``rollout.sglang.enable_custom_logit_processor=true``，并保持 ``enable_thinking=true`` 和 ``rollout.sglang.disable_overlap_schedule=true``。启用预算时，配置校验会拒绝重叠调度，避免 CPU token 历史落后于实际解码。预算默认是 ``null``。引擎记录实际强制插入的闭合 Token，该 Token 的训练 mask 为零；自然生成的闭合 Token 仍参与训练。此选项不限制后续重新开启的 Thinking 段。组装轨迹时必须保持返回的 Token ID、behavior logprob、强制标记和权重版本的对应关系。
-
-设置 ``actor.model.lm_head_chunk_size=256``，按块计算参与 loss 的回复 token 的输出层结果；默认 ``0`` 不分块。反向传播时会重新计算这些结果，支持 PP1/CP1 的 MBridge Qwen3.5，包括 TP 和 sequence parallel。使用安装页记录的 Megatron 版本。Entropy 只作为 detached 诊断指标，不支持 entropy loss bonus；该模式也不支持 FP8、MTP、延迟 embedding 梯度、muP 和 autocast。这些约束界定受支持的执行方式，不代表已有吞吐或学习收益。
-
-这些配置默认使用进程内 SGLang 后端。在相同启动命令中添加 ``+rollout.sglang.backend_type=server``，可改用主干的 HTTP server 后端。两个后端都传递图像、Thinking 预算处理器和已安装的权重版本。server 作为本地子进程运行，仅绑定回环地址；Actor 权重仍由 scheduler 直接接收。
-
-工具结果和图片保留在后续输入中。Policy loss 只作用于 policy 生成的 assistant token，user/tool/history token 不参与监督。逐 token 前缀兼容的连续 turn 合并，压缩或历史改写后分段。Actor 和 critic 使用相同的 response 位置映射；共享轨迹 packing 在任意一个计分 token 重叠时都会保留独立行，避免合并覆盖学习目标；这也适用于纯文本 SearchR1。回归测试比较 packing 前后的 loss 和梯度。response-only logits 要求 CP1。
-
-启用 ``tools.rpent.store_images_on_disk=true`` 时，所有 rollout 和 learner 进程必须能读取 **相同绝对路径下的图像** 。``tools.rpent.output_dir`` 需要在模型节点与环境节点间共享，并在轨迹或保存的 checkpoint 仍引用它时保留；不同节点上同名的本地目录不够。没有共享图像存储时保留默认 ``false``，让轨迹携带图像字节，但内存成本更高。不要清理可恢复 checkpoint 所需的 Episode 产物。
-
-为什么需要保留多轮图像的 Token
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-合并 Qwen3.5 图像 turn 时，在每台模型节点启动 Ray **之前** 启用保留 token 的 processor：
-
-.. code-block:: bash
-
-   export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
-
-adaptive 训练和评测模板也通过 ``rollout.env_vars`` 传入此变量，使 worker 启动不只依赖终端环境。
-
-该配置使用 SGLang 的外部 processor 注册入口。图像请求携带已展开的 prompt IDs 和原始图片；适配器核对图片数量及各图 pad 段与处理后 grid 的对应关系，保留原始文本和动作 IDs，再由 SGLang 根据这一序列计算 offset 和 M-RoPE。对已采样 token 解码后重新编码，即使文本相同，也可能改变 token 边界。字符串请求保持上游行为；该图像适配器会拒绝携带视频、音频或预计算图像输入的 token-ID 请求。
-
-使用包含 config、tokenizer 和 processor 文件的本地模型目录运行回归：
-
-.. code-block:: bash
-
-   CUDA_VISIBLE_DEVICES='' SGLANG_USE_CUDA_IPC_TRANSPORT=0 \
-     RLINF_TEST_QWEN_VL_MODEL=/path/to/Qwen3.5-4B \
-     PYTHONPATH=.:tests/unit_tests \
-     python -m pytest tests/unit_tests/test_sglang.py -k qwen_image_processor
-
-这些 CPU 检查覆盖输入 IDs、图像 tensor、offset，以及 HF 与 SGLang 的 M-RoPE 一致性。部署新版本前，还需要验证真实引擎的生成和 logprob、完整 learner 更新及 checkpoint 恢复。
+   * - 记录
+     - 内容
+   * - 代码
+     - RLinf、RPent 的完整 commit SHA；测试未提交代码时另存源码差异。
+   * - 环境
+     - Python、Torch、CUDA、SGLang、Megatron Core/Bridge 与内核版本，模型目录和版本。
+   * - 工作负载
+     - 任务 manifest 及哈希、任务 ID、seed、split 和最终解析的 Hydra 配置。
+   * - 资源
+     - GPU 型号、数量和 placement，显存／主机内存峰值与运行时间。
+   * - 证据
+     - 分别记录 CPU、GPU 输入／logprob、更新、同步、新进程恢复和独立评测结果，保留日志及失败记录。
 
 .. toctree::
    :hidden:
