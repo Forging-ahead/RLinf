@@ -67,9 +67,10 @@ The following examples include math reasoning RL and agentic AI workflows, such 
             style="width: 100%; height: 200px; object-fit: contain; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
        <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
         <a href="rpent.html" style="text-decoration: underline; color: blue;">
-          <b>RPent Planner PPO</b>
+          <b>RPent Planner RL</b>
          </a><br>
-         Train a Qwen3.5 planner that drives Pi0.5 and SAM3 tools on LIBERO-PRO with synchronous PPO
+         <a href="rpent.html">Original Pi0.5 / text Planner PPO</a>;
+         <a href="rpent_libero_rl.html">multimodal Planner PPO / SAO with direct end-effector control</a>
        </p>
      </div>
 
@@ -116,6 +117,6 @@ The following examples include math reasoning RL and agentic AI workflows, such 
    Search-R1 <searchr1/index>
    rStar2 <rstar2>
    RPent <rpent>
-   RPent libero_rl <rpent_libero_rl>
+   RPent Multimodal RL <rpent_libero_rl>
    Math Reasoning <math_reasoning/index>
    Qwen3 VL GRPO <qwen3_vl_geo3k>

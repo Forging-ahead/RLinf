@@ -1,10 +1,10 @@
 RPent 安装与部署
-=====================
+================
 
 本页准备 :doc:`rpent_libero_rl` 所需的配套代码、模型资产和服务。每个部署环境只需完成一次；日常训练和评测使用主示例入口。
 
 安装代码与环境
-------------------------
+--------------
 
 使用 Linux NVIDIA 主机，准备兼容驱动、CUDA 12.8 toolkit、EGL/OpenGL 库、Git 和 ``uv``。将配套的 RLinf、RPent checkout 分别放在 ``$STACK_ROOT/repos/RLinf`` 和 ``$STACK_ROOT/repos/RPent``。各节点使用相同版本和路径，安装前记录两边的 commit。
 
@@ -59,35 +59,8 @@ RPent 安装与部署
 
 精确复现某次运行时，安装前将两个仓库 checkout 到该次记录的 commit。分支名用于获取交付代码，不能代替实验的固定版本记录。
 
-试用 TokenSpace 图像输入
---------------------------
-
-TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核对推理返回的实际使用的 prompt token ID，从带校验和的文件重建图像，并在训练模型的语言输入处核对 M-RoPE。此模式支持 Qwen3.5 图像输入，使用 PIL 预处理和 Megatron-Bridge，要求 PP=1、CP=1。文字和生成回复中不能包含视觉特殊标记；这条路径不支持视频和音频。
-
-.. warning::
-
-   这条路径仍处于实验阶段。上面的默认 SGLang 0.5.12.post1 环境不能运行它。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
-
-新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同路径访问 ``output_dir``。
-
-.. code-block:: yaml
-
-   rollout:
-     sglang:
-       enable_token_space_processor: true
-   tools:
-     rpent:
-       store_images_on_disk: true
-       keep_episodes: all
-
-缺少 TokenSpace 接口时，rollout 初始化会报错。Server 和 Engine 都必须返回实际使用的 prompt token ID。采样前先预处理一次图像，再按展开后的 prompt 长度计算输出和思考的 token 预算。这一步对吞吐的影响尚未测量。
-
-切换模式时使用全新的 rollout 状态。异步 checkpoint 恢复会拒绝不同模式，训练端也会拒绝 Processor 指纹变化或混合图像格式。Torch 和内核升级后，不能直接假定旧 optimizer 状态仍然兼容。恢复 checkpoint 前须保留其引用的图像文件。
-
-训练验收前，先在部署环境验证多轮图像、历史压缩和打包后的 M-RoPE。再按固定的 96 点方案比较 logprob，要求平均绝对误差不超过 0.03，最大绝对误差不超过 0.10。基础模型 logprob 与经过采样惩罚、top-k、top-p 修改的概率须分开比较。CPU 输入检查不能证明 GPU 数值对齐。
-
 准备模型和标准 LIBERO 资产
-----------------------------------
+--------------------------
 
 将完整 Qwen3.5-4B 或兼容的全参 SFT 导出放到 ``$STACK_ROOT/models/``。其中必须包括视觉权重、tokenizer、processor 和 chat template；纯语言抽取模型不能处理 adaptive 带图回合。例如在联网机器下载基础模型：
 
@@ -140,18 +113,25 @@ LIBERO 的部分 XML/mesh 路径直接相对安装包构造，独立于 config.y
 这里按同一组 40 个任务的初始状态划分，不是未见过的任务族；称为独立 holdout 前还需检查与 SFT 训练清单是否重叠。生成 1,280 行及记录 task/初始状态数量、seeds、哈希的 manifest。seed 0 保留评测。生成器拒绝越过各任务初始状态范围的 seed，避免取模后重复同一初始状态。可使用 ``--seeds 33-39 --split dev`` 或 ``--seeds 40-49 --split test``，为各 split 指定独立输出目录。原来的 memory 清单生成器仍为默认 ``--workflow libero``，仍要求 ``--memory-dir``。
 
 启动三节点 Ray 和 SAM3
---------------------------------
+----------------------
 
 **每个节点** 启动 Ray 前都先 source RLinf 环境，导出 ``MEGATRON_PATH``、``NVTE_FLASH_ATTN=1``、``NVTE_FUSED_ATTN=0``、``TORCH_COMPILE_DISABLE=1``，并设置足够的 ``RLINF_TIMEOUT``，例如 ``10800``。按实际网络选择网卡，``RLINF_COMM_NET_DEVICES=eth0`` 仅为示例。Ray worker 在启动时继承这些环境变量。
 
 .. code-block:: bash
 
+   export STACK_ROOT="$HOME/rpent-stack"  # same path used during installation
+   export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
    source "$STACK_ROOT/envs/rlinf/bin/activate"
    export PYTHONPATH="$STACK_ROOT/repos/RPent:$STACK_ROOT/repos/RLinf:$MEGATRON_PATH${PYTHONPATH:+:$PYTHONPATH}"
    export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
    export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 TORCH_COMPILE_DISABLE=1
    export RLINF_TIMEOUT=10800
    export HEAD_IP=10.0.0.10  # 各节点可达的 head 地址
+
+然后在模型节点 0 启动 head：
+
+.. code-block:: bash
+
    export RLINF_NODE_RANK=0
    ray start --head --port 6387 --node-ip-address="$HEAD_IP" --num-gpus 8
 
@@ -175,4 +155,34 @@ LIBERO 的部分 XML/mesh 路径直接相对安装包构造，独立于 config.y
    python -m rpent.robots.components.sam3_server --cuda-device 0 --port 8101
 
 Agent worker 和 episode 子进程都位于节点 2，因此 ``http://127.0.0.1:8101`` 连接本地 SAM3。Policy 的本地 HTTP endpoint 通过 RLinf channel 将模型请求发往两台模型节点，无须跨节点暴露 SAM3。
+
+
+资源与服务就绪后，返回 :doc:`rpent_libero_rl` 启动训练或评测。
+
+试用 TokenSpace 图像输入
+------------------------
+
+TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核对推理服务实际使用并返回的 prompt token ID，从带校验和的文件重建图像，并在训练模型的语言输入处核对 M-RoPE。此模式支持 Qwen3.5 图像输入，使用 PIL 预处理和 Megatron-Bridge，要求 PP=1、CP=1。文字和生成回复中不能包含视觉特殊标记；这条路径不支持视频和音频。
+
+.. warning::
+
+   这条路径仍处于实验阶段。上面的默认 SGLang 0.5.12.post1 环境不能运行它。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
+
+新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同路径访问 ``output_dir``。
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_token_space_processor: true
+   tools:
+     rpent:
+       store_images_on_disk: true
+       keep_episodes: all
+
+缺少 TokenSpace 接口时，rollout 初始化会报错。Server 和 Engine 都必须返回实际使用的 prompt token ID。采样前先预处理一次图像，再按展开后的 prompt 长度计算输出和思考的 token 预算。这一步对吞吐的影响尚未测量。
+
+切换模式时使用全新的 rollout 状态。异步 checkpoint 恢复会拒绝不同模式，训练端也会拒绝 Processor 指纹变化或混合图像格式。Torch 和内核升级后，不能直接假定旧 optimizer 状态仍然兼容。恢复 checkpoint 前须保留其引用的图像文件。
+
+训练验收前，先在部署环境验证多轮图像、历史压缩和打包后的 M-RoPE。再按固定的 96 点方案比较 logprob，要求平均绝对误差不超过 0.03，最大绝对误差不超过 0.10。基础模型 logprob 与经过采样惩罚、top-k、top-p 修改的概率须分开比较。CPU 输入检查不能证明 GPU 数值对齐。
 

@@ -1,173 +1,82 @@
-RPent Reinforcement Learning
-============================
+RPent Multimodal Reinforcement Learning
+=======================================
 
-This example trains a multimodal Qwen3.5 policy with LIBERO feedback, using RPent to execute each episode and RLinf to optimize the policy.
+Train a Qwen3.5-4B planner on LIBERO with RPent and RLinf. RPent executes six end-effector tools and collects observations; RLinf samples model responses and updates the actor and critic. This workflow trains the planner with images and text, while the vision encoder and projector stay frozen.
 
-Choose The Integration
-----------------------
+Overview
+--------
 
-The launcher defaults to the original ``libero`` workflow. Its ``train_qwen3.5_4b_ppo`` and ``eval_qwen3.5_4b`` configs retain the original Pi0.5, memory and language-only model setup. See the :doc:`original LIBERO example </rst_source/examples/agentic/rpent>` for that workflow.
+.. grid:: 2 4 4 4
+   :gutter: 2
 
-The separate ``libero_rl`` workflow uses a **complete multimodal** Qwen checkpoint, adaptive observation and six tools: ``move_to``, ``set_gripper``, ``view_env``, ``segment``, ``back_project`` and ``finish``. SAM3 supplies segmentation; the motion tools execute directly in LIBERO. Select it explicitly with one of these configs:
+   .. grid-item-card:: Model
 
-.. list-table::
-   :header-rows: 1
+      Full multimodal Qwen3.5-4B checkpoint
 
-   * - Config name, without ``.yaml``
-     - Purpose
-   * - ``train_qwen3.5_4b_libero_rl_ppo``
-     - Synchronous PPO template
-   * - ``train_qwen3.5_4b_libero_rl_sao``
-     - Asynchronous SAO template
-   * - ``train_qwen3.5_4b_libero_rl_sao_local``
-     - Required deployment paths to fill locally
-   * - ``train_qwen3.5_4b_libero_rl_sao_3node``
-     - Shared 16-GPU SAO, plus a separate environment node
-   * - ``eval_qwen3.5_4b_libero_rl``
-     - Multimodal evaluation template
+   .. grid-item-card:: Algorithm
 
-Trajectory Format
------------------
+      Synchronous PPO or asynchronous SAO
 
-Each JSONL row contains ``prompt`` and an ``answer`` encoded as a JSON string with ``suite``, ``task`` and ``seed``. The generator writes the task/initial-state manifest alongside the data. An episode produces ordered model requests, sampled token IDs, behavior logprobs, tool results, images and the native terminal reward (success 1, failure 0).
+   .. grid-item-card:: Tools
 
-RLinf merges turns only while their token prefixes agree. A row records its prompt/response lengths, image inputs, per-token policy versions and response mask. Tool observations and forced closing tokens have mask 0; they receive neither policy loss nor a critic target. Actor and Critic inference results carry the same rollout identity even when two samples have identical text and different images.
+      Direct end-effector control and SAM3 segmentation
 
-Quick Start
------------
+   .. grid-item-card:: Hardware
 
-Complete :doc:`rpent_libero_rl_setup` first. On an existing cluster, activate its RLinf environment and fill the required paths in ``train_qwen3.5_4b_libero_rl_sao_local.yaml``. Check the resource layout below before launching.
+      The deployment example uses two 8-GPU model nodes and one 8-GPU environment node
 
-.. code-block:: bash
-
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_local
-
-For evaluation, fill the model, dataset and environment paths in ``eval_qwen3.5_4b_libero_rl.yaml`` and run:
-
-.. code-block:: bash
-
-   bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl
-
-See the export and resume commands below when evaluating a training checkpoint.
-
-Metrics And Validation Boundaries
----------------------------------
-
-Watch ``rpent/success_rate``, ``rpent/turns``, ``rpent/infra_retry_rate`` and the actor/critic loss and gradient metrics. Report native successes over completed cases and keep infrastructure failures separate. The template permits recovered retries (``agentloop.max_infra_retry_rate=1.0``); exhaustion of the per-episode retry limit still fails. Sync PPO and SAO apply the configured retry policy through the same task hook.
-
-These templates describe supported configurations. The available evidence does not yet establish a learning gain:
+Tasks
+~~~~~
 
 .. list-table::
    :header-rows: 1
 
-   * - Evidence
-     - Coverage and result
-   * - CPU regressions
-     - Trajectory identity, action masks, packet metadata, packing loss/gradients, stale-data admission and tool/context boundaries are covered by component tests.
-   * - Deployment correctness
-     - Real SGLang requests, learner updates and checkpoint recovery still need validation for the deployed revision and hardware. Optional thinking closure and LM Head chunking remain disabled; the historical forced-close numerical probe did not meet its diagnostic tolerance.
-   * - Learning results
-     - No completed independent evaluation demonstrates a learning gain for this branch. Historical training completion curves cannot substitute for matched starting-model/checkpoint evaluation.
+   * - Workflow
+     - Scope
+   * - This page: ``libero_rl``
+     - Standard LIBERO, 40 tasks; seeds 1–32 for training, seed 0 for evaluation. These are initial-state splits of the same tasks.
+   * - :doc:`Original Planner PPO <rpent>`
+     - LIBERO-PRO with Pi0.5, task memory and text observations. Use its own configurations and installation instructions.
 
-Train SAO With 16 GPUs
-----------------------------
-
-Use the four clean-workflow profiles as an inheritance chain: ``train_qwen3.5_4b_libero_rl_ppo`` → ``train_qwen3.5_4b_libero_rl_sao`` → ``train_qwen3.5_4b_libero_rl_sao_3node`` → ``train_qwen3.5_4b_libero_rl_sao_local``. The first inherits the original ``train_qwen3.5_4b_ppo``, which remains available for the original LIBERO integration. Common task, sampling and model settings live in the clean PPO profile; SAO overrides its update rules, the three-node profile overrides placement, and the local profile requires deployment paths.
-
-Fill ``examples/agent/rpent/config/train_qwen3.5_4b_libero_rl_sao_local.yaml``, or pass the required paths as launch overrides below. Unfilled ``???`` values are errors, not fallback paths. Set the full multimodal model directory, training JSONL, RPent interpreter, LIBERO configuration, episode directory and training output directory. The parent profiles require these paths instead of supplying machine-specific defaults. Setting ``rollout.model.model_path`` also sets the actor/critic tokenizer and HF import paths.
+Observation and Action
+~~~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
 
-   * - Resource or parameter
-     - Configuration
-   * - Nodes 0–1, GPUs 0–15
-     - Rollout, critic and actor share all 16 GPUs in successive phases; weights, gradients and optimizer states offload between phases
-   * - Learners
-     - TP2, CP1, DP8; sequence parallel; BF16; activation recomputation; response-only logits
-   * - Rollout
-     - 16 TP1 SGLang replicas; ``replica_affinity=false``; ``max_running_requests=128`` per replica; memory fraction 0.7
-   * - Node 2, GPUs 0–7
-     - Eight agent workers, 32 episode slots each; one SAM3 service on GPU 0
-   * - Completion scheduling
-     - Batch 128; ``max_in_flight_rollouts=null`` and ``rollout_buffer_capacity=null`` each resolve to 256
-   * - Training budget
-     - 10 dataset epochs, no separate step cap; 1,280 input rows yield 100 learner updates; save every five updates
-   * - Optimization
-     - One actor minibatch and two critic update epochs per learner update; microbatch 1; actor LR ``1e-6``, critic LR ``5e-6``; language parameters train, vision encoder/projector remain frozen
-   * - Episode
-     - Simple prompt, adaptive observation, thinking, 100 turns, 10,000 env steps, four-hour budget
-   * - Generation
-     - Context 262144, output 32768; temperature 1, top-p 0.95, top-k 20, presence penalty 1.5, repetition penalty 1.0
-   * - Context management
-     - Native message window 80→40, trigger fraction 0.7; no extra tool clearing or summarization
+   * - Item
+     - Contract
+   * - Observation
+     - Measured state after initialization/actions; ``view_env`` returns camera images.
+   * - Action
+     - ``move_to``, ``set_gripper``, ``view_env``, ``segment``, ``back_project`` and ``finish``.
+   * - Reward
+     - Native environment success: 1 for success, 0 for failure. A planner ``finish`` call alone does not establish success.
+   * - Task prompt
+     - Task language with the selected tool prompt; default ``simple``.
 
-The training and evaluation templates set ``rollout.sglang.disable_overlap_schedule=true``: presence penalties and optional thinking limits need the current CPU token history. Changing this setting requires verifying sampled logprobs and forced-token alignment with the installed SGLang version.
+Installation
+------------
 
-``agentloop.chat_template_kwargs.enable_thinking`` accepts ``true`` or ``false``; this
-recipe defaults to ``true``. Compare native task success and generation cost on the
-same checkpoint and task seeds before changing the mode for training. Start new
-episodes for the comparison; do not remove thinking tokens from an existing
-trajectory or its recorded behavior logprobs.
+Use the paired ``dev/rpent-rlinf-integration`` branches of ``Sonorous281/RLinf`` and ``Sonorous281/RPent``. Complete :doc:`rpent_libero_rl_setup` for the two Python environments, full model and SAM3 weights, simulator assets, task data and Ray services. The baseline branch's README specifies a different RPent revision and must not be used for this deployment.
 
-``agentloop.prompt=simple_brief`` selects RPent's optional concise-reasoning prompt,
-which targets 256 reasoning tokens per decision without forcing decoder tokens.
-It requires an RPent version that provides this prompt variant. Keep thinking
-history and compare native success and measured cost before adopting it.
+The setup page uses three nodes with eight GPUs each. Adjust placement and concurrency to your allocated resources before launch; this template is not a minimum-memory guarantee. The standalone RPent collector uses a different serving environment and defaults to LIBERO-PRO.
 
-Optional Thinking And Projection Limits
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Prepare the Task Data
+---------------------
 
-To cap the first thinking span already opened by the chat template, set ``agentloop.thinking_token_budget=512`` and ``rollout.sglang.enable_custom_logit_processor=true``, keeping ``enable_thinking=true`` and ``rollout.sglang.disable_overlap_schedule=true``. Configuration validation rejects a budget with overlap enabled because its CPU token history can lag decoding. The default budget is ``null``. The engine records which closing token it forces; that token has zero training mask, while a naturally generated closing token remains trainable. A later reopened thinking span is not capped by this option. Keep the returned IDs, behavior logprobs, forced-token flags and weight versions together through trajectory assembly.
+The task generator writes ``train.jsonl`` and a manifest with task IDs, initial-state seeds, counts and hashes. Each input line has a task instruction and a JSON-encoded ``answer``:
 
-For full projection chunking, set ``actor.model.lm_head_chunk_size=256``; the default ``0`` retains the normal projection. The chunked path projects scored response positions in blocks and recomputes them during backward. It supports MBridge Qwen3.5 with PP1/CP1, including TP and sequence parallel. Use the recorded Megatron version; this path replaces that model's postprocess operation temporarily. Entropy is a detached diagnostic only, so an entropy loss bonus is unsupported. FP8, MTP, deferred embedding gradients, muP and autocast are also rejected for this mode. These constraints protect supported execution semantics; they do not establish a throughput gain or learning benefit.
+.. code-block:: json
 
-These recipes use the in-process SGLang backend by default. To use the main
-branch's HTTP server backend, add ``+rollout.sglang.backend_type=server`` to the
-same launcher. Both paths carry images, thinking-budget processors and installed
-weight versions. The server runs as a local child process and binds to loopback;
-actor weights still transfer directly through the scheduler.
+   {"prompt": "open the bottom drawer", "answer": "{\"suite\": \"libero_goal\", \"task\": 0, \"seed\": 1}"}
 
-These SAO recipes use Partial rollout with a Critic and shared training GPUs.
-They retain their completed-episode buffer and checkpointed prompt cursor.
-The fully asynchronous Search-R1 recipe uses separate rollout GPUs and the main
-branch's group buffer; it is not a replacement for this Critic update schedule.
-See :doc:`searchr1/async` for that recipe.
+The suite/task pair selects the simulator task; use the generator to obtain its actual instruction. Rollouts retain sampled token IDs, behavior logprobs, image inputs, policy versions and the native outcome. Only model-generated response tokens contribute to the policy loss. Tool observations and forced closing tokens have zero loss mask.
 
-SAO keeps up to 256 episodes in flight and consumes the next 128 completed trajectories, rather than waiting for a fixed synchronous batch to finish. An episode's slot includes model waits and tool execution; eight workers with 32 slots can start all 256 in-flight episodes. ``max_env_initializations_per_worker=8`` bounds cold starts to 64 processes across the eight workers. A permit is released after the first environment state is saved, not at episode completion, so all 256 environments can remain active after warmup. This limits CPU/import/CUDA-context pressure without reducing rollout capacity. The buffer holds complete trajectories. Additional pending prompts can be queued, but do not increase the in-flight limit. Each episode normally has one outstanding model request, so a per-replica limit of 128 is an admission ceiling, not 128 continuously active requests on every GPU.
+Run It
+------
 
-Shared GPUs still require a phase switch: pause/retract model requests, offload rollout memory, train the critic and actor, synchronize weights, then resume the waiting requests. Environment work may continue during training, but model generation pauses. SAO also changes the learning rules: DIS actor loss, clip bounds 0.3/5.0, ``sao_gae`` with alpha 1.5, and the SAO critic objective. It uses behavior logprobs saved during rollout instead of recomputing old-policy logprobs. The task, model, prompt, sampling and compression settings remain inherited from clean PPO.
-
-Tool results and images remain in subsequent prompts. Only policy-generated assistant tokens receive policy loss; user/tool/history tokens do not. Prefix-compatible turns merge, while context compression/history rewriting starts a new row. The critic and actor use the same response-position mapping. Shared trajectory packing keeps rows separate if even one scored token overlaps: merging would overwrite a learning target. This applies to text-only SearchR1 as well as RPent; packing regressions compare both losses and gradients. Response-only logits require CP1.
-
-When enabling ``tools.rpent.store_images_on_disk=true``, every rollout and learner process must read the **same absolute image paths**. ``tools.rpent.output_dir`` must be shared across model and environment nodes and retained while trajectories or saved checkpoints reference it. A same-named directory on separate local disks is insufficient. Leave the default ``false`` for installations without shared image storage; it retains image bytes in trajectories at a higher memory cost. Do not prune episode artifacts needed by a recoverable checkpoint.
-
-Preserve Image-Turn Token Boundaries
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For merged Qwen3.5 image turns, enable the token-preserving processor on each model node **before starting Ray**:
-
-.. code-block:: bash
-
-   export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
-
-The adaptive train/eval templates also pass this variable through ``rollout.env_vars``, so worker launch does not depend solely on the terminal environment. This uses SGLang's external processor registry. Image requests carry already expanded prompt IDs and raw images. The adapter validates the number of images and each image's pad span against its processed grid, retains the exact text/action IDs, and lets SGLang derive offsets and M-RoPE from that sequence. Decoding and re-encoding sampled tokens can otherwise change their boundaries, even when the decoded text is identical. String requests retain the upstream behavior. Token-ID requests with video, audio or precomputed image inputs are rejected by this image-only adapter.
-
-Run the processor regressions with a local model directory containing its config, tokenizer and processor files:
-
-.. code-block:: bash
-
-   CUDA_VISIBLE_DEVICES='' SGLANG_USE_CUDA_IPC_TRANSPORT=0 \
-     RLINF_TEST_QWEN_VL_MODEL=/path/to/Qwen3.5-4B \
-     PYTHONPATH=.:tests/unit_tests \
-     python -m pytest tests/unit_tests/test_sglang.py -k qwen_image_processor
-
-These CPU checks cover input IDs, image tensors, offsets and HF/SGLang M-RoPE agreement. They do not replace real-engine generation/logprob checks or a complete learner update and checkpoint recovery before deploying a new processor version.
-
-Launch, Inspect And Resume
---------------------------
-
-After filling the local profile, launch it from the head node:
+After setup, launch the SAO example from the head node. The overrides fill the six required paths in the local profile:
 
 .. code-block:: bash
 
@@ -181,11 +90,43 @@ After filling the local profile, launch it from the head node:
      tools.rpent.output_dir="$STACK_ROOT/data/episodes" \
      rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B"
 
-Hydra overrides follow the config name, for example ``rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B-SFT"``. Append ``--cfg job --resolve`` to inspect the resolved configuration without starting training. Use ``runner.resume_dir=/path/to/checkpoints/global_step_N`` to resume a complete SAO checkpoint, retaining both model/optimizer states and its buffered/pending rollout state. Use only a completed checkpoint with actor/critic state and the final ``data/data.pt`` marker. Pending prompts are requeued; this is not a persisted simulator state for halfway-finished episodes. Keep the dataset, algorithm, world size and referenced images compatible. A synchronous PPO checkpoint cannot provide the SAO queue state. Actor/critic checkpoints and logs live under ``runner.output_dir``/the experiment name; episode requests, tool images and results live under ``tools.rpent.output_dir``.
+Hydra overrides follow the config name, for example ``rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B-SFT"``. Append ``--cfg job --resolve`` to inspect the resolved configuration without starting training. Actor/critic checkpoints and logs live under ``runner.output_dir``/the experiment name; episode requests, tool images and results live under ``tools.rpent.output_dir``.
 
 Check finite losses/gradients, nonzero parameter updates, actual replica activity, task success and infrastructure errors. Use Hydra overrides for an isolated short smoke run, rather than maintaining another smoke YAML. A successful short smoke test establishes connectivity and optimizer execution; it does not establish that the longest 262144-token workload fits in memory. Keep failure evidence and diagnose memory limits before changing sharding or budgets.
 
-For independent evaluation, run the evaluation command below on a separate available deployment. This template matches the training task, sampling, episode budgets and history window; only deployment and dataset paths need filling. If training used overrides, apply the corresponding settings to evaluation too. Its default placement expects one eight-GPU model node and a separate environment node; adjust placement to the resources assigned to evaluation. RPent's standalone batch collector is for serving/data collection, and the original ``eval_qwen3.5_4b`` is for the original LIBERO workflow.
+Visualization and Results
+-------------------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Evidence
+     - What to check
+   * - Run outputs
+     - Training logs and actor/critic checkpoints under ``runner.output_dir`` / experiment name; episode requests, images and results under ``tools.rpent.output_dir``.
+   * - Runtime checks
+     - Finite losses/gradients, nonzero parameter updates, successful weight synchronization and checkpoint recovery on the deployed revision.
+   * - Task results
+     - ``rpent/success_rate`` reports rollout outcomes. Report native successes / completed cases and infrastructure failures separately; use matched independent evaluation to measure learning.
+   * - Validation boundary
+     - CPU component tests cover trajectory/mask/packing contracts. Real SGLang/Megatron numerical parity, complete updates and recovery must be validated on the target stack. No independent evaluation establishes a learning gain for this branch.
+
+Also inspect ``rpent/turns`` and ``rpent/infra_retry_rate``. The template sets ``agentloop.max_infra_retry_rate=1.0`` to accept recovered retries; exhausted per-episode retries still fail. Historical forced-closure numerical probes did not meet the diagnostic tolerance and do not establish deployment correctness.
+
+Resume and Evaluate
+-------------------
+
+Resume Training
+~~~~~~~~~~~~~~~
+
+Use ``runner.resume_dir=/path/to/checkpoints/global_step_N`` to resume a complete SAO checkpoint, retaining both model/optimizer states and its buffered/pending rollout state. Use only a completed checkpoint with actor/critic state and the final ``data/data.pt`` marker. Pending prompts are requeued; this is not a persisted simulator state for halfway-finished episodes. Keep the dataset, algorithm, world size and referenced images compatible. A synchronous PPO checkpoint cannot provide the SAO queue state.
+
+Independent Evaluation
+~~~~~~~~~~~~~~~~~~~~~~
+
+Run the commands below on separately allocated resources. The default placement uses one eight-GPU model node and a separate environment node; adjust it for your evaluation deployment.
+
+The template matches the training task, sampling, episode budgets and history window. Apply any training overrides to evaluation too. RPent's standalone batch collector is for serving and data collection; ``eval_qwen3.5_4b`` belongs to the original LIBERO workflow.
 
 The export needs the same full VLM used to initialize training, because it retains the frozen vision weights and processor. Replace ``--vlm`` accordingly when training from SFT. Use a new output directory; an HF export is for inference and cannot replace the optimizer/queue checkpoint for resume.
 
@@ -212,6 +153,95 @@ The export needs the same full VLM used to initialize training, because it retai
 
 Run the same evaluation again for the starting model by changing only the model and output paths. Keep the manifest, task/initial-state IDs, prompt, sampling, turn/action budgets and compaction fixed. Report native success with numerator/denominator, turn-budget exhaustion and infrastructure failures separately. Training completion-queue success is not independent evaluation, and a fixed 40-case panel alone cannot establish a small learning gain.
 
+Choose a Training Configuration
+-------------------------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Config (without ``.yaml``)
+     - Use
+   * - ``train_qwen3.5_4b_libero_rl_ppo``
+     - Synchronous PPO
+   * - ``train_qwen3.5_4b_libero_rl_sao``
+     - SAO with completed-episode scheduling
+   * - ``train_qwen3.5_4b_libero_rl_sao_3node``
+     - SAO placement across three nodes
+   * - ``train_qwen3.5_4b_libero_rl_sao_local``
+     - Three-node SAO with required local paths
+   * - ``eval_qwen3.5_4b_libero_rl``
+     - Independent multimodal evaluation
+
+The launchers default to the original ``libero`` configurations. Always pass the ``libero_rl`` config name explicitly. The PPO → SAO → three-node → local profiles inherit common settings.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Setting
+     - Template value
+   * - Model placement
+     - Nodes 0–1: actor, critic and rollout share 16 GPUs in successive phases. Learners use TP2/CP1/DP8 and sequence parallel; rollout uses 16 TP1 replicas.
+   * - Environment placement
+     - Node 2: eight workers, 32 episode slots each, one SAM3 service on GPU 0. Eight simultaneous initializations per worker limit cold-start load.
+   * - Scheduling
+     - Batch 128; 256 in-flight episodes and buffer capacity. SAO consumes completed episodes. Generation pauses during learner updates on shared GPUs; environment work may continue.
+   * - Training
+     - 10 dataset epochs; save every five updates. With 1,280 rows, 100 learner updates. Actor LR 1e-6; critic LR 5e-6; one actor minibatch and two critic epochs per SAO update.
+   * - Episode
+     - 100 turns, 10,000 environment steps, four-hour budget; context 262144, output 32768.
+   * - Sampling
+     - Thinking enabled; temperature 1, top-p 0.95, top-k 20, presence penalty 1.5, repetition penalty 1.0.
+   * - History
+     - Message window 80→40 at 70% of context; no extra summarization.
+   * - Inference capacity
+     - Memory fraction 0.7 and 128 requests per replica are admission settings, not a measured throughput or memory-fit result.
+
+SAO uses DIS actor loss (clip bounds 0.3/5.0), ``sao_gae`` (alpha 1.5), the SAO critic loss and recorded behavior logprobs. The fully asynchronous :doc:`Search-R1 <searchr1/async>` recipe has separate rollout GPUs and a different update schedule.
+
+For long updates, ``rollout.drain_before_training=true`` finishes active episodes before pausing generation. Its buffer capacity must cover the in-flight limit. This changes admission timing, not task timeouts.
+
+Optional Runtime Settings
+-------------------------
+
+Training and evaluation set ``rollout.sglang.disable_overlap_schedule=true`` so presence penalties and optional thinking limits read the current CPU token history. Validate sampling logprobs and forced-token alignment on the deployed SGLang version before changing it.
+
+Set ``agentloop.chat_template_kwargs.enable_thinking=false`` to disable thinking, or ``agentloop.prompt=simple_brief`` for prompt guidance toward about 256 reasoning tokens per decision. The prompt does not enforce a decoder limit. Compare native success and cost from fresh episodes with fixed models and seeds; do not remove thinking tokens or behavior logprobs from recorded trajectories.
+
+To cap the first thinking span already opened by the chat template, set ``agentloop.thinking_token_budget=512`` and ``rollout.sglang.enable_custom_logit_processor=true``, keeping ``enable_thinking=true`` and ``rollout.sglang.disable_overlap_schedule=true``. Configuration validation rejects a budget with overlap enabled because its CPU token history can lag decoding. The default budget is ``null``. The engine records which closing token it forces; that token has zero training mask, while a naturally generated closing token remains trainable. A later reopened thinking span is not capped by this option. Keep the returned IDs, behavior logprobs, forced-token flags and weight versions together through trajectory assembly.
+
+Set ``actor.model.lm_head_chunk_size=256`` to calculate the output layer in blocks for response tokens that contribute to the loss. The default ``0`` disables chunking. Results are recomputed during the backward pass. It supports MBridge Qwen3.5 with PP1/CP1, including TP and sequence parallel. Use the Megatron version listed on the setup page. Entropy is a detached diagnostic only, so an entropy loss bonus is unsupported. FP8, MTP, deferred embedding gradients, muP and autocast are also rejected for this mode. These are support constraints, not evidence of higher throughput or learning gains.
+
+These recipes use the in-process SGLang backend by default. To use the main
+branch's HTTP server backend, add ``+rollout.sglang.backend_type=server`` to the
+same launcher. Both paths carry images, thinking-budget processors and installed
+weight versions. The server runs as a local child process and binds to loopback;
+actor weights still transfer directly through the scheduler.
+
+Tool results and images remain in subsequent prompts. Only policy-generated assistant tokens receive policy loss; user/tool/history tokens do not. Prefix-compatible turns merge, while context compression/history rewriting starts a new row. The critic and actor use the same response-position mapping. Shared trajectory packing keeps rows separate if even one scored token overlaps: merging would overwrite a learning target. This applies to text-only SearchR1 as well as RPent; packing regressions compare both losses and gradients. Response-only logits require CP1.
+
+When enabling ``tools.rpent.store_images_on_disk=true``, every rollout and learner process must read the **same absolute image paths**. ``tools.rpent.output_dir`` must be shared across model and environment nodes and retained while trajectories or saved checkpoints reference it. A same-named directory on separate local disks is insufficient. Leave the default ``false`` for installations without shared image storage; it retains image bytes in trajectories at a higher memory cost. Do not prune episode artifacts needed by a recoverable checkpoint.
+
+Preserve Image-Turn Token Boundaries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For merged Qwen3.5 image turns, enable the token-preserving processor on each model node **before starting Ray**:
+
+.. code-block:: bash
+
+   export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
+
+The adaptive train/eval templates also pass this variable through ``rollout.env_vars``, so worker launch does not depend solely on the terminal environment. This uses SGLang's external processor registry. Image requests carry already expanded prompt IDs and raw images. The adapter validates the number of images and each image's pad span against its processed grid, retains the exact text/action IDs, and lets SGLang derive offsets and M-RoPE from that sequence. Decoding and re-encoding sampled tokens can otherwise change their boundaries, even when the decoded text is identical. String requests retain the upstream behavior. Token-ID requests with video, audio or precomputed image inputs are rejected by this image-only adapter.
+
+Run the processor regressions with a local model directory containing its config, tokenizer and processor files:
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES='' SGLANG_USE_CUDA_IPC_TRANSPORT=0 \
+     RLINF_TEST_QWEN_VL_MODEL=/path/to/Qwen3.5-4B \
+     PYTHONPATH=.:tests/unit_tests \
+     python -m pytest tests/unit_tests/test_sglang.py -k qwen_image_processor
+
+These CPU checks cover input IDs, image tensors, offsets and HF/SGLang M-RoPE agreement. They do not replace real-engine generation/logprob checks or a complete learner update and checkpoint recovery before deploying a new processor version.
 
 .. toctree::
    :hidden:

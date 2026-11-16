@@ -66,9 +66,10 @@ RLinf的worker抽象、灵活的通信组件、以及对不同类型加速器的
             style="width: 100%; height: 200px; object-fit: contain; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
        <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
         <a href="rpent.html" style="text-decoration: underline; color: blue;">
-          <b>RPent Planner PPO</b>
+          <b>RPent Planner RL</b>
          </a><br>
-         用同步 PPO 训练 Qwen3.5 planner，在 LIBERO-PRO 上调用 Pi0.5 和 SAM3 工具完成任务
+         <a href="rpent.html">原版 Pi0.5 / 文本 Planner PPO</a>；
+         <a href="rpent_libero_rl.html">多模态 Planner PPO / SAO 与直接末端控制</a>
        </p>
      </div>
 
@@ -115,6 +116,6 @@ RLinf的worker抽象、灵活的通信组件、以及对不同类型加速器的
    Search-R1 <searchr1/index>
    rStar2 <rstar2>
    RPent <rpent>
-   RPent libero_rl <rpent_libero_rl>
+   RPent 多模态强化学习 <rpent_libero_rl>
    数学推理 <math_reasoning/index>
    Qwen3 VL GRPO <qwen3_vl_geo3k>
