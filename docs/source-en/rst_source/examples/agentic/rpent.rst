@@ -102,6 +102,11 @@ Install the Megatron training stack with SGLang following
    bash requirements/install.sh agentic --engine sglang
    source .venv/bin/activate
 
+The installer patches SGLang 0.5.12.post1 to keep Qwen3.5 GDN normalization
+weights in FP32 during loading and weight synchronization. Megatron exports
+these weights with their zero-centered offset added in FP32. Reinstalling
+SGLang directly with pip removes the patch; rerun the installer before training.
+
 Install the same RLinf environment on the simulator machine, which runs the
 agent workers; both machines need the same Python and Ray versions. On that
 machine, also install RPent with its LIBERO-PRO extra in a separate environment,

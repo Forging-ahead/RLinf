@@ -1386,6 +1386,29 @@ def test_qwen35_convertor_inverts_megatron_bridge_layouts():
         Qwen35Convertor(SimpleNamespace(reshard_tp_size=2, model_config=shape))
 
 
+def test_qwen35_convertor_preserves_bf16_gdn_norm_offset():
+    from types import SimpleNamespace
+
+    from rlinf.utils.convertor.utils import Qwen35Convertor
+
+    # All values are exact in BF16, but adding one in BF16 loses their offsets.
+    centered = torch.tensor([1 / 256, -1 / 512, 1 / 1024], dtype=torch.bfloat16)
+    original = centered.clone()
+    converted = Qwen35Convertor(
+        SimpleNamespace(reshard_tp_size=1, model_config=SimpleNamespace()), strict=True
+    ).convert(
+        {"language_model.decoder.layers.0.self_attention.out_norm.weight": centered}
+    )
+    expected = torch.tensor([257 / 256, 511 / 512, 1025 / 1024])
+    torch.testing.assert_close(
+        converted["model.language_model.layers.0.linear_attn.norm.weight"],
+        expected,
+        rtol=0,
+        atol=0,
+    )
+    assert torch.equal(centered, original)
+
+
 def test_qwen35_convertor_accepts_vision_language_keys():
     """A VL bridge names the language model one level down: language_model.*."""
     from types import SimpleNamespace

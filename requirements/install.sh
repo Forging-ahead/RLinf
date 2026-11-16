@@ -1627,6 +1627,31 @@ install_sglang() {
         fi
         install_engine_requirements "$extra_req"
     done
+    if [ "$version" = "0.5.12.post1" ]; then
+        local sglang_dir norm_patch
+        # uv may link installed files to its cache; patch only this environment.
+        sglang_dir=$(python - <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+import os
+import shutil
+import tempfile
+
+package = Path(find_spec("sglang").origin).parent
+target = package / "srt/models/qwen3_5.py"
+if target.is_symlink() or target.stat().st_nlink > 1:
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as private:
+        shutil.copy2(target, private.name)
+    os.replace(private.name, target)
+print(package)
+PY
+        )
+        norm_patch="$SCRIPT_DIR/agentic/sglang-0.5.12.post1-gdn-norm.patch"
+        # Apply relative to the package, even when the venv is inside a checkout.
+        if ! git --git-dir=/dev/null -C "$sglang_dir" apply --reverse --check "$norm_patch" 2>/dev/null; then
+            git --git-dir=/dev/null -C "$sglang_dir" apply "$norm_patch" || return $?
+        fi
+    fi
     echo "[install.sh] Installed sglang ${version}${*:+ with extras: $*} for $(agentic_cuda_line)."
 }
 
