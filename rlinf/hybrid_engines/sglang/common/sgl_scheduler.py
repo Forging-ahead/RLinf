@@ -369,18 +369,27 @@ class Scheduler(_Scheduler):
             versions.extend([self._rlinf_weight_version] * count)
             self._rlinf_generated_tokens += count
 
+    def _active_rollout_requests(self):
+        requests = {req.rid: req for req in self.waiting_queue}
+        # Component schedulers expose running and last batches at request dispatch.
+        for batch in (
+            self.running_batch,
+            self.last_batch,
+            getattr(self, "cur_batch", None),
+        ):
+            if batch is not None:
+                requests.update((req.rid, req) for req in batch.reqs)
+        if self.chunked_req is not None:
+            requests[self.chunked_req.rid] = self.chunked_req
+        return requests
+
     def pause_for_weight_update(self) -> dict[str, Any]:
         """Acknowledge drained GPU work and park requests outside cache ownership."""
         from sglang.srt.managers.io_struct import PauseGenerationReqInput
 
         if self._rlinf_parked is not None:
             return self.get_async_rollout_state()
-        requests = {req.rid: req for req in self.waiting_queue}
-        for batch in (self.running_batch, self.last_batch, self.cur_batch):
-            if batch is not None:
-                requests.update((req.rid, req) for req in batch.reqs)
-        if self.chunked_req is not None:
-            requests[self.chunked_req.rid] = self.chunked_req
+        requests = self._active_rollout_requests()
         self._rlinf_parked = {}
         super().pause_generation(PauseGenerationReqInput(mode="retract"))
         if self.enable_overlap:
@@ -391,17 +400,26 @@ class Scheduler(_Scheduler):
             if not req.finished():
                 self._rlinf_parked[req.rid] = req
         for req in self._rlinf_parked.values():
-            if not req.is_retracted or req.kv_allocated_len:
-                req.reset_for_retract()
-            req.req_pool_idx = None
+            if hasattr(req, "kv"):
+                # SGLang owns request pool rows and releases them during retraction.
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    raise RuntimeError(
+                        f"Retracted request {req.rid} still owns a GPU cache row."
+                    )
+            else:
+                if not req.is_retracted or req.kv_allocated_len:
+                    req.reset_for_retract()
+                req.req_pool_idx = None
             if req.logprob_start_len >= len(req.origin_input_ids):
                 # Output-only logprobs already cover the retained generated prefix.
                 req.logprob_start_len = -1
         self._rlinf_retractions += len(self._rlinf_parked)
         self.waiting_queue.clear()
         self.running_batch.filter_batch(keep_indices=[])
-        self.last_batch = self.cur_batch = self.chunked_req = None
-        self._chunked_req_scheduled_last_iter = False
+        self.last_batch = self.chunked_req = None
+        if hasattr(self, "cur_batch"):
+            self.cur_batch = None
+            self._chunked_req_scheduled_last_iter = False
         self._rlinf_worker.torch_platform.synchronize()
         if not self.flush_cache():
             raise RuntimeError(
@@ -437,7 +455,9 @@ class Scheduler(_Scheduler):
             state["requests"] = {
                 rid: {
                     "output_ids": list(req.output_ids),
-                    "logprobs": list(req.output_token_logprobs_val or []),
+                    "logprobs": list(
+                        getattr(req, "logprob", req).output_token_logprobs_val or []
+                    ),
                     "weight_versions": (req.customized_info or {}).get(
                         "rollout_weight_versions", []
                     ),
@@ -445,12 +465,7 @@ class Scheduler(_Scheduler):
                 for rid, req in parked.items()
             }
         if include_live_requests:
-            requests = {req.rid: req for req in self.waiting_queue}
-            for batch in (self.running_batch, self.last_batch, self.cur_batch):
-                if batch is not None:
-                    requests.update((req.rid, req) for req in batch.reqs)
-            if self.chunked_req is not None:
-                requests[self.chunked_req.rid] = self.chunked_req
+            requests = self._active_rollout_requests()
             queued = {req.rid for req in self.waiting_queue}
             state["live_requests"] = {
                 rid: {
