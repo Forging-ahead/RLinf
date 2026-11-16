@@ -20,7 +20,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -267,20 +267,28 @@ def test_sglang_packet_metadata_stays_aligned_with_cumulative_tokens():
     )
 
 
-def test_token_space_http_and_generation_metadata_preserve_prompt_ids():
+def test_token_space_http_and_generation_metadata_preserve_prompt_ids(monkeypatch):
     from rlinf.hybrid_engines.sglang.common.token_metadata import (
         decode_generation_result,
     )
     from rlinf.utils.http_client import InferenceHTTPClient
 
-    body = InferenceHTTPClient._generate_body(
-        None,
-        [1, 9, 9, 2],
-        {"max_new_tokens": 2},
-        True,
-        [b"image"],
-        True,
-        4,
+    client = InferenceHTTPClient("http://127.0.0.1:1")
+
+    async def capture_request(path, body):
+        assert path == "/generate"
+        return body
+
+    monkeypatch.setattr(client, "_apost", capture_request)
+    body = asyncio.run(
+        client.async_generate(
+            input_ids=[1, 9, 9, 2],
+            sampling_params={"max_new_tokens": 2},
+            return_logprob=True,
+            image_data=[b"image"],
+            return_prompt_token_ids=True,
+            mm_token_expansion_start_len=4,
+        )
     )
     assert body["return_prompt_token_ids"] is True
     assert body["mm_token_expansion_start_len"] == 4
@@ -419,3 +427,24 @@ def test_native_token_space_multiturn_replay_and_cache(tmp_path):
     with pytest.raises(ValueError, match="checksum mismatch"):
         materialize(entry)
     processor.shutdown()
+
+
+@pytest.mark.parametrize("namespace_package", [False, True])
+def test_bundled_cudart_preserves_library_search_paths(
+    tmp_path, monkeypatch, namespace_package
+):
+    from rlinf.workers.rollout.sglang.process import _pin_bundled_cudart
+
+    # Isolate the installed wheel layout, including namespace-only CUDA wheels.
+    nvidia = ModuleType("nvidia")
+    runtime = ModuleType("nvidia.cuda_runtime")
+    runtime.__path__ = [str(tmp_path)]
+    runtime.__file__ = None if namespace_package else str(tmp_path / "__init__.py")
+    nvidia.cuda_runtime = runtime
+    monkeypatch.setitem(sys.modules, "nvidia", nvidia)
+    monkeypatch.setitem(sys.modules, "nvidia.cuda_runtime", runtime)
+    library = tmp_path / "lib"
+    library.mkdir()
+    monkeypatch.setenv("LD_LIBRARY_PATH", f"/existing:{library}:/another")
+    _pin_bundled_cudart()
+    assert os.environ["LD_LIBRARY_PATH"] == f"{library}:/existing:/another"

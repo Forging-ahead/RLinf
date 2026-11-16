@@ -24,6 +24,7 @@ import io
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from rlinf.agents.tokenization import AgenticTokenizer
@@ -147,9 +148,15 @@ class ImagePrompt:
             digest = hashlib.sha256(image).hexdigest()
             path = directory / digest
             if not path.exists():
-                temporary = path.with_suffix(".tmp")
-                temporary.write_bytes(image)
-                temporary.replace(path)
+                # Concurrent writers have identical bytes. Publish only complete files.
+                with NamedTemporaryFile(dir=directory, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    try:
+                        stream.write(image)
+                        stream.flush()
+                        temporary.replace(path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
             references.append({"path": str(path.resolve()), "sha256": digest})
         return {
             "image_refs": references,

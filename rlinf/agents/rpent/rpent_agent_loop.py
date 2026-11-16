@@ -255,20 +255,28 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             )
             if not rendered.images:
                 return rendered.input_ids, [], None
-            prepared = await self.prepare_multimodal(
-                rendered.input_ids,
-                rendered.images,
-                prefix_length=rendered.prefix_length,
-                image_spans=rendered.image_spans,
-            )
-            rendered = episode.history.accept_token_space(prepared)
             directory = (
                 Path(self.cfg.tools.rpent.output_dir)
                 / episode.episode_id
                 / "training_images"
             )
-            payload = await asyncio.to_thread(rendered.store_images, directory)
-            return rendered.input_ids, rendered.images, {**payload, **prepared}
+            shared_cache = self.cfg.rollout.sglang.get(
+                "enable_token_space_preprocess_cache", False
+            )
+            images = rendered.images
+            if shared_cache:
+                payload = await asyncio.to_thread(rendered.store_images, directory)
+                images = [reference["path"] for reference in payload["image_refs"]]
+            prepared = await self.prepare_multimodal(
+                rendered.input_ids,
+                images,
+                prefix_length=rendered.prefix_length,
+                image_spans=rendered.image_spans,
+            )
+            rendered = episode.history.accept_token_space(prepared)
+            if not shared_cache:
+                payload = await asyncio.to_thread(rendered.store_images, directory)
+            return rendered.input_ids, images, {**payload, **prepared}
         if not request_has_images(request):
             prompt_ids = await asyncio.to_thread(episode.history.render, request)
             return prompt_ids, [], None

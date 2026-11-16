@@ -74,7 +74,8 @@ def test_masked_gae_carries_across_observations_and_bootstraps_truncation():
 
 
 @pytest.mark.parametrize("role", ["actor", "critic"])
-@pytest.mark.parametrize("dp_size,microbatches", [(2, 1), (4, 4)])
+@pytest.mark.parametrize("dp_size", [2, 4, 8])
+@pytest.mark.parametrize("microbatches", [1, 2, 4])
 def test_megatron_valid_token_scale_matches_unsplit_gradient(
     monkeypatch, tmp_path, role, dp_size, microbatches
 ):
@@ -130,6 +131,9 @@ def test_megatron_valid_token_scale_matches_unsplit_gradient(
                 },
             }
         )
+        from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+        worker.multimodal_preparer = MultimodalBatchPreparer("/test/model")
         worker.transformer_config = SimpleNamespace(sequence_parallel=False)
         worker.return_loss = True
         worker.loss_agg_func = masked_mean
@@ -140,7 +144,9 @@ def test_megatron_valid_token_scale_matches_unsplit_gradient(
         worker.value_clip = 0.5
         worker.num_microbatches = 1
         worker.response_only_logits = False
-        worker.lm_head_chunk_size = 0
+        if role == "actor":
+            worker.lm_head_chunk_size = 0
+            worker.scoring_forward = None
         input_ids = torch.arange(128).reshape(32, 4) % 7 + 1
         positions = torch.arange(4).expand_as(input_ids).clone()
         mask = (positions > 0) & (positions <= (torch.arange(32) % 3 + 1)[:, None])
@@ -297,10 +303,13 @@ QWEN3_5_SHAPE = {
 
 
 @pytest.mark.parametrize("presence_penalty", [0.0, 1.5])
+@pytest.mark.parametrize("loss_type", ["actor", "dis"])
 def test_tis_corrects_penalized_behavior_without_differentiating_the_weights(
     presence_penalty,
+    loss_type,
 ):
     """Enumerating the vocabulary gives an exact expected policy gradient."""
+    from rlinf.algorithms.registry import get_policy_loss
     from rlinf.algorithms.utils import truncated_importance_weights
 
     temperature, clip = 0.7, 2.0
@@ -316,12 +325,17 @@ def test_tis_corrects_penalized_behavior_without_differentiating_the_weights(
     )
 
     advantages = torch.tensor([[1.0, -0.5, -1.0, 0.25]])
-    loss, _ = compute_ppo_actor_loss(
+    weighted_advantages = advantages * weights
+    if loss_type == "dis":
+        # DIS averages tokens internally; weight the enumerated vocabulary by
+        # its sampling probabilities to compute the expected gradient.
+        weighted_advantages = weighted_advantages * behavior * mask.numel()
+    loss, _ = get_policy_loss(loss_type)(
         logprobs=target,
         old_logprobs=target.detach(),
         clip_ratio_low=0.2,
         clip_ratio_high=0.2,
-        advantages=advantages * weights,
+        advantages=weighted_advantages,
         loss_mask=mask,
         loss_agg_func=lambda values, loss_mask, *args: (
             values * behavior * loss_mask
@@ -358,3 +372,26 @@ def test_rollout_failure_cancels_and_drains_sibling_episodes():
         assert cleaned == ["sibling"] and tasks[0].cancelled()
 
     asyncio.run(asyncio.wait_for(main(), timeout=5))
+
+
+def test_qwen35_convertor_preserves_bf16_gdn_norm_offset():
+    from types import SimpleNamespace
+
+    from rlinf.utils.convertor.utils import Qwen35Convertor
+
+    # All values are exact in BF16, but adding one in BF16 loses their offsets.
+    centered = torch.tensor([1 / 256, -1 / 512, 1 / 1024], dtype=torch.bfloat16)
+    original = centered.clone()
+    converted = Qwen35Convertor(
+        SimpleNamespace(reshard_tp_size=1, model_config=SimpleNamespace()), strict=True
+    ).convert(
+        {"language_model.decoder.layers.0.self_attention.out_norm.weight": centered}
+    )
+    expected = torch.tensor([257 / 256, 511 / 512, 1025 / 1024])
+    torch.testing.assert_close(
+        converted["model.language_model.layers.0.linear_attn.norm.weight"],
+        expected,
+        rtol=0,
+        atol=0,
+    )
+    assert torch.equal(centered, original)

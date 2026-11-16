@@ -125,7 +125,7 @@ NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_ENGINES=("sglang" "vllm" "phyai")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "psi0" "pi0_fast" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "lingbotvlav2" "dreamzero" "fastwam" "cosmos3" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion" "sglang")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-ros" "frankasim" "robotwin" "robodojo" "habitat" "opensora" "wan" "genesis" "geniesim" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "so101" "lekiwi" "piper" "arx5" "yam" "dummy" "polaris" "simple")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-ros" "frankasim" "robotwin" "robodojo" "habitat" "opensora" "wan" "genesis" "geniesim" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "mujoco_warp" "dosw1" "gim_arm" "so101" "lekiwi" "piper" "arx5" "yam" "dummy" "polaris" "simple")
 
 #=======================Utility Functions=======================
 
@@ -1627,6 +1627,31 @@ install_sglang() {
         fi
         install_engine_requirements "$extra_req"
     done
+    if [ "$version" = "0.5.12.post1" ]; then
+        local sglang_dir norm_patch
+        # uv may link installed files to its cache; patch only this environment.
+        sglang_dir=$(python - <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+import os
+import shutil
+import tempfile
+
+package = Path(find_spec("sglang").origin).parent
+target = package / "srt/models/qwen3_5.py"
+if target.is_symlink() or target.stat().st_nlink > 1:
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as private:
+        shutil.copy2(target, private.name)
+    os.replace(private.name, target)
+print(package)
+PY
+        )
+        norm_patch="$SCRIPT_DIR/agentic/sglang-0.5.12.post1-gdn-norm.patch"
+        # Apply relative to the package, even when the venv is inside a checkout.
+        if ! git --git-dir=/dev/null -C "$sglang_dir" apply --reverse --check "$norm_patch" 2>/dev/null; then
+            git --git-dir=/dev/null -C "$sglang_dir" apply "$norm_patch" || return $?
+        fi
+    fi
     echo "[install.sh] Installed sglang ${version}${*:+ with extras: $*} for $(agentic_cuda_line)."
 }
 
@@ -2282,7 +2307,7 @@ clone_or_reuse_repo() {
         target_dir="$env_value"
         if [ ! -d "$target_dir" ]; then
             echo "$env_var_name=$target_dir does not exist yet; cloning $git_url into it..." >&2
-            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2
+            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2 || return $?
         else
             echo "Reusing existing checkout at $env_var_name=$target_dir." >&2
             local want_ref="" prev="" arg current_ref
@@ -2300,7 +2325,7 @@ clone_or_reuse_repo() {
     else
         target_dir="$default_dir"
         if [ ! -d "$target_dir" ]; then
-            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2
+            git_clone_with_retry "$@" "$git_url" "$target_dir" >&2 || return $?
         elif [ -d "$target_dir/.git" ]; then
             echo "Checking git repo $target_dir..." >&2
             local git_intact=1
@@ -2310,12 +2335,12 @@ clone_or_reuse_repo() {
             else
                 echo "Git repo $target_dir is corrupted. Re-cloning..." >&2
                 rm -rf "$target_dir"
-                git_clone_with_retry "$@" "$git_url" "$target_dir" >&2
+                git_clone_with_retry "$@" "$git_url" "$target_dir" >&2 || return $?
             fi
         fi
     fi
 
-    printf '%s\n' "$(realpath "$target_dir")"
+    realpath "$target_dir"
 }
 
 #=======================EMBODIED INSTALLERS=======================
@@ -3507,6 +3532,10 @@ install_env_only() {
         d4rl)
             install_d4rl_env
             ;;
+        mujoco_warp)
+            install_common_embodied_deps
+            install_mujoco_warp_env
+            ;;
         dummy)
             install_dummy_env
             ;;
@@ -3719,6 +3748,12 @@ EOF
 install_maniskill_libero_env() {
     install_libero_env
     install_maniskill_libero_extras
+}
+
+install_mujoco_warp_env() {
+    # Pin the verified CUDA 12-compatible stack so driverless Docker builds do
+    # not resolve warp-lang>=1.17, whose wheels require a CUDA 13 driver.
+    uv pip install "mujoco-warp==3.17.0" "warp-lang==1.16.0"
 }
 
 install_d4rl_env() {
@@ -4529,6 +4564,8 @@ install_mbridge() {
     uv pip uninstall rlinf-megatron-bridge || true
     uv pip install --no-deps "megatron-bridge==0.5.0"
     uv pip install "nvidia-modelopt==0.45.0"
+    # Qwen3.5's GatedDeltaNet uses FLA kernels, not the optional HF model wrappers.
+    uv pip install "fla-core==0.6.0"
 
     local mbridge_ver modelopt_ver
     mbridge_ver=$(uv pip show megatron-bridge 2>/dev/null | awk '/^Version:/{print $2}')
@@ -4637,6 +4674,15 @@ install_agentic() {
     [ "$torch211_stack" -eq 1 ] && megatron_branch="core_r0.18.0"
     local megatron_dir
     megatron_dir=$(clone_or_reuse_repo MEGATRON_PATH "$VENV_DIR/Megatron-LM" https://github.com/NVIDIA/Megatron-LM.git -b "$megatron_branch")
+
+    if [ "$torch211_stack" -eq 1 ] && [ -z "${MEGATRON_PATH:-}" ]; then
+        # Preserve CPU-offloaded master weights and Adam counters on resume.
+        # Explicit MEGATRON_PATH checkouts remain under the caller's control.
+        local resume_patch="$SCRIPT_DIR/agentic/megatron-core-r0.18.0-cpu-offload.patch"
+        if ! git -C "$megatron_dir" apply --reverse --check "$resume_patch" 2>/dev/null; then
+            git -C "$megatron_dir" apply "$resume_patch" || return $?
+        fi
+    fi
 
     echo "export PYTHONPATH=$(realpath "$megatron_dir"):\$PYTHONPATH" >> "$VENV_DIR/bin/activate"
 

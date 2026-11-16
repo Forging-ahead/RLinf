@@ -85,6 +85,8 @@ planner 以文本形式收到工具结果，物体位置由 SAM3 的 ``segment``
    bash requirements/install.sh agentic --engine sglang
    source .venv/bin/activate
 
+安装脚本会修补 SGLang 0.5.12.post1，让 Qwen3.5 的 GDN 归一化权重在加载和同步时保留 FP32 精度。Megatron 导出这些权重时，也在 FP32 中加回零中心偏移。直接用 pip 重装 SGLang 会覆盖补丁，训练前需重新运行安装脚本。
+
 在仿真器所在的机器上同样安装这套 RLinf 环境，agent worker 运行在这台机器上，两台机器的 Python 和 Ray 版本必须一致。这台机器还要按 `RPent 快速开始 <https://rpent.readthedocs.io/en/latest/rst_source/get_started/quickstart.html>`__ 在另一个环境里安装带 LIBERO-PRO 依赖的 RPent：
 
 .. code-block:: bash

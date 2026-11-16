@@ -276,6 +276,40 @@ def activation_to_func(
     return activation_func
 
 
+def validate_sglang_multimodal_cfg(cfg: DictConfig) -> None:
+    """Check native multimodal options supported by the default serving worker."""
+    serving_mode = cfg.get("serving_mode")
+    cache_enabled = cfg.get("enable_token_space_preprocess_cache", False)
+    cache_directory = cfg.get("token_space_preprocess_cache_dir")
+    check_rate = cfg.get("token_space_preprocess_cache_check_rate", 0.0)
+    if cache_enabled:
+        if (
+            serving_mode is not None
+            or not cfg.get("enable_token_space_processor", False)
+            or not cfg.get("token_space_preprocess_cache_trust_url", False)
+            or not cache_directory
+            or not os.path.isabs(cache_directory)
+        ):
+            raise ValueError(
+                "Shared preprocessing cache requires the default SGLang worker, "
+                "enable_token_space_processor=True, "
+                "token_space_preprocess_cache_trust_url=True and an absolute "
+                "token_space_preprocess_cache_dir visible to rollout and learners."
+            )
+    elif cache_directory is not None or check_rate:
+        raise ValueError(
+            "Set enable_token_space_preprocess_cache=True to use "
+            "token_space_preprocess_cache_dir or token_space_preprocess_cache_check_rate."
+        )
+    if check_rate is not None and (
+        type(check_rate) not in (int, float) or not 0 <= check_rate <= 1
+    ):
+        raise ValueError(
+            "token_space_preprocess_cache_check_rate must be between 0 and 1, "
+            f"got {check_rate!r}."
+        )
+
+
 def validate_rollout_cfg(cfg, algorithm_cfg, actor_cfg=None):
     SupportedModel(cfg.model.model_type)  # To validate model_type is supported
 
@@ -301,6 +335,7 @@ def validate_rollout_cfg(cfg, algorithm_cfg, actor_cfg=None):
             f"backend_type=server; the server backend is only implemented for "
             f"the default serving worker (leave serving_mode unset)."
         )
+        validate_sglang_multimodal_cfg(cfg)
         return cfg
 
     def validate_vllm_cfg(cfg):
@@ -2537,6 +2572,24 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
         raise ValueError(
             "tools.rpent.training_image_cache_bytes must be a nonnegative integer."
         )
+    prefetch_batches = rpent.get("training_image_prefetch_batches", 0)
+    prefetch_bytes = rpent.get("training_image_prefetch_bytes", 0)
+    if type(prefetch_batches) is not int or prefetch_batches < 0:
+        raise ValueError(
+            "training_image_prefetch_batches must be a nonnegative integer."
+        )
+    if type(prefetch_bytes) is not int or prefetch_bytes < 0:
+        raise ValueError("training_image_prefetch_bytes must be a nonnegative integer.")
+    if prefetch_batches and (
+        prefetch_bytes == 0
+        or not OmegaConf.select(
+            cfg, "rollout.sglang.enable_token_space_processor", default=False
+        )
+    ):
+        raise ValueError(
+            "Image prefetch requires enable_token_space_processor=True and positive "
+            "training_image_prefetch_bytes per learner rank."
+        )
     agentloop = cfg.agentloop
     thinking_budget = agentloop.get("thinking_token_budget")
     if thinking_budget is not None:
@@ -2677,11 +2730,25 @@ def validate_async_agent_ppo_cfg(cfg: DictConfig, task: str) -> None:
         )
     if cfg.algorithm.get("gae_lambda_alpha", 1.5) < 1:
         raise ValueError(f"{task} async PPO requires gae_lambda_alpha >= 1.")
-    if cfg.algorithm.recompute_logprobs:
+    importance_sampling = cfg.algorithm.get("importance_sampling_fix", False)
+    if importance_sampling != cfg.algorithm.recompute_logprobs:
         raise ValueError(
-            f"{task} async PPO trains from rollout logprobs; set "
-            "algorithm.recompute_logprobs=False."
+            f"{task} async PPO requires recompute_logprobs and "
+            "importance_sampling_fix to be enabled together."
         )
+    if importance_sampling:
+        if not cfg.rollout.get("return_logprobs", False):
+            raise ValueError(f"{task} async TIS requires rollout.return_logprobs=True.")
+        clip = cfg.algorithm.get("importance_sampling_clip")
+        if clip is None or not math.isfinite(clip) or clip <= 0:
+            raise ValueError(
+                f"{task} async TIS requires a finite positive importance_sampling_clip."
+            )
+        if cfg.rollout.get("max_weight_staleness") is None:
+            raise ValueError(
+                f"{task} async TIS requires an explicit rollout.max_weight_staleness "
+                "to bound behavior-policy lag."
+            )
     if cfg.algorithm.get("n_minibatches", 1) != 1:
         raise ValueError(f"{task} async PPO requires algorithm.n_minibatches=1.")
     if cfg.agentloop.get("truncate_response", True):

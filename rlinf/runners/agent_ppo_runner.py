@@ -77,6 +77,24 @@ class AgentPPORunner(AgentRunner):
         if self.cfg.actor.offload_optimizer:
             self.actor.offload_megatron_optimizer().wait()
 
+    def _start_actor_update(
+        self, input_channel: Channel, version: Optional[int] = None
+    ) -> tuple[Handle, Optional[Handle]]:
+        """Freeze actor logprobs before updating, preserving behavior metadata."""
+        inference_handle = None
+        if self.recompute_logprobs:
+            inference_handle = self.actor.run_inference(
+                input_channel=input_channel,
+                output_channel=self.actor_inference_channel,
+                compute_ref_logprobs=False,
+            )
+            inference_handle.wait()
+            input_channel = self.actor_inference_channel
+        return (
+            self.actor.run_training(input_channel=input_channel, version=version),
+            inference_handle,
+        )
+
     def _run_training(
         self, rollout_handle: Handle
     ) -> tuple[Optional[dict], list[dict], dict]:
@@ -131,17 +149,8 @@ class AgentPPORunner(AgentRunner):
         critic_training_metrics = critic_metrics[0][1]
 
         if self.shared_training:
-            actor_input_channel = self.training_channel
-            if self.recompute_logprobs:
-                actor_infer_handle = self.actor.run_inference(
-                    input_channel=self.training_channel,
-                    output_channel=self.actor_inference_channel,
-                    compute_ref_logprobs=False,
-                )
-                actor_infer_handle.wait()
-                actor_input_channel = self.actor_inference_channel
-            actor_handle: Handle = self.actor.run_training(
-                input_channel=actor_input_channel,
+            actor_handle, actor_infer_handle = self._start_actor_update(
+                self.training_channel,
             )
         actor_metrics = actor_handle.wait()
         actor_rollout_metrics = actor_metrics[0][0]
@@ -180,17 +189,9 @@ class AgentPPORunner(AgentRunner):
         )
         critic_training_metrics = critic_handle.wait()[0][1]
 
-        actor_input_channel = self.critic_output_channel
-        actor_infer_handle = None
-        if self.recompute_logprobs:
-            actor_infer_handle = self.actor.run_inference(
-                input_channel=actor_input_channel,
-                output_channel=self.actor_inference_channel,
-                compute_ref_logprobs=False,
-            )
-            actor_infer_handle.wait()
-            actor_input_channel = self.actor_inference_channel
-        actor_handle = self.actor.run_training(input_channel=actor_input_channel)
+        actor_handle, actor_infer_handle = self._start_actor_update(
+            self.critic_output_channel
+        )
         rollout_metrics, training_metrics = actor_handle.wait()[0]
         training_metrics = self._training_metrics(
             training_metrics, critic_training_metrics

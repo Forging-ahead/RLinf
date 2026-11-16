@@ -20,12 +20,16 @@ Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL l
    git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
    export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
    cd "$STACK_ROOT/repos/RLinf"
+   git -C "$MEGATRON_PATH" apply \
+     "$STACK_ROOT/repos/RLinf/requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch"
    UV_TORCH_BACKEND=cu128 UNINSTALL_FA4=1 bash requirements/install.sh agentic \
      --venv "$STACK_ROOT/envs/rlinf" --python 3.12.12 --torch 2.11.0 \
      --engine sglang --sglang 0.5.12.post1 --transformers 5.6.1 \
      --use-mirror --no-root --install-rlinf
 
 The installer honors an existing ``MEGATRON_PATH``. It temporarily edits dependency metadata while resolving, so use an idle checkout and a new environment. ``--no-root`` requires native system dependencies to be installed already. ``UNINSTALL_FA4=1`` selects the validated FA2 route. See ``bash requirements/install.sh --help`` for other platforms.
+
+Apply the patch once before installing. It lets Megatron restore CPU-offloaded master weights and Adam step counters from a Torch checkpoint. If you set ``MEGATRON_PATH``, apply the patch yourself.
 
 Install the separate simulator/SAM3 environment from the paired RPent checkout. Its requirements install RLinf from the sibling checkout, so both environments use the same source revision. Verify the printed module paths before launching:
 
@@ -159,6 +163,31 @@ The agent workers and episode processes all run on node 2, so ``http://127.0.0.1
 
 Return to :doc:`rpent_libero_rl` to launch training or evaluation.
 
+PPO and SAO training use full-vocabulary sampling by default, with temperature 1, top-k -1, top-p 1, presence penalty 0 and repetition penalty 1. Evaluation retains the standalone planner sampling settings; explicitly use the same sampling settings when comparing policies. Thinking is enabled, with no separate limit on thinking tokens (``agentloop.thinking_token_budget: null``). Set this option explicitly to impose a limit.
+
+Training uses the SGLang Server backend by default. Set ``rollout.sglang.backend_type=engine`` to use the in-process Engine backend. Both use the same rollout and weight synchronization interfaces. The SAO recipe collects episodes asynchronously with ``runner.synchronous: false``; actor and critic updates remain sequential. Rollout can overlap training when they use separate GPUs. Shared GPUs require rollout to pause and offload before training. This recipe does not use the critic-free ``runner.async_mode`` path.
+
+Enable Logprob Recalculation and TIS
+---------------------------------------------
+
+To test SAO with training-side logprobs and truncated importance sampling (TIS), add these settings to the SAO config. The default SAO recipe leaves both options disabled.
+
+.. code-block:: yaml
+
+   algorithm:
+     recompute_logprobs: true
+     importance_sampling_fix: true
+     importance_sampling_clip: 2.0
+   rollout:
+     return_logprobs: true
+     max_weight_staleness: 1
+
+Each batch retains its sampling logprobs and per-token policy versions. Before the actor update, the learner recalculates logprobs with the current actor weights. TIS limits how much backend differences and policy lag can affect an update. The DIS loss uses the actor weights used for recalculation as the reference when filtering tokens by probability ratio. With these settings, an episode is discarded if any token was sampled with weights more than one update behind the latest published version. Its task is then retried.
+
+.. warning::
+
+   Enabling these options changes how SAO computes its loss and adds an actor forward pass. Check TIS weight clipping, effective sample size and policy lag during a small run before scaling. Optimizer updates, weight synchronization and checkpoint recovery with these options have not been validated. Logprob recalculation and TIS do not establish numerical agreement between SGLang and Megatron.
+
 Try Token-Space Image Inputs (Experimental)
 -------------------------------------------
 
@@ -190,3 +219,32 @@ Start with fresh rollout state when switching modes. Async checkpoint recovery r
 
 To validate the stack for training, first verify multi-turn images, compaction and packed M-RoPE in the deployment environment. Then run the fixed 96-point logprob comparison. The mean absolute error must not exceed 0.03, and the maximum absolute error must not exceed 0.10. Compare base model logprobs separately from probabilities modified by sampling penalties, top-k and top-p. CPU input checks do not establish GPU numerical parity.
 
+Reduce Repeated Image Preprocessing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Token-space mode can share preprocessed images between rollout, actor and critic. The cache contains processed pixels and grid metadata. Each backend still runs its own frozen vision encoder; visual embeddings are not shared.
+
+Shared preprocessing caches and CPU prefetching are disabled by default. To enable them, add the following to the deployment profile above. Replace ``<cache-dir>`` with the absolute path to a directory reserved for this job. Every process in the job must be able to access the directory at that path.
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_token_space_preprocess_cache: true
+       token_space_preprocess_cache_dir: <cache-dir>
+       token_space_preprocess_cache_trust_url: true
+       token_space_preprocess_cache_check_rate: 0.0
+   tools:
+     rpent:
+       training_image_prefetch_batches: 2
+       training_image_prefetch_bytes: 268435456
+
+Cached image paths must always refer to the same image contents. The cache stores preprocessed outputs in a separate directory for each processor fingerprint. Set the check rate between 0 and 1 to recompute a sample of cache hits and verify their contents. Keep this setting identical across processes.
+
+The prefetch settings limit the number and total bytes of prepared microbatches per learner rank, including the current microbatch. One CPU thread prepares the following batch while the training thread runs the forward pass for the current microbatch. The 256 MiB example excludes processor scratch space and the separate ``training_image_cache_bytes`` cache. Multiply the per-rank budgets by the number of actor and critic ranks, and measure peak host memory before increasing them. A microbatch larger than the budget fails with an error. Prefetching requires token-space trajectories that record the size of the preprocessed pixel data in bytes. Set ``training_image_prefetch_batches: 0`` when replaying older trajectories.
+
+.. warning::
+
+   Only trusted processes may write the cache directory: cache reads deserialize Python objects. The native disk cache has no eviction or disk-size limit. Use a job-owned directory with a filesystem quota or external capacity monitoring. Remove it only after all job processes have exited; image files must remain available for checkpoint recovery. A new process rebuilds its CPU prefetch queue from the saved image references.
+
+CPU tests cover cache reuse, image integrity, prefetch ordering and thread cleanup. Validate GPU logprobs, training gradients, throughput and training recovery in a new process in the deployment environment. Compare each optimization against the same backend with the option disabled; the separate 96-point cross-backend acceptance limits above still apply.

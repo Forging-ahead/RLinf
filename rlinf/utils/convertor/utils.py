@@ -670,7 +670,8 @@ class Qwen35Convertor(BaseConvertor):
         }
 
     def _uncenter_gdn_norm(self, prefix: str, weight: torch.Tensor) -> dict:
-        return {f"{prefix}linear_attn.norm.weight": weight + 1}
+        # Megatron adds the zero-centered offset in FP32 during normalization.
+        return {f"{prefix}linear_attn.norm.weight": weight.float() + 1}
 
 
 class Qwen3MoEConvertor(Qwen3BaseConvertor):
