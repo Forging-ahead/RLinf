@@ -168,6 +168,10 @@ TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核�
 
    这条路径仍处于实验阶段。上面的默认 SGLang 0.5.12.post1 环境不能运行它。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
 
+   这个开发版仅用于显式设置 ``rollout.sglang.enable_token_space_processor=true`` 的 rollout。其他 rollout 路径以及独立的奖励模型、具身推理服务会在启动前拒绝该版本。这些任务应使用受支持的 SGLang 发布版，不能因为安装成功就认定兼容。
+
+受支持的 SGLang 发布版统一使用 ``rollout.cuda_graph_max_bs`` 配置项。SGLang 0.5.19 更改了对应服务参数的名称，RLinf 会完成映射，并将实际取值限制在 ``rollout.max_running_requests`` 以内。关闭 TokenSpace 时也适用这些规则。Search-R1 和具身任务的 GPU 回归尚未完成。
+
 新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同路径访问 ``output_dir``。
 
 .. code-block:: yaml

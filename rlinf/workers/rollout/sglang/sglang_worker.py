@@ -36,6 +36,7 @@ from rlinf.scheduler.dynamic_scheduler.utils import (
 )
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.rollout.backend import RlinfContext
+from rlinf.workers.rollout.sglang import require_supported_sglang
 from rlinf.workers.rollout.sglang.backends import make_backend
 from rlinf.workers.rollout.sglang.rendezvous import (
     broadcast_instance_readiness,
@@ -78,6 +79,11 @@ class SGLangWorker(Worker):
         if config_rollout is None:
             config_rollout = self._cfg.rollout
         self._cfg_rollout = config_rollout
+        require_supported_sglang(
+            token_space=self._cfg_rollout.sglang.get(
+                "enable_token_space_processor", False
+            )
+        )
         self._placement = placement
         # Only the entry (node_rank 0) of a model instance serves channels
         # and the HTTP control plane; other ranks just keep their sglang
@@ -251,6 +257,7 @@ class SGLangWorker(Worker):
                 image_processor_backend="pil",
             )
 
+        # SGLang 0.5.19 renamed this field; both release APIs use the same limit.
         graph_limit_name = (
             "cuda_graph_max_bs"
             if "cuda_graph_max_bs" in _SERVER_ARGS_FIELDS
@@ -330,8 +337,9 @@ class SGLangWorker(Worker):
         self.log_on_first_rank(f"{server_args=}")
         if dataclasses.is_dataclass(server_args):
             return dataclasses.asdict(server_args)
-        server_args.resolve_once()
-        return server_args.resolved_dict()
+        # Backends reconstruct ServerArgs and resolve it at launch. Resolved
+        # values are not constructor inputs (e.g. DP prefill sizing is scaled).
+        return msgspec.structs.asdict(server_args)
 
     async def stop(self):
         """Stop the SGLang engine and finalize stats collectors."""

@@ -14,6 +14,7 @@
 
 """Shared SGLang image preprocessing for rollout preflight and learner replay."""
 
+import copy
 import dataclasses
 import hashlib
 import inspect
@@ -71,7 +72,12 @@ def require_token_space_support() -> None:
 
 
 def processor_settings(server_args: dict) -> dict:
-    """Select the resolved serving settings that affect image preprocessing."""
+    """Resolve an independent copy for preprocessing, preserving launch inputs."""
+    from sglang.srt.server_args import ServerArgs
+
+    resolved = ServerArgs(**copy.deepcopy(server_args))
+    resolved.resolve_once()
+    settings = resolved.resolved_dict()
     names = (
         "model_path",
         "tokenizer_path",
@@ -85,7 +91,7 @@ def processor_settings(server_args: dict) -> dict:
         "disable_fast_image_processor",
         "mm_process_config",
     )
-    return {name: server_args[name] for name in names}
+    return {name: settings[name] for name in names}
 
 
 def tensor_digest(tensor: torch.Tensor) -> str:

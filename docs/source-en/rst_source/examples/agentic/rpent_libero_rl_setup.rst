@@ -168,6 +168,10 @@ Token-space mode uses SGLang's image preprocessing for rollout and training. It 
 
    This path is experimental. The default SGLang 0.5.12.post1 environment above cannot run it. The candidate dependency file, ``requirements/agentic/sglang-token-space.txt``, pins SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``, Torch 2.14.1 and Transformers 5.19.0. Prepare a separate environment with matching CUDA and Megatron-Bridge kernels; GPU serving, weight synchronization and training still need to be validated together in this environment. Keep the existing training environment unchanged.
 
+   RLinf permits this development build only for rollout with ``rollout.sglang.enable_token_space_processor=true``. Other rollout paths and standalone reward or embodied servers reject it before launch. Use a supported SGLang release for those workloads; installing this build does not establish their compatibility.
+
+Keep using ``rollout.cuda_graph_max_bs`` with supported SGLang releases, including 0.5.19, which renamed the corresponding server option. RLinf caps the value at ``rollout.max_running_requests``. These rules also apply when TokenSpace is disabled. GPU regression checks for Search-R1 and embodied workloads remain pending.
+
 After validating that environment, enable the following settings in the deployment profile. Remove ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`` from the rollout environment, including inherited shell settings. Keep ``output_dir`` accessible at the same path on rollout, actor and critic nodes.
 
 .. code-block:: yaml

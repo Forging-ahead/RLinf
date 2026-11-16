@@ -292,6 +292,14 @@ class SGLangServerProcess:
         """
         assert self._server_proc is None, "sglang server already initialized."
 
+        from rlinf.workers.rollout.sglang import require_supported_sglang
+
+        require_supported_sglang(
+            token_space=self._server_type == "srt"
+            and self._apply_rlinf_patch
+            and self._server_args_kwargs.get("enable_token_space_processor", False)
+        )
+
         # Every node needs an HTTP port (non-entry nodes bind a dummy
         # /health); a local dist port only on single node, cross-node uses
         # the negotiated dist_init_addr.

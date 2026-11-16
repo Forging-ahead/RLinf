@@ -45,6 +45,17 @@ else:
         )
     sglang_version = package_version
 
+
+def require_supported_sglang(*, token_space: bool = False) -> None:
+    """Restrict the pinned development build to explicit token-space rollout."""
+    if not parse("0.4.4") <= sglang_version <= parse("0.5.19") and not token_space:
+        raise ValueError(
+            "The pinned experimental SGLang build requires "
+            "rollout.sglang.enable_token_space_processor=true. "
+            "Use a supported release for other rollout, reward and embodied servers."
+        )
+
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from rlinf.hybrid_engines.sglang.common import io_struct
     from rlinf.hybrid_engines.sglang.common.sgl_engine import Engine
