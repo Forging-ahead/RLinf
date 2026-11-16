@@ -67,6 +67,27 @@ PPO 和 SAO 训练默认使用全词表采样：temperature 为 1、top-k 为 -1
 
 训练默认使用 SGLang Server 后端。设置 ``rollout.sglang.backend_type=engine`` 可切换到进程内 Engine 后端，两者复用相同的 rollout 和权重同步接口。SAO 配方通过 ``runner.synchronous: false`` 异步采集 episode，actor 和 critic 仍依次更新。rollout 与训练使用独立 GPU 时可以重叠执行；共卡时，rollout 必须先暂停并卸载，再开始训练。本配方不使用无 critic 的 ``runner.async_mode``\ 路径。
 
+启用 Logprob 重算与 TIS
+--------------------------
+
+SAO 默认关闭训练端 Logprob 重算和截断重要性采样（TIS）。试用这两个选项时，在 SAO 配置中加入：
+
+.. code-block:: yaml
+
+   algorithm:
+     recompute_logprobs: true
+     importance_sampling_fix: true
+     importance_sampling_clip: 2.0
+   rollout:
+     return_logprobs: true
+     max_weight_staleness: 1
+
+每个 batch 保留采样时的 logprob 和逐 token 的 policy 版本。actor 更新前，训练端用当前 actor 权重重算 logprob。TIS 同时校正后端数值差异和 policy 滞后。DIS 损失函数按概率比筛选训练 token，筛选范围以重算时使用的 actor 权重为基准。按上述配置，如果 episode 中任一 token 的采样权重比最新发布的权重落后超过一次更新，就丢弃整条 episode，并重新采样该任务。
+
+.. warning::
+
+   开启这些选项后，SAO 的损失计算方式会改变，并额外执行一次 actor 前向计算。扩批前，先用小规模运行检查 TIS 权重的截断比例、有效样本量和 policy 滞后。启用这些选项后的优化器更新、权重同步和 checkpoint 恢复尚未验证。logprob 重算和 TIS 不能证明 SGLang 与 Megatron 的数值一致。
+
 试用 TokenSpace 图像输入
 --------------------------
 
@@ -93,6 +114,38 @@ TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核�
 切换模式时使用全新的 rollout 状态。异步 checkpoint 恢复会拒绝不同模式，训练端也会拒绝 Processor 指纹变化或混合图像格式。Torch 和内核升级后，不能直接假定旧 optimizer 状态仍然兼容。恢复 checkpoint 前须保留其引用的图像文件。
 
 训练验收前，先在部署环境验证多轮图像、历史压缩和打包后的 M-RoPE。再按固定的 96 点方案比较 logprob，要求平均绝对误差不超过 0.03，最大绝对误差不超过 0.10。基础模型 logprob 与经过采样惩罚、top-k、top-p 修改的概率须分开比较。CPU 输入检查不能证明 GPU 数值对齐。
+
+减少重复图像预处理
+~~~~~~~~~~~~~~~~~~
+
+TokenSpace 模式可以让 rollout、actor 和 critic 共用图像预处理缓存。缓存保存处理后的像素和网格信息。rollout 和训练端仍各自运行冻结的视觉编码器，不共享视觉 embedding。
+
+共享预处理缓存、CPU 预取和视觉 DP 默认均关闭。启用缓存和预取时，在上面的部署配置中加入以下内容。将 ``<cache-dir>`` 替换为本作业独有的绝对路径，所有进程须能通过同一路径访问它。
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_token_space_preprocess_cache: true
+       token_space_preprocess_cache_dir: <cache-dir>
+       token_space_preprocess_cache_trust_url: true
+       token_space_preprocess_cache_check_rate: 0.0
+   tools:
+     rpent:
+       training_image_prefetch_batches: 2
+       training_image_prefetch_bytes: 268435456
+
+缓存要求图片路径指向的内容保持不变，并按处理器指纹分目录存放。抽查比例的取值为 0 到 1，提高该值会重算部分命中的内容，检查缓存是否一致。各进程须使用相同设置。
+
+预取配置限制每个训练 rank 同时准备的微批次数和总字节数，包含正在使用的微批次。训练线程执行前向计算，单个 CPU 线程准备后续批次。示例中的 256 MiB 不包含处理器临时内存，也不包含单独配置的 ``training_image_cache_bytes`` 缓存。规划主存时，将每个 rank 的预算乘以 actor 和 critic 的 rank 总数。提高预算前，先测量实际内存峰值。单个微批次超出预算会报错。预取要求新生成的 TokenSpace 轨迹记录处理后的像素字节数；重放旧轨迹时可将 ``training_image_prefetch_batches`` 设为 0。
+
+.. warning::
+
+   缓存读取会反序列化 Python 对象，目录只能由可信进程写入。原生磁盘缓存没有淘汰机制或容量上限，须使用作业专属目录，并配置文件系统配额或外部容量监控。所有作业进程退出后才能清理缓存；checkpoint 恢复依赖的图片文件须保留。新进程从保存的图片引用重建 CPU 预取队列。
+
+设置 ``rollout.sglang.mm_enable_dp_encoder: true`` 可启用 SGLang 原生视觉 DP，前提是模型和 TP 拓扑支持。TP1 不增加视觉并行度。Qwen3.5 的 Megatron 权重转换器要求 rollout TP1，因此 TP2 视觉 DP 仅用于独立的前向结果对照，训练时应保持关闭。
+
+CPU 测试覆盖缓存复用、图片校验、预取顺序和线程清理。GPU 上的 logprob、训练梯度和吞吐，以及在新进程中恢复训练的行为，仍需在部署环境验证。每项优化须与同一后端关闭该选项的结果比较；跨后端的 96 点验收仍使用上面的独立门槛。
 
 准备模型和标准 LIBERO 资产
 ----------------------------------

@@ -18,9 +18,14 @@ import asyncio
 import hashlib
 import io
 import json
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
+from threading import RLock
+from typing import ContextManager
 
 import torch
 
@@ -41,28 +46,32 @@ class _ProcessedImageCache:
     def __init__(self):
         self.entries = OrderedDict()
         self.bytes = 0
+        self.lock = RLock()
 
     def trim(self, budget):
-        while self.entries and self.bytes > budget:
-            _, (pixels, grid) = self.entries.popitem(last=False)
-            self.bytes -= pixels.nbytes + grid.nbytes
+        with self.lock:
+            while self.entries and self.bytes > budget:
+                _, (pixels, grid) = self.entries.popitem(last=False)
+                self.bytes -= pixels.nbytes + grid.nbytes
 
     def get(self, key):
-        if key not in self.entries:
-            return None
-        self.entries.move_to_end(key)
-        return self.entries[key]
+        with self.lock:
+            if key not in self.entries:
+                return None
+            self.entries.move_to_end(key)
+            return self.entries[key]
 
     def put(self, key, value, budget):
         size = sum(tensor.nbytes for tensor in value)
         if size > budget:
             return
-        previous = self.entries.pop(key, None)
-        if previous is not None:
-            self.bytes -= sum(tensor.nbytes for tensor in previous)
-        self.entries[key] = value
-        self.bytes += size
-        self.trim(budget)
+        with self.lock:
+            previous = self.entries.pop(key, None)
+            if previous is not None:
+                self.bytes -= sum(tensor.nbytes for tensor in previous)
+            self.entries[key] = value
+            self.bytes += size
+            self.trim(budget)
 
 
 _processed_image_cache = _ProcessedImageCache()
@@ -108,10 +117,14 @@ def _materialize_image_refs(entry, model_path, cache_bytes, processor=None):
         cached = _processed_image_cache.get(key)
     if cached is None:
         images = []
-        for content in contents:
-            with Image.open(io.BytesIO(content)) as image:
-                # Preserve alpha/mode for SGLang's own conversion rules.
-                images.append(image.copy() if token_space else image.convert("RGB"))
+        if token_space and processor.cache_directory is not None:
+            # Use the same immutable sources as serving, before decoding them.
+            images = [reference["path"] for reference in entry["image_refs"]]
+        else:
+            for content in contents:
+                with Image.open(io.BytesIO(content)) as image:
+                    # Preserve alpha/mode for SGLang's own conversion rules.
+                    images.append(image.copy() if token_space else image.convert("RGB"))
         if token_space:
             cached = asyncio.run(processor.replay(entry, images))
         else:
@@ -211,3 +224,128 @@ def materialize_multimodal_inputs(
         "pixel_values": torch.cat(pixels).to(device),
         "image_grid_thw": torch.cat(grids).to(device),
     }
+
+
+class MultimodalBatchPreparer:
+    """Prepare learner pixels on CPU, optionally ahead of model forward.
+
+    One background thread serializes native processor use. Prefetch limits
+    include the current microbatch and queued results, not processor scratch
+    space or the separately bounded process-local image cache. Futures live
+    only inside a forward/backward schedule, after distributed batch exchange.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        token_space: bool = False,
+        cache_bytes: int = 0,
+        prefetch_batches: int = 0,
+        prefetch_bytes: int = 0,
+    ):
+        self.model_path = model_path
+        self.token_space = token_space
+        self.cache_bytes = cache_bytes
+        self.prefetch_batches = prefetch_batches
+        self.prefetch_bytes = prefetch_bytes
+
+    def for_forward(
+        self, batch: dict, device: str | torch.device
+    ) -> dict[str, torch.Tensor]:
+        """Move only this microbatch's prepared inputs onto the training device."""
+        if self.prefetch_batches:
+            prepared = batch.pop("_prepared_multimodal_inputs")
+            return {key: value.to(device) for key, value in prepared.items()}
+        return self._materialize(batch, device)
+
+    def _materialize(self, batch: dict, device) -> dict[str, torch.Tensor]:
+        return materialize_multimodal_inputs(
+            batch.get("multi_modal_inputs") or [],
+            self.model_path,
+            device,
+            cache_bytes=self.cache_bytes,
+            input_ids=batch.get("input_ids"),
+            attention_mask=batch.get("attention_mask"),
+            token_space=self.token_space,
+        )
+
+    def iterator_context(
+        self, iterator: Iterator[dict]
+    ) -> ContextManager[Iterator[dict]]:
+        """Own and drain the prefetch thread even when model forward fails."""
+        if not self.prefetch_batches:
+            return nullcontext(iterator)
+        return self._prefetch_context(iterator)
+
+    def _result_bytes(self, batch: dict) -> int:
+        size = 3 * batch["input_ids"].numel() * 8 if self.token_space else 0
+        for entry in batch.get("multi_modal_inputs") or []:
+            if not entry:
+                continue
+            if "image_refs" in entry:
+                if "pixel_values_bytes" not in entry:
+                    raise ValueError(
+                        "Image prefetch needs pixel_values_bytes; generate fresh "
+                        "token-space rollouts or disable training_image_prefetch_batches."
+                    )
+                size += entry["pixel_values_bytes"]
+            else:
+                size += entry["pixel_values"].nbytes
+            size += entry["image_grid_thw"].nbytes
+        if size > self.prefetch_bytes:
+            raise ValueError(
+                f"Image microbatch needs {size} prepared bytes, exceeding "
+                f"training_image_prefetch_bytes={self.prefetch_bytes}; reduce the "
+                "microbatch or increase this per-rank budget."
+            )
+        return size
+
+    def _prepare(self, batch: dict, size: int) -> dict[str, torch.Tensor]:
+        prepared = self._materialize(batch, "cpu")
+        actual = sum(tensor.nbytes for tensor in prepared.values())
+        if actual != size:
+            raise ValueError(
+                f"Prepared image size {actual} differs from recorded size {size}."
+            )
+        return prepared
+
+    def _iterate(self, iterator, executor):
+        pending, reserved = deque(), 0
+        batch = next(iterator, None)
+        while batch is not None or pending:
+            while batch is not None and len(pending) < self.prefetch_batches:
+                size = self._result_bytes(batch)
+                if reserved + size > self.prefetch_bytes:
+                    break
+                # Distributed tensors return to CPU on the caller's thread.
+                cpu_batch = {
+                    "input_ids": batch["input_ids"].cpu(),
+                    "attention_mask": batch["attention_mask"].cpu(),
+                    "multi_modal_inputs": [
+                        {
+                            key: value.cpu() if torch.is_tensor(value) else value
+                            for key, value in entry.items()
+                        }
+                        if entry
+                        else entry
+                        for entry in batch.get("multi_modal_inputs") or []
+                    ],
+                }
+                future = executor.submit(self._prepare, cpu_batch, size)
+                pending.append((batch, future, size))
+                reserved += size
+                batch = next(iterator, None)
+            source, future, size = pending.popleft()
+            yield {**source, "_prepared_multimodal_inputs": future.result()}
+            reserved -= size
+
+    @contextmanager
+    def _prefetch_context(self, iterator):
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rlinf-images")
+        batches = self._iterate(iter(iterator), executor)
+        try:
+            yield batches
+        finally:
+            batches.close()
+            executor.shutdown(wait=True, cancel_futures=True)

@@ -213,8 +213,9 @@ def test_synchronous_publication_labels_installed_weights_after_resume(collocate
 
 
 @pytest.mark.parametrize("adv_type", ["actor_gae", "gae_dynamic"])
+@pytest.mark.parametrize("recompute", [False, True])
 def test_synchronous_runner_consumes_batches_with_multiple_critic_epochs(
-    monkeypatch, adv_type
+    monkeypatch, adv_type, recompute
 ):
     from omegaconf import OmegaConf
 
@@ -234,7 +235,7 @@ def test_synchronous_runner_consumes_batches_with_multiple_critic_epochs(
             },
             "algorithm": {
                 "kl_beta": 0,
-                "recompute_logprobs": False,
+                "recompute_logprobs": recompute,
                 "adv_type": adv_type,
                 "n_minibatches": 1,
                 "gamma": 1.0,
@@ -254,6 +255,7 @@ def test_synchronous_runner_consumes_batches_with_multiple_critic_epochs(
         is_end=[True],
         rewards=[1.0],
         rollout_logprobs=[[-0.1, -0.2]],
+        rollout_weight_versions=[[2, 3]],
     )
 
     def handle(value=None):
@@ -274,9 +276,23 @@ def test_synchronous_runner_consumes_batches_with_multiple_critic_epochs(
             output_channel.put(episode)
         return handle([(None, [{"critic/loss": 0.3}, {"critic/loss": 0.1}])])
 
-    def actor_train(input_channel):
+    def actor_infer(input_channel, output_channel, **kwargs):
+        episode = input_channel.get_nowait()
+        episode.recomputed_logprobs = torch.tensor([[0.0, -0.15, -0.3]])
+        output_channel.put(episode)
+        return handle()
+
+    def actor_train(input_channel, version=None):
         episode = input_channel.get_nowait()
         torch.testing.assert_close(episode.advantages, torch.tensor([[0.0, 0.75, 0.5]]))
+        assert episode.rollout_logprobs == [[-0.1, -0.2]]
+        assert episode.rollout_weight_versions == [[2, 3]]
+        if recompute:
+            torch.testing.assert_close(
+                episode.recomputed_logprobs, torch.tensor([[0.0, -0.15, -0.3]])
+            )
+        else:
+            assert episode.recomputed_logprobs is None
         return handle([({"reward": 1.0}, [{"actor/loss": 0.2}])])
 
     runner = AgentPPORunner(
@@ -288,7 +304,7 @@ def test_synchronous_runner_consumes_batches_with_multiple_critic_epochs(
         inference=None,
         reward=None,
         agent_loop=SimpleNamespace(_workers=[0]),
-        actor=SimpleNamespace(run_training=actor_train),
+        actor=SimpleNamespace(run_inference=actor_infer, run_training=actor_train),
         critic=SimpleNamespace(run_inference=infer, run_training=critic_train),
     )
     for channel in runner.rollout_output_channels:
@@ -301,6 +317,7 @@ def test_synchronous_runner_consumes_batches_with_multiple_critic_epochs(
         runner.value_channel,
         runner.training_channel,
         runner.critic_output_channel,
+        runner.actor_inference_channel,
     ]:
         with pytest.raises(asyncio.QueueEmpty):
             channel.get_nowait()
@@ -480,6 +497,9 @@ def test_megatron_valid_token_scale_matches_unsplit_gradient(
                 },
             }
         )
+        from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+        worker.multimodal_preparer = MultimodalBatchPreparer("/test/model")
         worker.transformer_config = SimpleNamespace(sequence_parallel=False)
         worker.return_loss = True
         worker.loss_agg_func = masked_mean
@@ -817,6 +837,9 @@ def test_multiturn_critic_preserves_values_loss_and_update_with_packing(
         )
         worker.role_cfg = worker.cfg.critic
         worker.tokenizer = SimpleNamespace(eos_token_id=0)
+        from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+        worker.multimodal_preparer = MultimodalBatchPreparer("/test/model")
         worker.transformer_config = SimpleNamespace(sequence_parallel=False)
         worker.num_microbatches = 1
         worker.value_clip = 0.5
@@ -1583,10 +1606,13 @@ def test_tis_weights_only_response_tokens_and_truncates_large_ratios():
 
 
 @pytest.mark.parametrize("presence_penalty", [0.0, 1.5])
+@pytest.mark.parametrize("loss_type", ["actor", "dis"])
 def test_tis_corrects_penalized_behavior_without_differentiating_the_weights(
     presence_penalty,
+    loss_type,
 ):
     """Enumerating the vocabulary gives an exact expected policy gradient."""
+    from rlinf.algorithms.registry import get_policy_loss
     from rlinf.algorithms.utils import truncated_importance_weights
 
     temperature, clip = 0.7, 2.0
@@ -1602,12 +1628,17 @@ def test_tis_corrects_penalized_behavior_without_differentiating_the_weights(
     )
 
     advantages = torch.tensor([[1.0, -0.5, -1.0, 0.25]])
-    loss, _ = compute_ppo_actor_loss(
+    weighted_advantages = advantages * weights
+    if loss_type == "dis":
+        # DIS averages tokens internally; weight the enumerated vocabulary by
+        # its sampling probabilities to compute the expected gradient.
+        weighted_advantages = weighted_advantages * behavior * mask.numel()
+    loss, _ = get_policy_loss(loss_type)(
         logprobs=target,
         old_logprobs=target.detach(),
         clip_ratio_low=0.2,
         clip_ratio_high=0.2,
-        advantages=advantages * weights,
+        advantages=weighted_advantages,
         loss_mask=mask,
         loss_agg_func=lambda values, loss_mask, *args: (
             values * behavior * loss_mask
@@ -1837,7 +1868,13 @@ def test_text_actor_forward_does_not_require_rpent_config(config):
     from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
 
     cfg = OmegaConf.create({"rollout": {"model": {"model_path": "unused"}}, **config})
-    actor = SimpleNamespace(cfg=cfg, torch_device_type="cpu")
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+    actor = SimpleNamespace(
+        cfg=cfg,
+        torch_device_type="cpu",
+        multimodal_preparer=MultimodalBatchPreparer(cfg.rollout.model.model_path),
+    )
     assert MAMegatronActor._forward_multimodal_inputs(actor, {}) == {}
 
 

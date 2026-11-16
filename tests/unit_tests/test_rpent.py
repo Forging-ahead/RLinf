@@ -1361,6 +1361,34 @@ def test_invalid_standard_seeds_are_rejected(seeds):
         _task_writer().parse_seeds(seeds)
 
 
+@pytest.mark.parametrize(
+    "invalid,value",
+    [
+        (None, None),
+        ("algorithm.recompute_logprobs", False),
+        ("algorithm.importance_sampling_fix", False),
+        ("algorithm.importance_sampling_clip", float("inf")),
+        ("rollout.return_logprobs", False),
+        ("rollout.max_weight_staleness", None),
+        ("rollout.max_weight_staleness", -1),
+    ],
+)
+def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, value):
+    from rlinf.config import validate_async_agent_ppo_cfg
+
+    cfg = compose(config_name="train_qwen3.5_4b_libero_rl_sao")
+    cfg.algorithm.recompute_logprobs = True
+    cfg.algorithm.importance_sampling_fix = True
+    cfg.algorithm.importance_sampling_clip = 2.0
+    cfg.rollout.max_weight_staleness = 1
+    if invalid is None:
+        validate_async_agent_ppo_cfg(cfg, "RPent")
+    else:
+        OmegaConf.update(cfg, invalid, value)
+        with pytest.raises(ValueError, match="async|staleness"):
+            validate_async_agent_ppo_cfg(cfg, "RPent")
+
+
 def test_distributed_recipe_matches_adaptive_student_evaluation():
     cfg = compose(config_name="train_qwen3.5_4b_libero_rl_sao_3node")
     assert cfg.cluster.num_nodes == 3
@@ -2051,23 +2079,17 @@ def test_token_space_config_requires_bridge_and_compatible_parallelism():
         validate_rpent_cfg(cfg)
 
 
-def test_native_token_space_multiturn_replay_and_cache(tmp_path):
-    """Optional CPU integration: real SGLang core and local Qwen processor assets."""
+@pytest.fixture(params=[False, True], ids=["uncached", "disk-cache"])
+def native_token_space(tmp_path, request):
+    """Use real SGLang preprocessing when local processor assets are supplied."""
     model_path = os.environ.get("RLINF_TOKEN_SPACE_TEST_MODEL")
     if not model_path:
         pytest.skip(
             "Set RLINF_TOKEN_SPACE_TEST_MODEL to local Qwen3.5 processor assets"
         )
-    import io
 
-    from PIL import Image
-    from transformers import AutoConfig
-
-    from rlinf.agents.rpent.history import ImagePrompt
     from rlinf.hybrid_engines.sglang.multimodal.token_space import SGLangTokenSpace
-    from rlinf.utils.multimodal import materialize_multimodal_inputs
 
-    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
     settings = {
         "model_path": model_path,
         "tokenizer_path": model_path,
@@ -2081,7 +2103,32 @@ def test_native_token_space_multiturn_replay_and_cache(tmp_path):
         "disable_fast_image_processor": True,
         "mm_process_config": {},
     }
+    if request.param:
+        settings.update(
+            enable_token_space_preprocess_cache=True,
+            token_space_preprocess_cache_dir=str(tmp_path / "cache"),
+            token_space_preprocess_cache_trust_url=True,
+        )
     processor = SGLangTokenSpace(settings)
+    try:
+        yield processor
+    finally:
+        processor.shutdown()
+
+
+@pytest.fixture
+def native_multiturn(native_token_space, tmp_path):
+    import io
+
+    from PIL import Image
+    from transformers import AutoConfig
+
+    from rlinf.agents.rpent.history import ImagePrompt
+
+    processor = native_token_space
+    config = AutoConfig.from_pretrained(
+        processor.settings["model_path"], local_files_only=True
+    )
     images = []
     for mode, size, color in [
         ("RGB", (64, 96), "red"),
@@ -2090,6 +2137,11 @@ def test_native_token_space_multiturn_replay_and_cache(tmp_path):
         data = io.BytesIO()
         Image.new(mode, size, color).save(data, format="PNG")
         images.append(data.getvalue())
+    media_directory = tmp_path / "images"
+    sources = images
+    if processor.cache_directory is not None:
+        stored = ImagePrompt([], images).store_images(media_directory)
+        sources = [ref["path"] for ref in stored["image_refs"]]
     marker = [
         config.vision_start_token_id,
         config.image_token_id,
@@ -2097,7 +2149,9 @@ def test_native_token_space_multiturn_replay_and_cache(tmp_path):
     ]
     first = asyncio.run(
         processor.prepare(
-            [42, *marker, 43], images[:1], {"prefix_length": 0, "image_spans": [(2, 3)]}
+            [42, *marker, 43],
+            sources[:1],
+            {"prefix_length": 0, "image_spans": [(2, 3)]},
         )
     )
     sampled = first["prompt_token_ids"] + [44, 45]
@@ -2105,7 +2159,7 @@ def test_native_token_space_multiturn_replay_and_cache(tmp_path):
     second = asyncio.run(
         processor.prepare(
             compact,
-            images,
+            sources,
             {
                 "prefix_length": len(sampled),
                 "image_spans": [
@@ -2120,33 +2174,277 @@ def test_native_token_space_multiturn_replay_and_cache(tmp_path):
     assert len(second["image_spans"]) == 2
     refs = ImagePrompt(
         second["prompt_token_ids"], images, second["image_grid_thw"]
-    ).store_images(tmp_path)
+    ).store_images(media_directory)
     entry = {**refs, **second}
     ids = torch.tensor([second["prompt_token_ids"] + [47, 48, 0, 0]])
     mask = ids.ne(0)
 
-    def materialize(value):
-        return materialize_multimodal_inputs(
-            [value],
-            model_path,
-            "cpu",
-            cache_bytes=8 * 1024 * 1024,
-            input_ids=ids,
-            attention_mask=mask,
-            token_space=True,
-        )
+    return SimpleNamespace(
+        processor=processor,
+        images=images,
+        entry=entry,
+        batch={"input_ids": ids, "attention_mask": mask, "multi_modal_inputs": [entry]},
+    )
 
-    first_inputs = materialize(entry)
-    again = materialize(entry)
+
+def test_native_token_space_multiturn_replay_and_cache(native_multiturn, monkeypatch):
+    from sglang.srt.multimodal.cache import DiskPreprocessCache
+
+    from rlinf.hybrid_engines.sglang.multimodal.token_space import SGLangTokenSpace
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+    case = native_multiturn
+    processor = case.processor
+    preparer = MultimodalBatchPreparer(
+        processor.settings["model_path"], token_space=True, cache_bytes=8 * 1024 * 1024
+    )
+    cache_hits = []
+    original_get = DiskPreprocessCache.get
+
+    def counted_get(cache, key):
+        result = original_get(cache, key)
+        if result is not None:
+            cache_hits.append(str(cache.directory))
+        return result
+
+    monkeypatch.setattr(DiskPreprocessCache, "get", counted_get)
+    first_inputs = preparer.for_forward(case.batch, "cpu")
+    if processor.cache_directory is not None:
+        assert cache_hits == [processor.cache_directory] * 2
+        uncached = SGLangTokenSpace(
+            {**processor.settings, "enable_token_space_preprocess_cache": False}
+        )
+        try:
+            assert uncached.fingerprint == processor.fingerprint
+            pixels, grid = asyncio.run(uncached.replay(case.entry, case.images))
+            assert torch.equal(pixels, first_inputs["pixel_values"])
+            assert torch.equal(grid, first_inputs["image_grid_thw"])
+        finally:
+            uncached.shutdown()
+    again = preparer.for_forward(case.batch, "cpu")
     for key in first_inputs:
         assert torch.equal(first_inputs[key], again[key])
-    assert first_inputs["multimodal_position_ids"].shape == (3, 1, ids.shape[1])
-    # Cache reuse cannot hide changed placement, pixels, or files.
-    with pytest.raises(ValueError, match="pixel_values differs"):
-        materialize({**entry, "pixel_values_sha256": "changed"})
-    with pytest.raises(ValueError, match="mrope_positions differs"):
-        materialize({**entry, "mrope_sha256": "changed"})
-    Path(entry["image_refs"][1]["path"]).write_bytes(b"changed")
+    assert first_inputs["multimodal_position_ids"].shape == (
+        3,
+        *case.batch["input_ids"].shape,
+    )
+
+
+def test_native_token_space_replay_rejects_corruption(native_multiturn):
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+    case = native_multiturn
+    preparer = MultimodalBatchPreparer(
+        case.processor.settings["model_path"],
+        token_space=True,
+        cache_bytes=8 * 1024 * 1024,
+    )
+    preparer.for_forward(case.batch, "cpu")
+    for field, error in [
+        ("pixel_values_sha256", "pixel_values differs"),
+        ("mrope_sha256", "mrope_positions differs"),
+    ]:
+        with pytest.raises(ValueError, match=error):
+            preparer.for_forward(
+                {
+                    **case.batch,
+                    "multi_modal_inputs": [{**case.entry, field: "changed"}],
+                },
+                "cpu",
+            )
+    Path(case.entry["image_refs"][1]["path"]).write_bytes(b"changed")
     with pytest.raises(ValueError, match="checksum mismatch"):
-        materialize(entry)
-    processor.shutdown()
+        preparer.for_forward(case.batch, "cpu")
+
+
+def test_native_token_space_prefetch_matches_synchronous_replay(native_multiturn):
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+    case = native_multiturn
+    baseline = MultimodalBatchPreparer(
+        case.processor.settings["model_path"], token_space=True
+    )
+    expected = baseline.for_forward(case.batch, "cpu")
+    prefetch = MultimodalBatchPreparer(
+        case.processor.settings["model_path"],
+        token_space=True,
+        prefetch_batches=2,
+        prefetch_bytes=2 * sum(t.nbytes for t in expected.values()),
+    )
+    with prefetch.iterator_context(iter([case.batch] * 3)) as iterator:
+        for batch in iterator:
+            actual = prefetch.for_forward(batch, "cpu")
+            assert actual.keys() == expected.keys()
+            for key in expected:
+                assert actual[key].device.type == "cpu"
+                assert torch.equal(actual[key], expected[key])
+
+
+@pytest.mark.parametrize(
+    "overrides, error",
+    [
+        (["rollout.sglang.token_space_preprocess_cache_trust_url=false"], "trust_url"),
+        (["rollout.sglang.token_space_preprocess_cache_dir=relative"], "absolute"),
+        (
+            ["rollout.sglang.token_space_preprocess_cache_check_rate=1.1"],
+            "between 0 and 1",
+        ),
+        (
+            ["rollout.sglang.enable_token_space_processor=false"],
+            "enable_token_space_processor",
+        ),
+    ],
+)
+def test_shared_preprocess_cache_rejects_invalid_settings(tmp_path, overrides, error):
+    from rlinf.config import validate_rollout_cfg
+
+    cfg = compose(
+        [
+            "rollout.model.model_path=/unused/model",
+            "rollout.sglang.enable_token_space_processor=true",
+            "rollout.sglang.enable_token_space_preprocess_cache=true",
+            "rollout.sglang.token_space_preprocess_cache_trust_url=true",
+            f"rollout.sglang.token_space_preprocess_cache_dir={tmp_path}",
+        ]
+    )
+    validate_rollout_cfg(cfg.rollout, cfg.algorithm, cfg.actor)
+    for override in overrides:
+        cfg.merge_with_dotlist([override])
+    with pytest.raises(ValueError, match=error):
+        validate_rollout_cfg(cfg.rollout, cfg.algorithm, cfg.actor)
+
+
+@pytest.mark.parametrize("prefetch_batches", [0, 2, 8])
+def test_image_prefetch_preserves_order_and_gradients(prefetch_batches, monkeypatch):
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+    consumed = []
+    source_ids = []
+    # Simulate distinct host copies without depending on a GPU for this test.
+    monkeypatch.setattr(torch.Tensor, "cpu", lambda tensor: tensor.clone())
+
+    def batches():
+        for index in range(5):
+            consumed.append(index)
+            ids = torch.tensor([[index + 1, 9]])
+            source_ids.append(ids)
+            yield {
+                "input_ids": ids,
+                "attention_mask": torch.ones(1, 2),
+                "multi_modal_inputs": [
+                    {
+                        "pixel_values": torch.full((2, 3), float(index)),
+                        "image_grid_thw": torch.tensor([[1, 1, 2]]),
+                    }
+                ],
+            }
+
+    # Each result is 48 bytes; the byte limit admits at most two batches.
+    preparer = MultimodalBatchPreparer(
+        "unused", prefetch_batches=prefetch_batches, prefetch_bytes=96
+    )
+    weight = torch.tensor(0.5, requires_grad=True)
+    with preparer.iterator_context(batches()) as iterator:
+        for index, batch in enumerate(iterator):
+            assert batch["input_ids"] is source_ids[index]
+            inputs = preparer.for_forward(batch, "cpu")
+            assert torch.equal(inputs["pixel_values"], torch.full((2, 3), float(index)))
+            if prefetch_batches:
+                assert (
+                    len(consumed) <= index + 3
+                )  # Two admitted, one compact lookahead.
+            (inputs["pixel_values"] * weight).sum().backward()
+            assert "_prepared_multimodal_inputs" not in batch
+    assert weight.grad.item() == 6 * sum(range(5))
+
+
+@pytest.mark.parametrize("failure", ["prepare", "consumer", "budget"])
+def test_image_prefetch_propagates_failure_and_joins_threads(failure):
+    import threading
+
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "attention_mask": torch.ones(1, 2),
+        "multi_modal_inputs": [],
+    }
+    if failure == "prepare":
+        batch["multi_modal_inputs"] = [
+            {
+                "format": "legacy",
+                "pixel_values": torch.ones(1),
+                "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
+            }
+        ]
+    preparer = MultimodalBatchPreparer(
+        "unused",
+        token_space=True,
+        prefetch_batches=2,
+        prefetch_bytes=1 if failure == "budget" else 4096,
+    )
+    error = {
+        "prepare": "Legacy media",
+        "budget": "exceeding",
+        "consumer": "model forward",
+    }[failure]
+    with pytest.raises(ValueError, match=error):
+        with preparer.iterator_context(iter([batch, batch])) as iterator:
+            next(iterator)
+            raise ValueError("model forward failed")
+    assert not any(
+        thread.name.startswith("rlinf-images") for thread in threading.enumerate()
+    )
+
+
+def test_native_token_space_disk_cache_shared_across_processes(
+    native_multiturn, tmp_path
+):
+    import subprocess
+
+    from rlinf.hybrid_engines.sglang.multimodal.token_space import tensor_digest
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
+
+    case = native_multiturn
+    if case.processor.cache_directory is None:
+        pytest.skip("Cross-process cache check needs the disk-cache variant")
+    request = tmp_path / "replay.pt"
+    result = tmp_path / "replay.json"
+    torch.save(case.batch, request)
+    script = """
+import json, sys, torch
+from pathlib import Path
+from sglang.srt.multimodal.cache import DiskPreprocessCache
+from rlinf.hybrid_engines.sglang.multimodal.token_space import tensor_digest
+from rlinf.utils.multimodal import MultimodalBatchPreparer
+hits = []
+original = DiskPreprocessCache.get
+def get(cache, key):
+    value = original(cache, key)
+    if value is not None:
+        hits.append(key)
+    return value
+DiskPreprocessCache.get = get
+batch = torch.load(sys.argv[1], weights_only=True)
+model_path = batch["multi_modal_inputs"][0]["processor_settings"]["model_path"]
+preparer = MultimodalBatchPreparer(model_path, token_space=True)
+inputs = preparer.for_forward(batch, "cpu")
+Path(sys.argv[2]).write_text(json.dumps({"hits": len(hits), "digests": {
+    name: tensor_digest(value) for name, value in inputs.items()
+}}))
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(request), str(result)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    actual = json.loads(result.read_text())
+    expected = MultimodalBatchPreparer(
+        case.processor.settings["model_path"], token_space=True
+    ).for_forward(case.batch, "cpu")
+    assert actual["hits"] == 2
+    assert actual["digests"] == {
+        key: tensor_digest(value) for key, value in expected.items()
+    }

@@ -251,6 +251,24 @@ class SGLangWorker(Worker):
                 image_processor_backend="pil",
             )
 
+        for name in (
+            "enable_token_space_preprocess_cache",
+            "token_space_preprocess_cache_dir",
+            "token_space_preprocess_cache_trust_url",
+            "token_space_preprocess_cache_check_rate",
+            "mm_enable_dp_encoder",
+        ):
+            if name not in self._cfg_rollout.sglang:
+                continue
+            value = self._cfg_rollout.sglang[name]
+            if name in _SERVER_ARGS_FIELDS:
+                version_dependent_args[name] = value
+            elif value:
+                raise ValueError(
+                    f"Installed SGLang does not support {name}={value!r}; "
+                    "use a compatible build or disable this option."
+                )
+
         graph_limit_name = (
             "cuda_graph_max_bs"
             if "cuda_graph_max_bs" in _SERVER_ARGS_FIELDS
@@ -457,6 +475,11 @@ class SGLangWorker(Worker):
             )
 
             self._token_space = SGLangTokenSpace(processor_settings(server_args))
+            if self._token_space.cache_directory is not None:
+                # Serving and replay use the same processor-scoped namespace.
+                server_args["token_space_preprocess_cache_dir"] = (
+                    self._token_space.cache_directory
+                )
         self._backend = make_backend(
             backend_type,
             server_args=server_args,

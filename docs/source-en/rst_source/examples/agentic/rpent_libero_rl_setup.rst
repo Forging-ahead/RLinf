@@ -67,6 +67,27 @@ PPO and SAO training use full-vocabulary sampling by default, with temperature 1
 
 Training uses the SGLang Server backend by default. Set ``rollout.sglang.backend_type=engine`` to use the in-process Engine backend. Both use the same rollout and weight synchronization interfaces. The SAO recipe collects episodes asynchronously with ``runner.synchronous: false``; actor and critic updates remain sequential. Rollout can overlap training when they use separate GPUs. Shared GPUs require rollout to pause and offload before training. This recipe does not use the critic-free ``runner.async_mode`` path.
 
+Enable Logprob Recalculation and TIS
+---------------------------------------------
+
+To test SAO with training-side logprobs and truncated importance sampling (TIS), add these settings to the SAO config. The default SAO recipe leaves both options disabled.
+
+.. code-block:: yaml
+
+   algorithm:
+     recompute_logprobs: true
+     importance_sampling_fix: true
+     importance_sampling_clip: 2.0
+   rollout:
+     return_logprobs: true
+     max_weight_staleness: 1
+
+Each batch retains its sampling logprobs and per-token policy versions. Before the actor update, the learner recalculates logprobs with the current actor weights. TIS corrects for both backend differences and policy lag. The DIS loss filters training tokens by their probability ratios, relative to the actor weights used for recalculation. With these settings, an episode is discarded if any token was sampled with weights more than one update behind the latest published version. Its task is then retried.
+
+.. warning::
+
+   Enabling these options changes how SAO computes its loss and adds an actor forward pass. Check TIS weight clipping, effective sample size and policy lag during a small run before scaling. Optimizer updates, weight synchronization and checkpoint recovery with these options have not been validated. Logprob recalculation and TIS do not establish numerical agreement between SGLang and Megatron.
+
 Try Token-Space Image Inputs (Experimental)
 -------------------------------------------
 
@@ -93,6 +114,38 @@ Rollout initialization fails if the TokenSpace APIs are unavailable. Both Server
 Start with fresh rollout state when switching modes. Async checkpoint recovery rejects a different mode, and the learner rejects changed processor fingerprints or mixed media formats. Do not assume optimizer state is portable across the Torch/kernel upgrade. Retain image files for checkpoint recovery.
 
 To validate the stack for training, first verify multi-turn images, compaction and packed M-RoPE in the deployment environment. Then run the fixed 96-point logprob comparison. The mean absolute error must not exceed 0.03, and the maximum absolute error must not exceed 0.10. Compare base model logprobs separately from probabilities modified by sampling penalties, top-k and top-p. CPU input checks do not establish GPU numerical parity.
+
+Reduce Repeated Image Preprocessing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Token-space mode can share preprocessed images between rollout, actor and critic. The cache contains processed pixels and grid metadata. Each backend still runs its own frozen vision encoder; visual embeddings are not shared.
+
+Shared preprocessing caches, CPU prefetching and visual DP are disabled by default. To enable caching and prefetching, add the following to the deployment profile above. Replace ``<cache-dir>`` with an absolute, job-owned directory that all processes see at the same path.
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_token_space_preprocess_cache: true
+       token_space_preprocess_cache_dir: <cache-dir>
+       token_space_preprocess_cache_trust_url: true
+       token_space_preprocess_cache_check_rate: 0.0
+   tools:
+     rpent:
+       training_image_prefetch_batches: 2
+       training_image_prefetch_bytes: 268435456
+
+Cached image paths must always refer to the same image contents. The cache stores each processor fingerprint in a separate directory. The check rate is between 0 and 1: increasing it recomputes a fraction of cache hits to check their contents. Keep this setting identical across processes.
+
+The prefetch settings limit the number and total bytes of prepared microbatches per learner rank, including the current microbatch. One CPU thread prepares the following batch while the training thread runs the current forward. The 256 MiB example excludes processor scratch space and the separate ``training_image_cache_bytes`` cache. Multiply the per-rank budgets by the number of actor and critic ranks, and measure peak host memory before increasing them. A microbatch larger than the budget fails with an error. Prefetching requires token-space trajectories that record the size of the preprocessed pixel data in bytes. Set ``training_image_prefetch_batches: 0`` when replaying older trajectories.
+
+.. warning::
+
+   Only trusted processes may write the cache directory: cache reads deserialize Python objects. The native disk cache has no eviction or disk-size limit. Use a job-owned directory with a filesystem quota or external capacity monitoring. Remove it only after all job processes have exited; image files must remain available for checkpoint recovery. A new process rebuilds its CPU prefetch queue from the saved image references.
+
+Set ``rollout.sglang.mm_enable_dp_encoder: true`` to select SGLang's native visual DP encoder for a supported model and TP topology. TP1 has no additional visual parallelism. The Qwen3.5 Megatron weight converter requires rollout TP1, so TP2 visual DP is limited to standalone forward comparisons in this integration. Keep it disabled for the training recipe.
+
+CPU tests cover cache reuse, image integrity, prefetch ordering and thread cleanup. Validate GPU logprobs, training gradients, throughput and training recovery in a new process in the deployment environment. Compare each optimization against the same backend with the option disabled; the separate 96-point cross-backend acceptance limits above still apply.
 
 Prepare Models And Standard LIBERO Assets
 -----------------------------------------

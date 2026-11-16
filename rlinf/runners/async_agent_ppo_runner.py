@@ -333,8 +333,8 @@ class AsyncAgentPPORunner(AgentPPORunner):
                         gae_lambda_alpha=self.cfg.algorithm.gae_lambda_alpha,
                     )
                 with self.timer("training"):
-                    actor_handle: Handle = self.actor.run_training(
-                        input_channel=self.training_channel,
+                    actor_handle, actor_infer_handle = self._start_actor_update(
+                        self.training_channel, version=self.actor_version
                     )
                     actor_metrics = actor_handle.wait()
                     actor_rollout_metrics = actor_metrics[0][0]
@@ -375,6 +375,10 @@ class AsyncAgentPPORunner(AgentPPORunner):
 
             time_metrics = self.timer.consume_durations()
             time_metrics["training"] = actor_handle.consume_duration()
+            if actor_infer_handle is not None:
+                time_metrics["inference"] = actor_infer_handle.consume_duration(
+                    reduction_type="min"
+                )
             time_metrics["critic/training"] = critic_handle.consume_duration()
             time_metrics["critic/inference"] = critic_infer_handle.consume_duration(
                 reduction_type="min"

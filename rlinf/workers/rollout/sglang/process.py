@@ -478,6 +478,19 @@ def _assert_sglang_supports_rlinf_patch() -> None:
         sglang_version = parse(version("sglang"))
     except PackageNotFoundError as e:
         raise RuntimeError("sglang is not installed.") from e
+    if sglang_version <= parse("0.5.5"):
+        from rlinf.hybrid_engines.sglang.multimodal.token_space import (
+            is_token_space_build,
+        )
+
+        if is_token_space_build():
+            from sglang.srt.entrypoints.http_server import launch_server
+
+            if (
+                "run_scheduler_process_func"
+                in inspect.signature(launch_server).parameters
+            ):
+                return
     assert sglang_version > parse("0.5.5"), (
         f"apply_rlinf_patch requires sglang > 0.5.5 "
         f"(launch_server run_scheduler_process_func injection); "

@@ -362,11 +362,21 @@ def test_sglang_replicas_reserve_both_initialization_ports(monkeypatch, num_node
     def unexpected_free_port():
         pytest.fail("SGLang must use the port reserved by RLinf.")
 
-    monkeypatch.setattr(vendor, "get_free_port", unexpected_free_port)
     args = results[0][1]
-    vendor_args = object.__new__(vendor.ServerArgs)
-    vendor_args.nccl_port = args["nccl_port"]
-    vendor_args.dist_init_addr = args["dist_init_addr"]
+    if hasattr(vendor, "get_free_port_below_ephemeral"):
+        monkeypatch.setattr(
+            vendor, "get_free_port_below_ephemeral", unexpected_free_port
+        )
+        vendor_args = vendor.ServerArgs(
+            model_path="dummy",
+            nccl_port=args["nccl_port"],
+            dist_init_addr=args["dist_init_addr"],
+        )
+    else:
+        monkeypatch.setattr(vendor, "get_free_port", unexpected_free_port)
+        vendor_args = object.__new__(vendor.ServerArgs)
+        vendor_args.nccl_port = args["nccl_port"]
+        vendor_args.dist_init_addr = args["dist_init_addr"]
     ports = vendor.PortArgs.init_new(vendor_args)
     try:
         assert ports.nccl_port == args["nccl_port"]
@@ -400,7 +410,8 @@ def test_sglang_running_state_uses_native_hybrid_pool_accounting(
         waiting_queue=[object(), object()],
     )
     expected_used = 30
-    if cache_kind != "legacy":
+    has_observer = not hasattr(VendorScheduler, "get_pool_stats")
+    if cache_kind != "legacy" and not has_observer:
         state.is_hybrid_ssm = cache_kind == "mamba"
         state.is_hybrid_swa = cache_kind == "swa"
         state.enable_hisparse = False
@@ -413,9 +424,12 @@ def test_sglang_running_state_uses_native_hybrid_pool_accounting(
     if cache_kind == "mamba":
         cache.supports_mamba = lambda: True
         cache.is_tree_cache = lambda: True
+        cache.supports_prefix_sharing = lambda: True
         cache.mamba_evictable_size = lambda: 2
         state.req_to_token_pool = SimpleNamespace(
-            mamba_pool=SimpleNamespace(size=10, available_size=lambda: 3)
+            mamba_pool=SimpleNamespace(size=10, available_size=lambda: 3),
+            mamba_allocator=SimpleNamespace(available_size=lambda: 3),
+            schedulable_token_capacity=lambda available: available,
         )
     elif cache_kind == "swa":
         allocator.available_size = Mock(side_effect=NotImplementedError)
@@ -424,7 +438,26 @@ def test_sglang_running_state_uses_native_hybrid_pool_accounting(
         cache.swa_evictable_size = lambda: 5
         state.full_tokens_per_layer = 100
         state.swa_tokens_per_layer = 60
+        allocator.swa_capacity_and_available = lambda **kwargs: ((100, 30), (60, 15))
         expected_used = 50
+    if cache_kind != "legacy" and has_observer:
+        from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+            SchedulerPoolStatsObserver,
+        )
+
+        state.pool_stats_observer = SchedulerPoolStatsObserver(
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=getattr(state, "req_to_token_pool", None),
+            session_controller=None,
+            hisparse_coordinator=None,
+            is_hybrid_swa=cache_kind == "swa",
+            is_hybrid_ssm=cache_kind == "mamba",
+            enable_hisparse=False,
+            full_tokens_per_layer=100,
+            swa_tokens_per_layer=60,
+            max_total_num_tokens=100,
+        )
 
     assert Scheduler.get_scheduler_running_state(state) == {
         "num_running_reqs": num_running,
@@ -632,20 +665,28 @@ def test_server_request_preserves_images_and_logit_processors(batched):
     assert images == ([[b"png-image"], []] if batched else [b"png-image"])
 
 
-def test_token_space_http_and_generation_metadata_preserve_prompt_ids():
+def test_token_space_http_and_generation_metadata_preserve_prompt_ids(monkeypatch):
     from rlinf.hybrid_engines.sglang.common.token_metadata import (
         decode_generation_result,
     )
     from rlinf.utils.http_client import InferenceHTTPClient
 
-    body = InferenceHTTPClient._generate_body(
-        None,
-        [1, 9, 9, 2],
-        {"max_new_tokens": 2},
-        True,
-        [b"image"],
-        True,
-        4,
+    client = InferenceHTTPClient("http://127.0.0.1:1")
+
+    async def capture_request(path, body):
+        assert path == "/generate"
+        return body
+
+    monkeypatch.setattr(client, "_apost", capture_request)
+    body = asyncio.run(
+        client.async_generate(
+            input_ids=[1, 9, 9, 2],
+            sampling_params={"max_new_tokens": 2},
+            return_logprob=True,
+            image_data=[b"image"],
+            return_prompt_token_ids=True,
+            mm_token_expansion_start_len=4,
+        )
     )
     assert body["return_prompt_token_ids"] is True
     assert body["mm_token_expansion_start_len"] == 4

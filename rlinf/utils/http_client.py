@@ -160,11 +160,19 @@ class InferenceHTTPClient:
         sampling_params: Optional[list[dict] | dict] = None,
         return_logprob: list[bool] | bool = False,
         image_data: Optional[list] = None,
+        return_prompt_token_ids: bool = False,
+        mm_token_expansion_start_len: Optional[int] = None,
     ) -> dict | list:
         return await self._apost(
             "/generate",
             self._generate_body(
-                prompt, input_ids, sampling_params, return_logprob, image_data
+                prompt,
+                input_ids,
+                sampling_params,
+                return_logprob,
+                image_data,
+                return_prompt_token_ids,
+                mm_token_expansion_start_len,
             ),
         )
 

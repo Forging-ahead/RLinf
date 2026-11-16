@@ -27,6 +27,12 @@ import torch
 
 SGLANG_TOKEN_SPACE_COMMIT = "18a44326f6de5134fe921927d760d81f8ee48fc9"
 TOKEN_SPACE_FORMAT = "sglang-token-space-v1"
+CACHE_SETTINGS = {
+    "enable_token_space_preprocess_cache": False,
+    "token_space_preprocess_cache_dir": None,
+    "token_space_preprocess_cache_trust_url": False,
+    "token_space_preprocess_cache_check_rate": 0.0,
+}
 
 
 def is_token_space_build() -> bool:
@@ -85,7 +91,15 @@ def processor_settings(server_args: dict) -> dict:
         "disable_fast_image_processor",
         "mm_process_config",
     )
-    return {name: server_args[name] for name in names}
+    settings = {name: server_args[name] for name in names}
+    if server_args.get("enable_token_space_preprocess_cache", False):
+        settings.update(
+            {
+                name: server_args.get(name, default)
+                for name, default in CACHE_SETTINGS.items()
+            }
+        )
+    return settings
 
 
 def tensor_digest(tensor: torch.Tensor) -> str:
@@ -172,6 +186,17 @@ class SGLangTokenSpace:
             image_processor_backend="pil",
             model_name=settings["model_path"],
         )
+        self.fingerprint = self._fingerprint(config, processor, TokenSpaceProcessor)
+        self.cache_directory = None
+        cache = None
+        if settings.get("enable_token_space_preprocess_cache", False):
+            from sglang.srt.multimodal.cache import DiskPreprocessCache
+
+            self.cache_directory = str(
+                Path(settings["token_space_preprocess_cache_dir"]) / self.fingerprint
+            )
+            Path(self.cache_directory).mkdir(mode=0o700, parents=True, exist_ok=True)
+            cache = DiskPreprocessCache(self.cache_directory)
         self.core = TokenSpaceProcessor.for_strategy(strategy)(
             config,
             processor,
@@ -182,10 +207,13 @@ class SGLangTokenSpace:
                 mm_processor_worker_num=0,
                 mm_io_worker_num=1,
             ),
+            item_feature_cache=cache,
+            item_feature_cache_check_rate=settings.get(
+                "token_space_preprocess_cache_check_rate", 0.0
+            ),
         )
         self._close = weakref.finalize(self, self.core.shutdown)
         self.image_id = config.image_token_id
-        self.fingerprint = self._fingerprint(config, processor, TokenSpaceProcessor)
 
     def shutdown(self) -> None:
         """Release the native processor's IO and preprocessing executors."""
@@ -199,7 +227,12 @@ class SGLangTokenSpace:
             source.update(path.read_bytes())
         description = {
             "format": TOKEN_SPACE_FORMAT,
-            "settings": self.settings,
+            # Cache location and checking frequency do not change model inputs.
+            "settings": {
+                key: value
+                for key, value in self.settings.items()
+                if key not in CACHE_SETTINGS
+            },
             "config": config.to_dict(),
             "processor": processor.to_dict(),
             "image_processor": processor.image_processor.to_dict(),
@@ -256,6 +289,8 @@ class SGLangTokenSpace:
             "image_spans": actual_spans,
             "image_grid_thw": output["image_grid_thw"].cpu(),
             "pixel_values_sha256": tensor_digest(output["pixel_values"]),
+            # Learners replay pixels in BF16, independently of processor dtype.
+            "pixel_values_bytes": output["pixel_values"].numel() * 2,
             "mrope_sha256": tensor_digest(output["mrope_positions"]),
         }
 

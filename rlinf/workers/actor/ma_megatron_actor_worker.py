@@ -16,7 +16,7 @@ import copy
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
-from typing import Optional
+from typing import ContextManager, Iterator, Optional
 
 import torch
 import torch.distributed
@@ -62,7 +62,7 @@ from rlinf.utils.metric_utils import (
     VersionedTrajectoryRecord,
     compute_staleness_metrics,
 )
-from rlinf.utils.multimodal import materialize_multimodal_inputs
+from rlinf.utils.multimodal import MultimodalBatchPreparer
 from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
     PlacementMode,
@@ -137,6 +137,21 @@ class MAMegatronActor(MegatronActor):
         loss_scales = self.cfg.algorithm.get("loss_scales", [])
         self.loss_scale_fns = get_loss_scales(loss_scales)
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
+        self.multimodal_preparer = MultimodalBatchPreparer(
+            cfg.rollout.model.model_path,
+            token_space=OmegaConf.select(
+                cfg, "rollout.sglang.enable_token_space_processor", default=False
+            ),
+            cache_bytes=OmegaConf.select(
+                cfg, "tools.rpent.training_image_cache_bytes", default=0
+            ),
+            prefetch_batches=OmegaConf.select(
+                cfg, "tools.rpent.training_image_prefetch_batches", default=0
+            ),
+            prefetch_bytes=OmegaConf.select(
+                cfg, "tools.rpent.training_image_prefetch_bytes", default=0
+            ),
+        )
         # Long agent rows would otherwise materialize vocabulary logits for every
         # history token; this scores only the positions of response tokens.
         self.response_only_logits = self.cfg.actor.get("response_only_logits", False)
@@ -149,18 +164,13 @@ class MAMegatronActor(MegatronActor):
 
     def _forward_multimodal_inputs(self, batch: dict) -> dict[str, torch.Tensor]:
         """Materialize only the rows scored by this forward, in token-marker order."""
-        return materialize_multimodal_inputs(
-            batch.get("multi_modal_inputs") or [],
-            self.cfg.rollout.model.model_path,
-            self.torch_device_type,
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            token_space=OmegaConf.select(
-                self.cfg, "rollout.sglang.enable_token_space_processor", default=False
-            ),
-            cache_bytes=OmegaConf.select(
-                self.cfg, "tools.rpent.training_image_cache_bytes", default=0
-            ),
+        return self.multimodal_preparer.for_forward(batch, self.torch_device_type)
+
+    def data_iterator_context(
+        self, iterator: Iterator[dict]
+    ) -> ContextManager[Iterator[dict]]:
+        return self.multimodal_preparer.iterator_context(
+            self.make_data_iterator_list(iterator)
         )
 
     def _scored_positions(
@@ -453,16 +463,17 @@ class MAMegatronActor(MegatronActor):
                 else self.megatron_forward_backward_record
             )
             forward_backward_record.start()
-        forward_outputs = fwd_bwd_function(
-            forward_step_func=self.get_forward_step_func(),
-            data_iterator=self.make_data_iterator_list(batch_iter),
-            model=self.model,
-            num_microbatches=num_microbatches,
-            forward_only=forward_only,
-            seq_length=total_seqlen,
-            micro_batch_size=1,
-            collect_non_loss_data=forward_only,
-        )
+        with self.data_iterator_context(batch_iter) as data_iterator:
+            forward_outputs = fwd_bwd_function(
+                forward_step_func=self.get_forward_step_func(),
+                data_iterator=data_iterator,
+                model=self.model,
+                num_microbatches=num_microbatches,
+                forward_only=forward_only,
+                seq_length=total_seqlen,
+                micro_batch_size=1,
+                collect_non_loss_data=forward_only,
+            )
         if self.use_profiler:
             forward_backward_record.stop()
             self.profiler.stop(forward_only=forward_only)

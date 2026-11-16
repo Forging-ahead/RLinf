@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import ContextManager, Iterator
+
 import torch
 from megatron.core import parallel_state
 from megatron.training.training import unwrap_model
@@ -30,7 +32,7 @@ from rlinf.utils.distributed import (
     masked_stats,
     normalize_from_stats,
 )
-from rlinf.utils.multimodal import materialize_multimodal_inputs
+from rlinf.utils.multimodal import MultimodalBatchPreparer
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.utils import clear_memory, configure_batch_sizes, cpu_dict
 from rlinf.workers.critic.megatron_critic_worker import MegatronCritic
@@ -50,6 +52,28 @@ class MAMegatronCritic(MegatronCritic):
             "Multi-agent critic requires dynamic rollout batches and synchronous execution."
         )
         self.pack_traj = cfg.actor.get("pack_traj", True)
+        self.multimodal_preparer = MultimodalBatchPreparer(
+            cfg.rollout.model.model_path,
+            token_space=OmegaConf.select(
+                cfg, "rollout.sglang.enable_token_space_processor", default=False
+            ),
+            cache_bytes=OmegaConf.select(
+                cfg, "tools.rpent.training_image_cache_bytes", default=0
+            ),
+            prefetch_batches=OmegaConf.select(
+                cfg, "tools.rpent.training_image_prefetch_batches", default=0
+            ),
+            prefetch_bytes=OmegaConf.select(
+                cfg, "tools.rpent.training_image_prefetch_bytes", default=0
+            ),
+        )
+
+    def data_iterator_context(
+        self, iterator: Iterator[dict]
+    ) -> ContextManager[Iterator[dict]]:
+        return self.multimodal_preparer.iterator_context(
+            self.make_data_iterator_list(iterator)
+        )
 
     def get_batch(
         self, channel: Channel
@@ -77,20 +101,8 @@ class MAMegatronCritic(MegatronCritic):
                 key: val.to(self.torch_device_type) if torch.is_tensor(val) else val
                 for key, val in next(dataloader_iter).items()
             }
-            multimodal_inputs = materialize_multimodal_inputs(
-                batch.get("multi_modal_inputs") or [],
-                self.cfg.rollout.model.model_path,
-                self.torch_device_type,
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                token_space=OmegaConf.select(
-                    self.cfg,
-                    "rollout.sglang.enable_token_space_processor",
-                    default=False,
-                ),
-                cache_bytes=OmegaConf.select(
-                    self.cfg, "tools.rpent.training_image_cache_bytes", default=0
-                ),
+            multimodal_inputs = self.multimodal_preparer.for_forward(
+                batch, self.torch_device_type
             )
             output = self.custom_forward(
                 model,
