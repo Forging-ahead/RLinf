@@ -256,7 +256,6 @@ class SGLangWorker(Worker):
             "token_space_preprocess_cache_dir",
             "token_space_preprocess_cache_trust_url",
             "token_space_preprocess_cache_check_rate",
-            "mm_enable_dp_encoder",
         ):
             if name not in self._cfg_rollout.sglang:
                 continue

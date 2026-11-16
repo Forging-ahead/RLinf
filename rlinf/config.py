@@ -308,8 +308,6 @@ def validate_sglang_multimodal_cfg(cfg: DictConfig) -> None:
             "token_space_preprocess_cache_check_rate must be between 0 and 1, "
             f"got {check_rate!r}."
         )
-    if cfg.get("mm_enable_dp_encoder", False) and serving_mode is not None:
-        raise ValueError("mm_enable_dp_encoder requires the default SGLang worker.")
 
 
 def validate_rollout_cfg(cfg, algorithm_cfg, actor_cfg=None):

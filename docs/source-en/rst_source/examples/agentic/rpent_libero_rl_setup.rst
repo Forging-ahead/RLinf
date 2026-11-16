@@ -120,7 +120,7 @@ Reduce Repeated Image Preprocessing
 
 Token-space mode can share preprocessed images between rollout, actor and critic. The cache contains processed pixels and grid metadata. Each backend still runs its own frozen vision encoder; visual embeddings are not shared.
 
-Shared preprocessing caches, CPU prefetching and visual DP are disabled by default. To enable caching and prefetching, add the following to the deployment profile above. Replace ``<cache-dir>`` with an absolute, job-owned directory that all processes see at the same path.
+Shared preprocessing caches and CPU prefetching are disabled by default. To enable them, add the following to the deployment profile above. Replace ``<cache-dir>`` with the absolute path to a directory reserved for this job. Every process in the job must be able to access the directory at that path.
 
 .. code-block:: yaml
 
@@ -142,8 +142,6 @@ The prefetch settings limit the number and total bytes of prepared microbatches 
 .. warning::
 
    Only trusted processes may write the cache directory: cache reads deserialize Python objects. The native disk cache has no eviction or disk-size limit. Use a job-owned directory with a filesystem quota or external capacity monitoring. Remove it only after all job processes have exited; image files must remain available for checkpoint recovery. A new process rebuilds its CPU prefetch queue from the saved image references.
-
-Set ``rollout.sglang.mm_enable_dp_encoder: true`` to select SGLang's native visual DP encoder for a supported model and TP topology. TP1 has no additional visual parallelism. The Qwen3.5 Megatron weight converter requires rollout TP1, so TP2 visual DP is limited to standalone forward comparisons in this integration. Keep it disabled for the training recipe.
 
 CPU tests cover cache reuse, image integrity, prefetch ordering and thread cleanup. Validate GPU logprobs, training gradients, throughput and training recovery in a new process in the deployment environment. Compare each optimization against the same backend with the option disabled; the separate 96-point cross-backend acceptance limits above still apply.
 
