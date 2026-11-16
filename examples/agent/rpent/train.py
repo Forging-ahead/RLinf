@@ -29,14 +29,15 @@ from rlinf.scheduler import Cluster
 from rlinf.utils.logging import get_logger
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.utils import output_redirector
-from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
-from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 from rlinf.workers.rollout.utils import get_rollout_backend_worker
 
 
 @hydra.main(version_base="1.1")
 @output_redirector
 def main(cfg) -> None:
+    from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
+    from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
+
     cfg = validate_cfg(cfg)
     get_logger().info(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 

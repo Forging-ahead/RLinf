@@ -19,8 +19,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
-import shutil
 import time
 from collections import Counter
 from pathlib import Path
@@ -34,6 +32,7 @@ from rlinf.agents.rpent.history import (
     AppendOnlyHistory,
     request_has_images,
 )
+from rlinf.agents.rpent.launcher import RPentEpisodeLauncher
 from rlinf.agents.rpent.thinking_budget import (
     ThinkingBudget,
     serialized_thinking_processor,
@@ -53,11 +52,6 @@ from rlinf.workers.agent.openai_session_server import (
 )
 
 _RETRY_KINDS = ("env_setup", "process", "model_transport")
-# Exit status of an RPent episode whose environment or shared service did not
-# start (robots.libero.rl_episode.EXIT_SETUP_FAILED).
-_EXIT_SETUP_FAILED = 75
-# A stopped episode process gets this long to release its simulator.
-_STOP_GRACE_S = 60
 # The planner names this model in its requests; each worker serves one policy.
 _MODEL_NAME = "policy"
 # Closes the reasoning the generation prompt opened; the answer follows it.
@@ -123,9 +117,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         for slot in range(rpent.episodes_per_worker):
             index = self._rank + slot
             self._env_slots.put_nowait(rpent.env_gpus[index % len(rpent.env_gpus)])
-        self._env_initializations = asyncio.Semaphore(
-            rpent.get("max_env_initializations_per_worker", 8)
-        )
+        self._episode_launcher = RPentEpisodeLauncher(cfg)
         # Loaded when view_env first returns images.
         self._image_processor = None
         # Episode processes run on this node and reach the endpoint locally.
@@ -185,7 +177,9 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             )
             base_url = self._model_server.open(episode.episode_id, episode)
             try:
-                outcome = await self._run_rpent(episode, base_url, gpu)
+                outcome = await self._episode_launcher.run(
+                    episode, self._planner_options(base_url), gpu
+                )
             finally:
                 error = await self._model_server.close(episode.episode_id)
             if error is not None:
@@ -195,78 +189,6 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             self._env_slots.put_nowait(gpu)
         self._check_planner_done(episode, outcome)
         return self._episode_output(episode, outcome)
-
-    async def _run_rpent(self, episode: Episode, base_url: str, gpu: int) -> dict:
-        """Run the episode's RPent process and return the outcome it wrote."""
-        rpent = self.cfg.tools.rpent
-        output = Path(rpent.output_dir) / episode.episode_id
-        output.mkdir(parents=True)
-        request = {"task": episode.task, "planner": self._planner_options(base_url)}
-        (output / "request.json").write_text(json.dumps(request))
-        command = self._rpent_command(output, gpu)
-        log = output / "episode.log"
-        with log.open("wb") as log_file:
-            await self._env_initializations.acquire()
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=log_file,
-                    stderr=asyncio.subprocess.STDOUT,
-                    env=self._episode_env(gpu),
-                )
-            except BaseException:
-                self._env_initializations.release()
-                raise
-            startup = asyncio.create_task(
-                self._watch_environment_startup(process, output)
-            )
-            try:
-                returncode = await asyncio.wait_for(
-                    process.wait(), rpent.process_timeout_s
-                )
-            except asyncio.TimeoutError:
-                raise RPentEpisodeError(
-                    f"RPent episode {episode.episode_id} ran past "
-                    f"tools.rpent.process_timeout_s; see {log}",
-                    kind="process",
-                ) from None
-            finally:
-                try:
-                    await _stop(process)
-                finally:
-                    startup.cancel()
-                    await asyncio.gather(startup, return_exceptions=True)
-        if returncode == _EXIT_SETUP_FAILED:
-            raise RPentEpisodeError(
-                f"RPent episode {episode.episode_id} did not start; see {log}",
-                kind="env_setup",
-            )
-        if returncode < 0:
-            raise RPentEpisodeError(
-                f"RPent episode {episode.episode_id} was stopped by signal "
-                f"{-returncode}; see {log}",
-                kind="process",
-            )
-        if returncode != 0:
-            raise RuntimeError(
-                f"RPent episode {episode.episode_id} failed with exit status "
-                f"{returncode}; see {log}"
-            )
-        outcome = json.loads((output / "outcome.json").read_text())
-        keep = rpent.keep_episodes == "all" or (
-            rpent.keep_episodes == "failures" and not outcome["success"]
-        )
-        if not keep:
-            shutil.rmtree(output)
-        return outcome
-
-    async def _watch_environment_startup(self, process, output: Path) -> None:
-        """Release a cold-start permit after reset, process exit, or cancellation."""
-        try:
-            while process.returncode is None and not (output / "states.json").is_file():
-                await asyncio.sleep(0.5)
-        finally:
-            self._env_initializations.release()
 
     def _planner_options(self, base_url: str) -> dict:
         """Planner options of an episode whose policy is served at ``base_url``."""
@@ -290,67 +212,6 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         else:
             options["no_images"] = True
         return options
-
-    def _episode_env(self, gpu: int) -> dict[str, str]:
-        """Environment of an episode process assigned to ``gpu``.
-
-        Agent workers hold every GPU, so the worker's own environment names
-        GPU 0 as the render device. The episode process picks its device from
-        ``--cuda-device`` instead, and ``configure_egl_device`` only overrides
-        an inherited value when it is unset, so the inherited one has to go.
-        """
-        env = dict(os.environ)
-        env.pop("MUJOCO_EGL_DEVICE_ID", None)
-        env.pop("EGL_DEVICE_ID", None)
-        config_path = self.cfg.tools.rpent.get("libero_config_path")
-        if config_path is not None:
-            env["LIBERO_CONFIG_PATH"] = str(config_path)
-        return env
-
-    def _rpent_command(self, output: Path, gpu: int) -> list[str]:
-        """Command line of an episode process writing to ``output``."""
-        rpent = self.cfg.tools.rpent
-        workflow = rpent.get("workflow", "libero")
-        command = [
-            rpent.python,
-            "-m",
-            f"robots.{workflow}.rl_episode",
-            "--output-dir",
-            str(output),
-            "--request",
-            str(output / "request.json"),
-        ]
-        if workflow == "libero_rl":
-            command += [
-                "--observation-mode",
-                "adaptive",
-                "--prompt",
-                self.cfg.agentloop.get("prompt", "simple"),
-            ]
-            if rpent.get("sam3_endpoint") is not None:
-                command += ["--sam3-endpoint", rpent.sam3_endpoint]
-            if rpent.get("libero_type") is not None:
-                command += ["--libero-type", rpent.libero_type]
-        else:
-            command += [
-                "--vla-endpoint",
-                rpent.vla_endpoint,
-                "--sam3-endpoint",
-                rpent.sam3_endpoint,
-                "--libero-type",
-                rpent.libero_type,
-            ]
-        command += [
-            "--max-episode-steps",
-            str(rpent.max_episode_steps),
-            "--cuda-device",
-            str(gpu),
-            "--tokenizer-path",
-            self.cfg.rollout.model.model_path,
-        ]
-        if workflow == "libero" and rpent.get("frozen_memory_dir") is not None:
-            command += ["--frozen-memory-dir", rpent.frozen_memory_dir]
-        return command
 
     @staticmethod
     def _check_planner_done(episode: Episode, status: dict) -> None:
@@ -675,15 +536,3 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 message + f"; stop threshold is {_MIN_RETRIED_EPISODES} episodes"
             )
         return metrics
-
-
-async def _stop(process: asyncio.subprocess.Process) -> None:
-    """Stop an episode process, giving it time to release its simulator."""
-    if process.returncode is not None:
-        return
-    process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), _STOP_GRACE_S)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()

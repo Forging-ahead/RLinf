@@ -3,6 +3,10 @@ RPent Multimodal Reinforcement Learning
 
 Train a Qwen3.5-4B planner on LIBERO with RPent and RLinf. RPent executes six end-effector tools and collects observations; RLinf samples model responses and updates the actor and critic. This workflow trains the planner with images and text, while the vision encoder and projector stay frozen.
 
+.. important::
+
+   The default image path preserves sampled tokens and checks image grids and positions. Experimental TokenSpace also checks processor, pixel-value and M-RoPE replay. These checks establish input consistency, not measured SGLang/Megatron logprob parity for either path. TokenSpace is off by default and requires the dependency versions in the installation guide.
+
 Overview
 --------
 
@@ -73,26 +77,50 @@ The task generator writes ``train.jsonl`` and a manifest with task IDs, initial-
 
 The suite/task pair selects the simulator task; use the generator to obtain its actual instruction. Rollouts retain sampled token IDs, behavior logprobs, image inputs, policy versions and the native outcome. Only model-generated response tokens contribute to the policy loss. Tool observations and forced closing tokens have zero loss mask.
 
-Run It
-------
+Configure Deployment Paths
+--------------------------
 
-After setup, launch the SAO example from the head node. The overrides fill the six required paths in the local profile:
+After installation, copy the deployment path template outside the repository:
 
 .. code-block:: bash
 
    source "$STACK_ROOT/envs/rlinf/bin/activate"
    cd "$STACK_ROOT/repos/RLinf"
+   mkdir -p "$STACK_ROOT/config/deployment"
+   cp examples/agent/rpent/config/deployment/paths.yaml "$STACK_ROOT/config/deployment/local.yaml"
+
+Edit ``$STACK_ROOT/config/deployment/local.yaml`` and replace every ``???`` with an absolute path. Set ``data.train_data_paths`` and ``data.val_data_paths`` to YAML lists of training and evaluation JSONL files. Fill the remaining fields with the log directory, RPent interpreter, LIBERO config directory, episode directory and full-model directory. Training, evaluation and resume share this file; command-line overrides still take precedence. Retain it with Hydra's resolved configuration to reproduce the run.
+
+Run One Episode First
+---------------------
+
+This configuration uses two GPUs on one node: GPU 0 serves the model, and GPU 1 handles simulator rendering and SAM3. Complete the installation and asset steps first, but start a single-node Ray cluster with ``RLINF_NODE_RANK=0``. Start SAM3 separately on GPU 1 and set ``tools.rpent.sam3_endpoint`` to its address. This two-GPU configuration has not passed GPU validation; measure its memory requirements before increasing the workload.
+
+Select one fixed evaluation case and cap it at 3 turns, 40 environment steps and 1024 generated tokens per request:
+
+.. code-block:: bash
+
+   "$STACK_ROOT/envs/rpent/bin/python" examples/agent/rpent/prepare_tasks.py \
+     --workflow libero_rl --libero-type standard --libero-config-path "$LIBERO_CONFIG_PATH" \
+     --seeds 0 --split eval --output-dir "$STACK_ROOT/data/libero-rl-eval"
+   head -n 1 "$STACK_ROOT/data/libero-rl-eval/eval.jsonl" > "$STACK_ROOT/data/libero-rl-eval/smoke.jsonl"
+   bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl_smoke \
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     data.val_data_paths="[$STACK_ROOT/data/libero-rl-eval/smoke.jsonl]"
+
+Append ``--cfg job --resolve`` to the ``run_eval.sh`` command to inspect the resolved configuration without loading a model. A completed run writes ``runner.output_dir/rpent-libero-rl-smoke/eval_results.json`` with ``summary.episodes`` equal to 1, and retains requests, outcomes and logs in the episode directory. Inspect tool calls and the native outcome, and confirm the episode subprocess has exited. The task can fail within this budget: the check covers collection and cleanup, not task success, numerical parity or learning.
+
+Run It
+------
+
+After the single-episode check, allocate the three-node placement and start Ray as described in the installation guide, then launch SAO:
+
+.. code-block:: bash
+
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_local \
-     runner.output_dir="$STACK_ROOT/logs/training" \
-     data.train_data_paths="[$STACK_ROOT/data/libero-rl-tasks/train.jsonl]" \
-     tools.rpent.python="$STACK_ROOT/envs/rpent/bin/python" \
-     tools.rpent.libero_config_path="$LIBERO_CONFIG_PATH" \
-     tools.rpent.output_dir="$STACK_ROOT/data/episodes" \
-     rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B"
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local
 
-Hydra overrides follow the config name, for example ``rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B-SFT"``. Append ``--cfg job --resolve`` to inspect the resolved configuration without starting training. Actor/critic checkpoints and logs live under ``runner.output_dir``/the experiment name; episode requests, tool images and results live under ``tools.rpent.output_dir``.
-
-Check finite losses/gradients, nonzero parameter updates, actual replica activity, task success and infrastructure errors. Use Hydra overrides for an isolated short smoke run, rather than maintaining another smoke YAML. A successful short smoke test establishes connectivity and optimizer execution; it does not establish that the longest 262144-token workload fits in memory. Keep failure evidence and diagnose memory limits before changing sharding or budgets.
+For synchronous PPO, use ``train_qwen3.5_4b_libero_rl_ppo`` and adjust placement and batch size for the allocated resources. SAO also changes the algorithm: it uses DIS loss and SAO GAE, updates the critic, recomputes values, then updates the actor. It is more than asynchronous scheduling of PPO. Check finite losses and gradients, parameter updates, weight synchronization and recovery before scaling. A short smoke run does not establish capacity for the full 262144-token workload.
 
 Visualization and Results
 -------------------------
@@ -108,10 +136,16 @@ Visualization and Results
      - Finite losses/gradients, nonzero parameter updates, successful weight synchronization and checkpoint recovery on the deployed revision.
    * - Task results
      - ``rpent/success_rate`` reports rollout outcomes. Report native successes / completed cases and infrastructure failures separately; use matched independent evaluation to measure learning.
-   * - Validation boundary
-     - CPU component tests cover trajectory/mask/packing contracts. Real SGLang/Megatron numerical parity, complete updates and recovery must be validated on the target stack. No independent evaluation establishes a learning gain for this branch.
+   * - CPU component regression
+     - Covers prefixes, masks, trajectory merging, Gloo data exchange, process cleanup and config composition. Tests skipped for missing Megatron/SGLang dependencies do not count as passes.
+   * - Real GPU numerical checks
+     - Not accepted. Validate the default and TokenSpace paths separately on the fixed 96 points (mean ≤ 0.03, max ≤ 0.10), multi-turn images and M-RoPE. Recomputing logprobs or using TIS does not eliminate native logprob error.
+   * - Checkpoint and recovery
+     - Full training acceptance is pending for this branch. Verify both optimizers, post-update weight synchronization and fresh-process resume; SAO also needs buffer/pending-state and policy-version checks.
+   * - Independent evaluation
+     - No result establishes a learning gain. Compare native success before and after training with matched tasks, initial states and budgets.
 
-Also inspect ``rpent/turns`` and ``rpent/infra_retry_rate``. The template sets ``agentloop.max_infra_retry_rate=1.0`` to accept recovered retries; exhausted per-episode retries still fail. Historical forced-closure numerical probes did not meet the diagnostic tolerance and do not establish deployment correctness.
+Also inspect ``rpent/turns`` and ``rpent/infra_retry_rate``. The template sets ``agentloop.max_infra_retry_rate=1.0`` to accept recovered retries; exhausted per-episode retries still fail. Earlier numerical checks with forced closing tokens exceeded the diagnostic tolerance and do not validate this deployment.
 
 Resume and Evaluate
 -------------------
@@ -132,11 +166,6 @@ The export needs the same full VLM used to initialize training, because it retai
 
 .. code-block:: bash
 
-   # Generate the same fixed cases once, using the simulator environment.
-   "$STACK_ROOT/envs/rpent/bin/python" examples/agent/rpent/prepare_tasks.py \
-     --workflow libero_rl --libero-type standard --libero-config-path "$LIBERO_CONFIG_PATH" \
-     --seeds 0 --split eval --output-dir "$STACK_ROOT/data/libero-rl-eval"
-
    # Export a completed checkpoint into a new full-model directory.
    python examples/agent/rpent/checkpoint.py export \
      --checkpoint /path/to/checkpoints/global_step_5 \
@@ -144,12 +173,10 @@ The export needs the same full VLM used to initialize training, because it retai
      --output "$STACK_ROOT/models/policy-step5"
 
    bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl \
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
      runner.output_dir="$STACK_ROOT/logs/eval-step5" \
-     data.val_data_paths="[$STACK_ROOT/data/libero-rl-eval/eval.jsonl]" \
      rollout.model.model_path="$STACK_ROOT/models/policy-step5" \
-     tools.rpent.python="$STACK_ROOT/envs/rpent/bin/python" \
-     tools.rpent.output_dir="$STACK_ROOT/data/eval-episodes-step5" \
-     tools.rpent.libero_config_path="$LIBERO_CONFIG_PATH"
+     tools.rpent.output_dir="$STACK_ROOT/data/eval-episodes-step5"
 
 Run the same evaluation again for the starting model by changing only the model and output paths. Keep the manifest, task/initial-state IDs, prompt, sampling, turn/action budgets and compaction fixed. Report native success with numerator/denominator, turn-budget exhaustion and infrastructure failures separately. Training completion-queue success is not independent evaluation, and a fixed 40-case panel alone cannot establish a small learning gain.
 

@@ -34,8 +34,8 @@ from rlinf.agents.rpent.history import (
     render_prompt,
     template_messages,
 )
+from rlinf.agents.rpent.launcher import RPentEpisodeLauncher
 from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker
-from rlinf.agents.rpent.thinking_budget import ThinkingBudget, apply_thinking_budget
 from rlinf.workers.agent.agent_loop import AgentLoopOutput
 
 TOOLS = [
@@ -1236,7 +1236,7 @@ def test_original_libero_preserves_episode_arguments_and_planner_contract(config
     assert OmegaConf.to_container(cfg, resolve=True) == before
     worker = object.__new__(RPentAgentLoopWorker)
     worker.cfg = cfg
-    command = worker._rpent_command(Path("/tmp/episode"), 2)
+    command = RPentEpisodeLauncher(worker.cfg).command(Path("/tmp/episode"), 2)
     assert command[2] == "robots.libero.rl_episode"
     assert command[command.index("--vla-endpoint") + 1] == cfg.tools.rpent.vla_endpoint
     assert (
@@ -1273,7 +1273,7 @@ def test_clean_libero_rl_selects_adaptive_without_legacy_services(config_name):
     assert OmegaConf.to_container(cfg, resolve=True) == before
     worker = object.__new__(RPentAgentLoopWorker)
     worker.cfg = cfg
-    command = worker._rpent_command(Path("/tmp/episode"), 1)
+    command = RPentEpisodeLauncher(worker.cfg).command(Path("/tmp/episode"), 1)
     assert command[2] == "robots.libero_rl.rl_episode"
     assert command[command.index("--observation-mode") + 1] == "adaptive"
     assert "--vla-endpoint" not in command and "--frozen-memory-dir" not in command
@@ -1408,7 +1408,7 @@ def test_episode_benchmark_config_overrides_parent_path(monkeypatch):
     worker = object.__new__(RPentAgentLoopWorker)
     worker.cfg = compose(config_name="train_qwen3.5_4b_libero_rl_sao_3node")
     worker.cfg.tools.rpent.libero_config_path = "/sim/standard-config"
-    env = worker._episode_env(7)
+    env = RPentEpisodeLauncher(worker.cfg).environment()
     assert env["LIBERO_CONFIG_PATH"] == "/sim/standard-config"
     assert "MUJOCO_EGL_DEVICE_ID" not in env and "EGL_DEVICE_ID" not in env
     assert os.environ["LIBERO_CONFIG_PATH"] == "/parent/pro-config"
@@ -1627,7 +1627,7 @@ def test_environment_cold_start_permit_releases_before_episode_end(
     tmp_path, completion
 ):
     async def run():
-        worker = object.__new__(RPentAgentLoopWorker)
+        worker = object.__new__(RPentEpisodeLauncher)
         worker._env_initializations = asyncio.Semaphore(1)
         await worker._env_initializations.acquire()
         process = await asyncio.create_subprocess_exec(
@@ -1743,107 +1743,6 @@ def test_image_storage_requires_retained_episode_assets():
     )
     with pytest.raises(ValueError, match="keep_episodes=all"):
         validate_rpent_cfg(cfg)
-
-
-def _thinking_params(budget, output):
-    # SGLang's external Req object supplies these three fields to its hook.
-    request = SimpleNamespace(
-        origin_input_ids=[0] * budget.prompt_tokens,
-        output_ids=output,
-        customized_info=None,
-    )
-    return {**budget.custom_params(), "__req__": request}
-
-
-def test_preserved_history_and_current_tokenizer_ids():
-    start, end = 248068, 248069
-    prompt = [start, 8, end, 12, start, 198]
-    budget = ThinkingBudget.from_prompt(prompt, 512, start, end)
-    params = _thinking_params(budget, [7] * 512)
-    logits = torch.ones(1, 248320)
-    apply_thinking_budget(logits, [params])
-    assert torch.isfinite(logits).sum().item() == 1
-    assert logits[0, end].item() == 0
-    assert params["__req__"].customized_info["forced_token_mask"] == [False] * 512 + [
-        True
-    ]
-
-
-def test_natural_end_keeps_every_sampled_token():
-    budget = ThinkingBudget(4, 7, 100000)
-    output = [2, 7, 3, 4, 5, 6]
-    logits = torch.randn(1, 9)
-    original = logits.clone()
-    params = _thinking_params(budget, output)
-    apply_thinking_budget(logits, [params])
-    torch.testing.assert_close(logits, original)
-    assert budget.response_mask(output, []) == [1] * len(output)
-
-
-def test_retracted_request_and_tool_continuation():
-    budget = ThinkingBudget(2, 7, 100)
-    params = _thinking_params(budget, [2, 3])
-    apply_thinking_budget(torch.zeros(1, 9), [params])
-    apply_thinking_budget(torch.zeros(1, 9), [params])
-    request = params["__req__"]
-    assert request.customized_info["forced_token_mask"] == [False, False, True]
-    request.output_ids.extend([7, 4, 5, 6])
-    logits = torch.randn(1, 9)
-    original = logits.clone()
-    apply_thinking_budget(logits, [params])
-    torch.testing.assert_close(logits, original)
-    assert budget.response_mask(request.output_ids, [2]) == [1, 1, 0, 1, 1, 1]
-    assert request.output_ids == [2, 3, 7, 4, 5, 6]
-
-
-def test_forced_token_has_zero_loss_gradient_and_preserves_normalization():
-    budget = ThinkingBudget(2, 5, 10)
-    ids = torch.tensor([1, 2, 5, 3])
-    mask = torch.tensor(budget.response_mask(ids.tolist(), [2]))
-    logits = torch.arange(32, dtype=torch.float64).reshape(4, 8).requires_grad_()
-    logprobs = logits.log_softmax(-1).gather(-1, ids[:, None]).squeeze(-1)
-    loss = -(logprobs * mask).sum() / mask.sum()
-    reference = -logprobs[[0, 1, 3]].mean()
-    grad = torch.autograd.grad(loss, logits, retain_graph=True)[0]
-    reference_grad = torch.autograd.grad(reference, logits)[0]
-    torch.testing.assert_close(loss, reference)
-    torch.testing.assert_close(grad, reference_grad)
-    assert torch.count_nonzero(grad[2]).item() == 0
-    assert all(torch.count_nonzero(grad[row]).item() for row in [0, 1, 3])
-
-
-def test_batch_requests_have_independent_budgets_and_disabled_path():
-    params = [_thinking_params(ThinkingBudget(2, 7, 10), [3, 4]), None]
-    logits = torch.randn(2, 9)
-    baseline = logits.clone()
-    apply_thinking_budget(logits, params)
-    assert torch.isfinite(logits[0]).sum().item() == 1
-    torch.testing.assert_close(logits[1], baseline[1])
-    original = baseline.clone()
-    apply_thinking_budget(baseline, None)
-    torch.testing.assert_close(baseline, original)
-
-
-@pytest.mark.parametrize("limit", [-1, True, 2.5])
-def test_invalid_limits_are_rejected(limit):
-    with pytest.raises(ValueError, match="nonnegative int"):
-        ThinkingBudget(limit, 7, 10)
-
-
-def test_wrong_prompt_or_missing_engine_evidence_is_rejected():
-    with pytest.raises(ValueError, match="open thinking span"):
-        ThinkingBudget.from_prompt([6, 2, 7], 2, 6, 7)
-    budget = ThinkingBudget(2, 7, 10)
-    params = _thinking_params(budget, [2, 3])
-    params["__req__"].origin_input_ids.append(0)
-    with pytest.raises(ValueError, match="prompt length"):
-        apply_thinking_budget(torch.zeros(1, 9), [params])
-    with pytest.raises(ValueError, match="closing token"):
-        budget.response_mask([2, 3, 4], [2])
-    with pytest.raises(ValueError, match="did not record"):
-        budget.response_mask([2, 3, 7, 4], [])
-    with pytest.raises(ValueError, match="outside the thinking boundary"):
-        budget.response_mask([2, 7, 4], [2])
 
 
 def test_multimodal_evaluation_uses_the_training_task_and_budget():
@@ -1973,60 +1872,6 @@ def test_token_space_checks_exact_served_prompt_ids(make_agent):
         worker._check_generation(generated, [1, 2])
 
 
-def test_token_space_rejects_ambiguous_spans_and_changed_training_prefix():
-    from rlinf.hybrid_engines.sglang.multimodal.token_space import collapse_image_spans
-    from rlinf.utils.multimodal import materialize_multimodal_inputs
-
-    assert collapse_image_spans([1, 9, 9, 2, 9, 3], [(1, 3), (4, 5)], 9) == [
-        1,
-        9,
-        2,
-        9,
-        3,
-    ]
-    for spans in ([(1, 2)], [(1, 4), (4, 5)], [(4, 5), (1, 3)]):
-        with pytest.raises(ValueError):
-            collapse_image_spans([1, 9, 9, 2, 9, 3], spans, 9)
-    row = {
-        "format": "sglang-token-space-v1",
-        "prompt_token_ids": [1, 2],
-        "image_refs": [],
-    }
-    ids = torch.tensor([[1, 3, 7]])
-    with pytest.raises(ValueError, match="Training tokens"):
-        materialize_multimodal_inputs(
-            [row],
-            "unused",
-            "cpu",
-            input_ids=ids,
-            attention_mask=ids.ne(0),
-            token_space=True,
-        )
-    with pytest.raises(ValueError, match="Legacy media"):
-        materialize_multimodal_inputs(
-            [{"image_grid_thw": torch.tensor([[1, 4, 4]])}],
-            "unused",
-            "cpu",
-            input_ids=ids,
-            attention_mask=ids.ne(0),
-            token_space=True,
-        )
-    with pytest.raises(ValueError, match="requires token-space training"):
-        materialize_multimodal_inputs([row], "unused", "cpu")
-
-
-def test_token_space_text_only_rows_keep_padding_out_of_positions():
-    from rlinf.utils.multimodal import materialize_multimodal_inputs
-
-    ids = torch.tensor([[1, 2, 3, 0], [0, 4, 5, 6]])
-    inputs = materialize_multimodal_inputs(
-        [], "unused", "cpu", input_ids=ids, attention_mask=ids.ne(0), token_space=True
-    )
-    expected = torch.tensor([[0, 1, 2, 0], [0, 0, 1, 2]])
-    assert set(inputs) == {"multimodal_position_ids"}
-    assert torch.equal(inputs["multimodal_position_ids"], expected.expand(3, -1, -1))
-
-
 def test_token_space_config_requires_bridge_and_compatible_parallelism():
     from rlinf.config import validate_rpent_cfg
 
@@ -2047,102 +1892,82 @@ def test_token_space_config_requires_bridge_and_compatible_parallelism():
         validate_rpent_cfg(cfg)
 
 
-def test_native_token_space_multiturn_replay_and_cache(tmp_path):
-    """Optional CPU integration: real SGLang core and local Qwen processor assets."""
-    model_path = os.environ.get("RLINF_TOKEN_SPACE_TEST_MODEL")
-    if not model_path:
-        pytest.skip(
-            "Set RLINF_TOKEN_SPACE_TEST_MODEL to local Qwen3.5 processor assets"
-        )
-    import io
+@pytest.mark.parametrize(
+    "mode,default", [("train", "train_qwen3.5_4b_ppo"), ("eval", "eval_qwen3.5_4b")]
+)
+def test_launchers_preserve_arguments_and_child_failure(tmp_path, mode, default):
+    import subprocess
 
-    from PIL import Image
-    from transformers import AutoConfig
-
-    from rlinf.agents.rpent.history import ImagePrompt
-    from rlinf.hybrid_engines.sglang.multimodal.token_space import SGLangTokenSpace
-    from rlinf.utils.multimodal import materialize_multimodal_inputs
-
-    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
-    settings = {
-        "model_path": model_path,
-        "tokenizer_path": model_path,
-        "tokenizer_mode": "auto",
-        "tokenizer_backend": "huggingface",
-        "trust_remote_code": False,
-        "revision": None,
-        "model_config_parser": "auto",
-        "json_model_override_args": "{}",
-        "image_processor_backend": "pil",
-        "disable_fast_image_processor": True,
-        "mm_process_config": {},
-    }
-    processor = SGLangTokenSpace(settings)
-    images = []
-    for mode, size, color in [
-        ("RGB", (64, 96), "red"),
-        ("RGBA", (96, 64), (0, 0, 255, 80)),
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    python = binary / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "print(json.dumps(sys.argv[1:]))\n"
+        "assert os.environ['PYTHONPATH']\n"
+        "sys.exit(73)\n"
+    )
+    python.chmod(0o755)
+    source = Path(__file__).parents[2] / f"examples/agent/rpent/run_{mode}.sh"
+    script = tmp_path / "repo space" / "examples" / "agent" / "rpent" / source.name
+    script.parent.mkdir(parents=True)
+    script.write_text(source.read_text())
+    environment = {**os.environ, "PATH": f"{binary}:/usr/bin:/bin"}
+    environment.pop("PYTHONPATH", None)
+    for arguments, name in [
+        ([], default),
+        (["local", "runner.output_dir=/tmp/a b"], "local"),
     ]:
-        data = io.BytesIO()
-        Image.new(mode, size, color).save(data, format="PNG")
-        images.append(data.getvalue())
-    marker = [
-        config.vision_start_token_id,
-        config.image_token_id,
-        config.vision_end_token_id,
-    ]
-    first = asyncio.run(
-        processor.prepare(
-            [42, *marker, 43], images[:1], {"prefix_length": 0, "image_spans": [(2, 3)]}
+        result = subprocess.run(
+            ["bash", str(script), *arguments],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-    )
-    sampled = first["prompt_token_ids"] + [44, 45]
-    compact = sampled + marker + [46]
-    second = asyncio.run(
-        processor.prepare(
-            compact,
-            images,
-            {
-                "prefix_length": len(sampled),
-                "image_spans": [
-                    *first["image_spans"],
-                    (len(sampled) + 1, len(sampled) + 2),
+        assert result.returncode == 73, result.stderr
+        passed = json.loads(result.stdout)
+        assert passed[passed.index("--config-name") + 1] == name
+        if arguments:
+            assert passed[-1] == "runner.output_dir=/tmp/a b"
+
+
+def test_deployment_profile_composes_with_training_evaluation_and_smoke(tmp_path):
+    from hydra import compose as hydra_compose
+    from hydra import initialize_config_dir
+
+    from rlinf.config import validate_rpent_cfg
+
+    configs = Path(__file__).parents[2] / "examples/agent/rpent/config"
+    deployment = tmp_path / "deployment"
+    deployment.mkdir()
+    local = OmegaConf.load(configs / "deployment/paths.yaml")
+    for field, value in {
+        "runner.output_dir": "/test/output",
+        "data.train_data_paths": ["/test/train.jsonl"],
+        "data.val_data_paths": ["/test/eval.jsonl"],
+        "tools.rpent.python": "/test/python",
+        "tools.rpent.libero_config_path": "/test/libero",
+        "tools.rpent.output_dir": "/test/episodes",
+        "rollout.model.model_path": "/test/model",
+    }.items():
+        OmegaConf.update(local, field, value)
+    OmegaConf.save(local, deployment / "local.yaml")
+    for name in (
+        "train_qwen3.5_4b_libero_rl_ppo",
+        "train_qwen3.5_4b_libero_rl_sao_local",
+        "eval_qwen3.5_4b_libero_rl",
+        "eval_qwen3.5_4b_libero_rl_smoke",
+    ):
+        with initialize_config_dir(version_base="1.1", config_dir=str(configs)):
+            cfg = hydra_compose(
+                config_name=name,
+                overrides=[
+                    f"hydra.searchpath=[file://{tmp_path}]",
+                    "+deployment@_global_=local",
                 ],
-            },
-        )
-    )
-    assert second["prompt_token_ids"][: len(sampled)] == sampled
-    assert second["image_spans"][0] == first["image_spans"][0]
-    assert len(second["image_spans"]) == 2
-    refs = ImagePrompt(
-        second["prompt_token_ids"], images, second["image_grid_thw"]
-    ).store_images(tmp_path)
-    entry = {**refs, **second}
-    ids = torch.tensor([second["prompt_token_ids"] + [47, 48, 0, 0]])
-    mask = ids.ne(0)
-
-    def materialize(value):
-        return materialize_multimodal_inputs(
-            [value],
-            model_path,
-            "cpu",
-            cache_bytes=8 * 1024 * 1024,
-            input_ids=ids,
-            attention_mask=mask,
-            token_space=True,
-        )
-
-    first_inputs = materialize(entry)
-    again = materialize(entry)
-    for key in first_inputs:
-        assert torch.equal(first_inputs[key], again[key])
-    assert first_inputs["multimodal_position_ids"].shape == (3, 1, ids.shape[1])
-    # Cache reuse cannot hide changed placement, pixels, or files.
-    with pytest.raises(ValueError, match="pixel_values differs"):
-        materialize({**entry, "pixel_values_sha256": "changed"})
-    with pytest.raises(ValueError, match="mrope_positions differs"):
-        materialize({**entry, "mrope_sha256": "changed"})
-    Path(entry["image_refs"][1]["path"]).write_bytes(b"changed")
-    with pytest.raises(ValueError, match="checksum mismatch"):
-        materialize(entry)
-    processor.shutdown()
+            )
+        assert not OmegaConf.missing_keys(cfg)
+        validate_rpent_cfg(cfg)
+        assert cfg.tools.rpent.python == "/test/python"

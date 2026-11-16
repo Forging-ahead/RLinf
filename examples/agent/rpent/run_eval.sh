@@ -1,13 +1,11 @@
 #! /bin/bash
-set -x
-
-tabs 4
+set -euo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TOKENIZERS_PARALLELISM=false
 export RAY_DEDUP_LOGS=0
 
 CONFIG_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-REPO_PATH=$(dirname $(dirname $(dirname "$CONFIG_PATH")))
+REPO_PATH="$(cd "$CONFIG_PATH/../../.." && pwd)"
 if [ -z "${MEGATRON_PATH:-}" ]; then
     if [ -d "${VIRTUAL_ENV:-/opt/venv/reason}/Megatron-LM" ]; then
         MEGATRON_PATH="${VIRTUAL_ENV:-/opt/venv/reason}/Megatron-LM"
@@ -15,13 +13,13 @@ if [ -z "${MEGATRON_PATH:-}" ]; then
         MEGATRON_PATH=/opt/Megatron-LM
     fi
 fi
-export PYTHONPATH=${REPO_PATH}:${MEGATRON_PATH}:${REPO_PATH}/examples:$PYTHONPATH
+export PYTHONPATH=${REPO_PATH}:${MEGATRON_PATH}:${REPO_PATH}/examples${PYTHONPATH:+:$PYTHONPATH}
 
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     CONFIG_NAME="eval_qwen3.5_4b"
 else
     CONFIG_NAME=$1
     shift
 fi
 
-exec python ${REPO_PATH}/examples/agent/rpent/eval.py --config-path ${CONFIG_PATH}/config/  --config-name "$CONFIG_NAME" "$@"
+exec python "${REPO_PATH}/examples/agent/rpent/eval.py" --config-path "${CONFIG_PATH}/config/"  --config-name "$CONFIG_NAME" "$@"

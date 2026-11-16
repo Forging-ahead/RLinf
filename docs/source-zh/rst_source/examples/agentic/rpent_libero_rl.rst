@@ -3,6 +3,10 @@ RPent 多模态强化学习
 
 本示例用 RLinf 训练 Qwen3.5-4B 规划器，通过 RPent 在 LIBERO 中执行六种末端控制工具。规划器接收图像和文字，生成工具调用；RLinf 负责采样与 Actor/Critic 更新。训练更新语言参数，冻结视觉编码器和 projector。
 
+.. important::
+
+   默认图像路径保留采样 token，并校验图像网格与位置；实验 TokenSpace 路径还校验 processor、pixel values 和 M-RoPE 重放。这些是输入一致性检查，两条路径都不能据此宣称真实 SGLang/Megatron logprob 已通过数值验收。TokenSpace 默认关闭，依赖版本见安装页。
+
 概述
 ----
 
@@ -35,7 +39,7 @@ RPent 多模态强化学习
      - 范围
    * - 本页：``libero_rl``
      - 标准 LIBERO 的 40 个任务；seed 1–32 用于训练，seed 0 用于评测。划分的是同一组任务的初始状态。
-   * - :doc:`原版 Planner PPO <rpent>`
+   * - :doc:`Pi0.5 Planner PPO <rpent>`
      - LIBERO-PRO、Pi0.5、任务记忆和文本观测。使用该页面的配置与安装说明。
 
 观测与动作
@@ -73,24 +77,50 @@ RPent 多模态强化学习
 
 ``suite`` 和 ``task`` 指定模拟器任务；实际指令由生成器读取。Rollout 保留采样 token ID、behavior logprob、图像、policy 版本与原生结果。Policy loss 只覆盖模型生成的回复 token；工具观测和强制闭合 token 的 loss mask 为 0。
 
-运行训练
---------
+填写部署路径
+------------
 
-安装完成后，在 head 节点运行下方 SAO 示例。六个覆盖参数填写 local 配置的必填路径：
+安装后，将部署路径模板复制到仓库外：
 
 .. code-block:: bash
 
    source "$STACK_ROOT/envs/rlinf/bin/activate"
    cd "$STACK_ROOT/repos/RLinf"
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_local \
-     runner.output_dir="$STACK_ROOT/logs/training" \
-     data.train_data_paths="[$STACK_ROOT/data/libero-rl-tasks/train.jsonl]" \
-     tools.rpent.python="$STACK_ROOT/envs/rpent/bin/python" \
-     tools.rpent.libero_config_path="$LIBERO_CONFIG_PATH" \
-     tools.rpent.output_dir="$STACK_ROOT/data/episodes" \
-     rollout.model.model_path="$STACK_ROOT/models/Qwen3.5-4B"
+   mkdir -p "$STACK_ROOT/config/deployment"
+   cp examples/agent/rpent/config/deployment/paths.yaml "$STACK_ROOT/config/deployment/local.yaml"
 
-末尾添加 ``--cfg job --resolve`` 可检查最终配置而不启动训练。先用 Hydra 覆盖参数缩小预算，验证 loss/梯度、参数更新、权重同步与基础设施错误。短 smoke 通过不代表最长 262144-token 工作负载能放入显存。
+编辑 ``$STACK_ROOT/config/deployment/local.yaml``，把每个 ``???`` 替换为实际绝对路径。``data.train_data_paths`` 和 ``data.val_data_paths`` 填 YAML 列表，分别指向训练与评测 JSONL；其余字段填写日志目录、RPent 解释器、LIBERO 配置目录、episode 目录和完整模型目录。训练、评测和恢复共用这个文件，命令末尾仍可覆盖单次运行的值。保留该文件和 Hydra 输出的最终配置，便于复现运行参数。
+
+先运行一个 Episode
+------------------
+
+这个配置在单台机器上使用两张 GPU：GPU 0 部署模型，GPU 1 负责仿真渲染和 SAM3。先按安装页完成依赖和资源准备，但只启动单节点 Ray（``RLINF_NODE_RANK=0``）；另行在 GPU 1 上启动 SAM3，并将服务地址填入 ``tools.rpent.sam3_endpoint``。两卡配置尚未经 GPU 验收，显存需求以实测为准。
+
+从固定评测集取一条任务，限制为 3 轮、40 个环境 step、每次最多生成 1024 个 token：
+
+.. code-block:: bash
+
+   "$STACK_ROOT/envs/rpent/bin/python" examples/agent/rpent/prepare_tasks.py \
+     --workflow libero_rl --libero-type standard --libero-config-path "$LIBERO_CONFIG_PATH" \
+     --seeds 0 --split eval --output-dir "$STACK_ROOT/data/libero-rl-eval"
+   head -n 1 "$STACK_ROOT/data/libero-rl-eval/eval.jsonl" > "$STACK_ROOT/data/libero-rl-eval/smoke.jsonl"
+   bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl_smoke \
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     data.val_data_paths="[$STACK_ROOT/data/libero-rl-eval/smoke.jsonl]"
+
+启动前可在 ``run_eval.sh`` 命令末尾添加 ``--cfg job --resolve``，检查最终配置而不加载模型。运行后应生成 ``runner.output_dir/rpent-libero-rl-smoke/eval_results.json``，其中 ``summary.episodes`` 为 1；episode 目录保留请求、结果和日志。检查工具调用及原生终态，并确认 episode 子进程已退出。任务可能因预算耗尽而失败。这项检查只验证轨迹采集和进程清理，不验证任务成功、训练与推理的数值一致性或学习收益。
+
+运行训练
+--------
+
+完成单任务检查后，按安装页分配三节点资源并启动 Ray，再运行 SAO：
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_local \
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local
+
+同步 PPO 使用 ``train_qwen3.5_4b_libero_rl_ppo``，并按实际资源覆盖 placement 与 batch。SAO 除了异步采集，还使用 DIS loss、SAO GAE，并先更新 Critic、重算 value 再更新 Actor；它不只是同步 PPO 的调度变体。训练前先验证有限 loss/梯度、实际参数更新、权重同步与恢复。短 smoke 不能证明最长 262144-token 工作负载能放入显存。
 
 结果与验证
 ----------
@@ -106,10 +136,16 @@ RPent 多模态强化学习
      - 在部署版本上确认 loss/梯度有限、参数确实更新、权重同步正常，以及 checkpoint 可以恢复。
    * - 任务结果
      - ``rpent/success_rate`` 反映训练 rollout 结果。分别报告原生成功数／完成数与基础设施失败；学习收益需用同条件独立评测衡量。
-   * - 验证范围
-     - CPU 组件测试覆盖轨迹、mask 和 packing。真实 SGLang/Megatron 数值一致性、完整更新与恢复仍需在目标环境验证。本分支尚无证明学习收益的独立评测。
+   * - CPU 组件回归
+     - 覆盖前缀、mask、轨迹合并、Gloo 数据交换、进程清理和配置组合；未安装 Megatron/SGLang 的测试会跳过，不能计为通过。
+   * - 真实 GPU 数值
+     - 未验收。默认与 TokenSpace 路径须分别验证固定 96 点（mean ≤ 0.03、max ≤ 0.10）、多轮图像及 M-RoPE。重算或 TIS 不等于消除原生 logprob 误差。
+   * - Checkpoint 与恢复
+     - 未完成本分支真实训练验收。须验证两套优化器、更新后权重同步及新进程恢复；SAO 还须核对 buffered/pending 状态与 policy 版本。
+   * - 独立效果评测
+     - 尚无证明学习收益的结果。比较相同任务、初始状态与预算下训练前后的原生成功率。
 
-同时查看 ``rpent/turns`` 和 ``rpent/infra_retry_rate``。模板设置 ``agentloop.max_infra_retry_rate=1.0``，允许已恢复的重试继续训练；单局重试耗尽仍报错。历史强制闭合数值探针未达到诊断容差，不能作为部署验收证据。
+同时查看 ``rpent/turns`` 和 ``rpent/infra_retry_rate``。模板设置 ``agentloop.max_infra_retry_rate=1.0``，允许已恢复的重试继续训练；单局重试耗尽仍报错。此前针对强制闭合 token 的数值检查超出诊断容差，不能作为本部署的验证依据。
 
 恢复与评测
 ----------
@@ -130,11 +166,6 @@ RPent 多模态强化学习
 
 .. code-block:: bash
 
-   # Generate the same fixed cases once, using the simulator environment.
-   "$STACK_ROOT/envs/rpent/bin/python" examples/agent/rpent/prepare_tasks.py \
-     --workflow libero_rl --libero-type standard --libero-config-path "$LIBERO_CONFIG_PATH" \
-     --seeds 0 --split eval --output-dir "$STACK_ROOT/data/libero-rl-eval"
-
    # Export a completed checkpoint into a new full-model directory.
    python examples/agent/rpent/checkpoint.py export \
      --checkpoint /path/to/checkpoints/global_step_5 \
@@ -142,12 +173,10 @@ RPent 多模态强化学习
      --output "$STACK_ROOT/models/policy-step5"
 
    bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl \
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
      runner.output_dir="$STACK_ROOT/logs/eval-step5" \
-     data.val_data_paths="[$STACK_ROOT/data/libero-rl-eval/eval.jsonl]" \
      rollout.model.model_path="$STACK_ROOT/models/policy-step5" \
-     tools.rpent.python="$STACK_ROOT/envs/rpent/bin/python" \
-     tools.rpent.output_dir="$STACK_ROOT/data/eval-episodes-step5" \
-     tools.rpent.libero_config_path="$LIBERO_CONFIG_PATH"
+     tools.rpent.output_dir="$STACK_ROOT/data/eval-episodes-step5"
 
 评测初始模型时，只改变模型与输出路径，复用同一份 manifest、任务/初态 ID、prompt、采样参数、轮数/动作预算及压缩设置。分别报告原生成功数/总数、轮数耗尽和基础设施失败。训练完成队列的成功率不是独立评测；固定 40 条 case 也不足以确认很小的学习增益。
 
