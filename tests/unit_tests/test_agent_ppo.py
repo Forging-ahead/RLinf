@@ -16,6 +16,7 @@
 
 import asyncio
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -395,3 +396,158 @@ def test_qwen35_convertor_preserves_bf16_gdn_norm_offset():
         atol=0,
     )
     assert torch.equal(centered, original)
+
+
+@pytest.mark.parametrize("truncate", [True, False])
+@pytest.mark.parametrize("budget", [12, 100])
+@pytest.mark.parametrize("return_logprobs", [True, False])
+def test_searchr1_response_processing_preserves_behavior_tokens(
+    truncate, budget, return_logprobs
+):
+    from rlinf.agents.searchr1.searchr1_agent_loop import Searchr1AgentLoopWorker
+    from rlinf.agents.tokenization import get_agentic_tokenizer
+
+    class Tokenizer:
+        def decode(self, ids):
+            return "".join(map(chr, ids))
+
+        def encode(self, text):
+            raise AssertionError("Generated tokens must not be re-encoded.")
+
+    class AsyncChannel:
+        # Replace only the Ray transport; retain the real request/response path.
+        def __init__(self):
+            self.queue = asyncio.Queue()
+
+        def put(self, value, key=None, async_op=False):
+            return SimpleNamespace(async_wait=lambda: self.queue.put(value))
+
+        def get(self, key=None, async_op=False):
+            return SimpleNamespace(async_wait=self.queue.get)
+
+    worker = object.__new__(Searchr1AgentLoopWorker)
+    worker.cfg = SimpleNamespace(agentloop=SimpleNamespace(max_turns=2))
+    worker.max_resp_len = budget
+    worker.truncate_response = truncate
+    worker.return_logprobs = return_logprobs
+    worker.tokenizer = Tokenizer()
+    worker.agentic_tokenizer = get_agentic_tokenizer(worker.tokenizer, "default")
+    worker.generate_input_channel = AsyncChannel()
+    worker.generate_output_channel = AsyncChannel()
+    ids = list(map(ord, "<search>x</search>\n"))
+    logprobs = [-0.01 * (i + 1) for i in range(len(ids))]
+    context = {"turn": 0, "all_llm_response_ids": []}
+
+    async def engine():
+        request = await worker.generate_input_channel.get(async_op=True).async_wait()
+        assert request["sampling_params"]["max_new_tokens"] == budget
+        await worker.generate_output_channel.put(
+            {"output_ids": ids.copy(), "logprobs": logprobs.copy()},
+            key=request["channel_key"],
+            async_op=True,
+        ).async_wait()
+
+    async def run():
+        output, _ = await asyncio.gather(
+            worker.generate_llm_response(context, [], [1], [1]), engine()
+        )
+        return output[-1]
+
+    output = asyncio.run(run())
+    expected = ids[:budget]
+    if truncate and budget == 100:
+        expected = ids[:-1]
+    assert output.response_ids == expected
+    assert output.response_logprobs == (
+        logprobs[: len(expected)] if return_logprobs else None
+    )
+    assert context["all_llm_response_ids"] == output.response_ids
+
+
+@pytest.mark.parametrize("truncate", [None, True, False])
+@pytest.mark.parametrize("recompute", [True, False])
+def test_searchr1_response_config_defaults_and_raw_logprobs(
+    truncate, recompute, monkeypatch
+):
+    from omegaconf import OmegaConf
+
+    from rlinf.config import validate_searchr1_cfg
+
+    cfg = OmegaConf.load(
+        Path(__file__).resolve().parents[2]
+        / "examples/agent/searchr1/config/train_qwen2.5_ppo.yaml"
+    )
+    # This test checks response configuration, without connecting to a Ray cluster.
+    monkeypatch.setattr("rlinf.config.Cluster", lambda: None)
+    monkeypatch.setattr(
+        "rlinf.config.ModelParallelComponentPlacement",
+        lambda *_: SimpleNamespace(
+            is_collocated=True, get_hardware_ranks=lambda _: [0]
+        ),
+    )
+    cfg.agentloop.pop("truncate_response")
+    if truncate is not None:
+        cfg.agentloop.truncate_response = truncate
+    cfg.algorithm.recompute_logprobs = recompute
+    cfg.rollout.return_logprobs = not recompute
+    validate_searchr1_cfg(cfg)
+    assert cfg.agentloop.truncate_response == (truncate is not False)
+
+
+@pytest.mark.parametrize("field", ["rollout_weight_versions", "rollout_ids"])
+def test_result_merge_rejects_partially_missing_row_metadata(field):
+    result = DynamicRolloutResult(
+        num_sequence=1,
+        group_size=1,
+        idx_to_traj=[0],
+        input_ids=[[1, 2]],
+        prompt_lengths=[1],
+        response_lengths=[1],
+        is_end=[True],
+    )
+    stamped = copy.deepcopy(result)
+    setattr(stamped, field, [[3]] if field == "rollout_weight_versions" else [9])
+    with pytest.raises(ValueError, match=field):
+        DynamicRolloutResult.merge_result_list([result, stamped])
+
+
+def test_checkpoint_loader_patch_is_released_after_a_failed_load(monkeypatch):
+    training = pytest.importorskip("megatron.training.training")
+    from rlinf.hybrid_engines.megatron.megatron_model_manager import (
+        patch_load_checkpoint_to_be_non_strict,
+    )
+
+    def loader(*, strict=True):
+        return strict
+
+    monkeypatch.setattr(training, "load_checkpoint", loader)
+    with pytest.raises(OSError, match="checkpoint unavailable"):
+        with patch_load_checkpoint_to_be_non_strict(True):
+            assert training.load_checkpoint() is False
+            raise OSError("checkpoint unavailable")
+    assert training.load_checkpoint() is True
+
+
+def test_batch_merge_pads_rows_for_a_text_only_batch():
+    """A batch without images must still contribute one slot per row."""
+
+    def batch(payloads):
+        data = {
+            "input_ids": torch.zeros(3, 6, dtype=torch.long),
+            "idx_to_traj": [0, 1, 2],
+            "prompt_lengths": torch.ones(3, dtype=torch.int32),
+            "response_lengths": torch.ones(3, dtype=torch.int32),
+            "is_end": torch.zeros(3, dtype=torch.bool),
+        }
+        if payloads is not None:
+            data["multi_modal_inputs"] = payloads
+        return data
+
+    with_images = batch([None, {"tag": torch.tensor([1.0])}, None])
+    for order in ([batch(None), with_images], [with_images, batch(None)]):
+        merged = DynamicRolloutResult.merge_batches(
+            [dict(item) for item in order], group_size=3, adjust_traj_indices=True
+        )
+        payloads = merged["multi_modal_inputs"]
+        assert len(payloads) == merged["input_ids"].shape[0] == 6
+        assert sum(entry is not None for entry in payloads) == 1

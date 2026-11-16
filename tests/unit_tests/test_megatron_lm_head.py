@@ -351,3 +351,63 @@ def test_chunked_lm_head_two_rank_vocab_shards(tmp_path):
     mp.spawn(
         _chunked_lm_head_tp_reference, args=((tmp_path / "tp-init").as_uri(),), nprocs=2
     )
+
+
+@pytest.mark.parametrize("instance_override", [False, True])
+def test_chunked_forward_restores_postprocess_after_failure(instance_override):
+    from types import SimpleNamespace
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import (
+        forward_qwen_vl_with_chunked_log_probs,
+    )
+
+    class LanguageModel(torch.nn.Module):
+        def _postprocess(self, **kwargs):
+            return kwargs
+
+    language = LanguageModel()
+    language.post_process = True
+    language.mtp_process = False
+    language.config = SimpleNamespace(
+        mtp_num_layers=0, use_mup=False, defer_embedding_wgrad_compute=False, fp8=False
+    )
+    language.pg_collection = SimpleNamespace(tp=None)
+    if instance_override:
+        language._postprocess = lambda **kwargs: kwargs
+    original = language._postprocess
+    model = SimpleNamespace(language_model=language, post_process=True)
+
+    def fail(**kwargs):
+        assert language._postprocess is not original
+        raise RuntimeError("decoder failed")
+
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        forward_qwen_vl_with_chunked_log_probs(
+            fail,
+            model,
+            label=torch.zeros(1, 2, dtype=torch.long),
+            label_mask=torch.ones(1, 2, dtype=torch.bool),
+            chunk_size=1,
+            temperature=1.0,
+        )
+    assert ("_postprocess" in language.__dict__) is instance_override
+    assert language._postprocess == original
+
+
+def test_mrope_verification_removes_hook_after_failure():
+    pytest.importorskip("megatron.bridge")
+    from rlinf.hybrid_engines.megatron.qwen_vl_inputs import verify_qwen_vl_positions
+
+    class BridgeModel(torch.nn.Module):
+        __module__ = "megatron.bridge.models.qwen_vl.test"
+
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Identity()
+
+    model = BridgeModel()
+    positions = torch.zeros(3, 1, 2, dtype=torch.long)
+    with pytest.raises(ValueError, match="M-RoPE positions different"):
+        with verify_qwen_vl_positions(model, positions, torch.ones(1, 2)):
+            model.language_model(position_ids=positions + 1)
+    assert not model.language_model._forward_pre_hooks

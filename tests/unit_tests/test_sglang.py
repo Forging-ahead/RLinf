@@ -431,9 +431,9 @@ def test_native_token_space_multiturn_replay_and_cache(tmp_path):
 
 @pytest.mark.parametrize("namespace_package", [False, True])
 def test_bundled_cudart_preserves_library_search_paths(
-    tmp_path, monkeypatch, namespace_package
+    tmp_path, monkeypatch, namespace_package, sglang_args_modules
 ):
-    from rlinf.workers.rollout.sglang.process import _pin_bundled_cudart
+    _pin_bundled_cudart = sglang_args_modules[2]._pin_bundled_cudart
 
     # Isolate the installed wheel layout, including namespace-only CUDA wheels.
     nvidia = ModuleType("nvidia")
