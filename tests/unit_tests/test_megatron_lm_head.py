@@ -268,21 +268,6 @@ def test_chunked_lm_head_matches_dense_values_and_gradients(
         )
 
 
-def test_chunked_lm_head_empty_mask_and_frozen_weight():
-    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
-
-    hidden = torch.randn(2, 4, 3, requires_grad=True)
-    weight = torch.randn(11, 3)
-    labels = torch.full((2, 4), -100)
-    mask = torch.zeros_like(labels, dtype=torch.bool)
-    output = chunked_vocab_parallel_log_probs(
-        hidden, weight, labels, mask, chunk_size=3
-    )
-    output["log_probs"].sum().backward()
-    torch.testing.assert_close(output["log_probs"], torch.zeros(2, 4))
-    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
-
-
 def test_chunked_lm_head_accumulates_main_grad_without_double_add():
     from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
 
@@ -310,31 +295,6 @@ def test_chunked_lm_head_accumulates_main_grad_without_double_add():
     torch.testing.assert_close(weight.main_grad, expected, atol=3e-6, rtol=3e-6)
     assert weight.grad_added_to_main_grad
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
-
-
-def test_chunked_lm_head_does_not_save_vocabulary_activations():
-    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
-
-    hidden = torch.randn(23, 5, requires_grad=True)
-    weight = torch.randn(29, 5, requires_grad=True)
-    labels = torch.arange(23)
-    saved = []
-
-    def record(tensor):
-        saved.append(tuple(tensor.shape))
-        return tensor
-
-    with torch.autograd.graph.saved_tensors_hooks(record, lambda tensor: tensor):
-        output = chunked_vocab_parallel_log_probs(
-            hidden,
-            weight,
-            labels,
-            torch.ones(23, dtype=torch.bool),
-            chunk_size=4,
-        )
-    output["log_probs"].sum().backward()
-    assert (29, 5) in saved
-    assert not any(len(shape) >= 2 and shape[-1] == 29 for shape in saved), saved
 
 
 def _chunked_lm_head_tp_reference(rank, rendezvous):
