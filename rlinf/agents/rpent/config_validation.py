@@ -19,18 +19,18 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 
 def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
-    """Validate RPent planner PPO or evaluation, selected by ``tools.rpent``."""
-    from rlinf.config import (
-        release_image_replay_enabled,
-        shared_multi_modal_processor_enabled,
-        validate_agent_ppo_cfg,
-        validate_async_agent_ppo_cfg,
-    )
-
+    """Validate RPent resources, planner inputs and the selected RL algorithm."""
     rpent = cfg.get("tools", {}).get("rpent")
     if rpent is None:
         return cfg
+    _validate_resources(rpent)
+    _validate_multimodal(cfg, rpent)
+    _validate_planner(cfg, rpent)
+    _validate_training(cfg, rpent)
+    return cfg
 
+
+def _validate_resources(rpent: DictConfig) -> None:
     if not rpent.env_gpus or rpent.episodes_per_worker < 1:
         raise ValueError(
             "tools.rpent needs at least one env GPU and one episode per worker, got "
@@ -53,6 +53,13 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             "tools.rpent.store_images_on_disk requires keep_episodes=all; "
             "training and checkpoint recovery still reference episode images."
         )
+    if type(rpent.get("record_api_trace", False)) is not bool:
+        raise ValueError("tools.rpent.record_api_trace must be a boolean.")
+
+
+def _validate_multimodal(cfg: DictConfig, rpent: DictConfig) -> None:
+    from rlinf.config import release_image_replay_enabled, shared_multi_modal_processor_enabled
+
     if shared_multi_modal_processor_enabled(OmegaConf.select(cfg, "rollout.sglang")):
         if cfg.rollout.rollout_backend != "sglang" or not rpent.get(
             "store_images_on_disk", False
@@ -112,6 +119,9 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             if field not in multimodal:
                 with open_dict(cfg):
                     OmegaConf.update(cfg, target, rpent[legacy], force_add=True)
+
+
+def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
     agentloop = cfg.agentloop
     thinking_budget = agentloop.get("thinking_token_budget")
     if thinking_budget is not None:
@@ -229,6 +239,12 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
                 raise ValueError(
                     "compressed episode histories require chronological actor_gae, not gae_dynamic."
                 )
+
+
+def _validate_training(cfg: DictConfig, rpent: DictConfig) -> None:
+    from rlinf.config import validate_agent_ppo_cfg, validate_async_agent_ppo_cfg
+
+    workflow = rpent.get("workflow", "libero")
     if cfg.runner.task_type == "reasoning":
         if not cfg.critic.get("use_critic_model", False):
             if (
@@ -277,4 +293,3 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             validate_agent_ppo_cfg(cfg, "RPent")
         elif not cfg.runner.get("synchronous", False):
             validate_async_agent_ppo_cfg(cfg, "RPent")
-    return cfg
