@@ -508,6 +508,51 @@ def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, val
             validate_async_agent_ppo_cfg(cfg, "RPent")
 
 
+@pytest.mark.parametrize(
+    "mode,invalid,value,error",
+    [
+        ("eval", None, None, None),
+        ("ppo", None, None, None),
+        ("sao", None, None, None),
+        ("eval", "tools.rpent.store_images_on_disk", False, "store_images_on_disk"),
+        (
+            "eval",
+            "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE",
+            "custom",
+            "Remove",
+        ),
+        ("ppo", "actor.model.pipeline_model_parallel_size", 2, "PP=1"),
+        ("sao", "critic.megatron.mbridge", False, "Megatron-Bridge"),
+    ],
+)
+def test_token_space_validation_scopes_learner_checks(mode, invalid, value, error):
+    from rlinf.config import validate_rpent_cfg
+
+    name = (
+        "eval_qwen3.5_4b_libero_rl"
+        if mode == "eval"
+        else f"train_qwen3.5_4b_libero_rl_{mode}"
+    )
+    cfg = compose(
+        [
+            "++rollout.sglang.enable_token_space_processor=true",
+            "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
+            "++tools.rpent.store_images_on_disk=true",
+            "tools.rpent.keep_episodes=all",
+        ],
+        config_name=name,
+    )
+    if invalid:
+        OmegaConf.update(cfg, invalid, value)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            validate_rpent_cfg(cfg)
+    else:
+        validate_rpent_cfg(cfg)
+        if mode == "eval":
+            assert "actor" not in cfg and "critic" not in cfg
+
+
 @pytest.fixture(params=[False, True], ids=["uncached", "disk-cache"])
 def native_token_space(tmp_path, request):
     """Use real SGLang preprocessing when local processor assets are supplied."""

@@ -61,7 +61,10 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             raise ValueError(
                 "Remove SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE when enabling token-space processing"
             )
-        for role in ("actor", "critic"):
+        learner_roles = (
+            ("actor", "critic") if cfg.runner.task_type == "reasoning" else ()
+        )
+        for role in learner_roles:
             worker = cfg[role]
             if (
                 worker.training_backend != "megatron"
