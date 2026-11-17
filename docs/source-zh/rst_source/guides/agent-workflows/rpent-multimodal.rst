@@ -70,14 +70,22 @@ TokenSpace 模式可以让 rollout、actor 和 critic 共用图像预处理缓�
        token_space_preprocess_cache_dir: <cache-dir>
        token_space_preprocess_cache_trust_url: true
        token_space_preprocess_cache_check_rate: 0.0
-   tools:
-     rpent:
-       training_image_prefetch_batches: 2
-       training_image_prefetch_bytes: 268435456
+   actor:
+     multimodal:
+       cache_bytes: 0
+       prefetch_batches: 2
+       prefetch_bytes: 268435456
+   critic:
+     multimodal:
+       cache_bytes: 0
+       prefetch_batches: 2
+       prefetch_bytes: 268435456
+
+actor 和 critic 可以分别设置预算。同一配置项的新旧字段均未填写时，取值默认为 0，对应的缓存或预取功能关闭。``tools.rpent`` 下的旧字段 ``training_image_cache_bytes``、``training_image_prefetch_batches`` 和 ``training_image_prefetch_bytes`` 仍同时作用于两个训练角色。同一配置项的新旧字段同时存在时，取值必须一致，否则配置校验报错。独立评估无需配置 actor 或 critic。 示例模板已改用训练角色下的字段。通过命令行设置旧字段时，使用 Hydra 的 ``++`` 语法，例如 ``++tools.rpent.training_image_cache_bytes=268435456``。
 
 缓存要求图片路径指向的内容保持不变。缓存按处理器指纹分目录保存预处理结果。抽查比例的取值为 0 到 1，提高该值会重算部分命中的内容，检查缓存是否一致。各进程须使用相同设置。
 
-预取配置限制每个训练 rank 的微批次数和总字节数，预取队列和当前在用的微批次都计入上限。训练线程执行前向计算，单个 CPU 线程准备后续批次。示例中的 256 MiB 不包含处理器临时内存，也不包含单独配置的 ``training_image_cache_bytes`` 缓存。规划主存时，将每个 rank 的预算乘以 actor 和 critic 的 rank 总数。提高预算前，先测量实际内存峰值。单个微批次超出预算会报错。预取要求 TokenSpace 轨迹记录处理后的像素字节数。重放缺少该字段的旧轨迹时，将 ``training_image_prefetch_batches`` 设为 0。
+预取配置限制每个训练 rank 的微批次数和总字节数，预取队列和当前在用的微批次都计入上限。训练线程执行前向计算，单个 CPU 线程准备后续批次。示例中的 256 MiB 不包含处理器临时内存，也不包含单独配置的 ``multimodal.cache_bytes`` 缓存。规划主存时，将每个 rank 的预算乘以 actor 和 critic 的 rank 总数。提高预算前，先测量实际内存峰值。单个微批次超出预算会报错。预取要求 TokenSpace 轨迹记录处理后的像素字节数。重放缺少该字段的旧轨迹时，将 ``multimodal.prefetch_batches`` 设为 0。
 
 .. warning::
 

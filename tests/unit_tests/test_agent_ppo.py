@@ -471,7 +471,7 @@ def test_searchr1_response_config_defaults_and_raw_logprobs(
 ):
     from omegaconf import OmegaConf
 
-    from rlinf.config import validate_searchr1_cfg
+    from rlinf.config import validate_multimodal_learner_cfg, validate_searchr1_cfg
 
     cfg = OmegaConf.load(
         Path(__file__).resolve().parents[2]
@@ -491,6 +491,9 @@ def test_searchr1_response_config_defaults_and_raw_logprobs(
     cfg.algorithm.recompute_logprobs = recompute
     cfg.rollout.return_logprobs = not recompute
     validate_searchr1_cfg(cfg)
+    snapshot = OmegaConf.to_container(cfg)
+    validate_multimodal_learner_cfg(cfg)
+    assert OmegaConf.to_container(cfg) == snapshot
     assert cfg.agentloop.truncate_response == (truncate is not False)
 
 
@@ -551,3 +554,40 @@ def test_batch_merge_pads_rows_for_a_text_only_batch():
         payloads = merged["multi_modal_inputs"]
         assert len(payloads) == merged["input_ids"].shape[0] == 6
         assert sum(entry is not None for entry in payloads) == 1
+
+
+@pytest.mark.parametrize(
+    "settings,token_space,error",
+    [
+        ({}, False, None),
+        ({"cache_bytes": 1024}, False, None),
+        ({"prefetch_batches": 2, "prefetch_bytes": 4096}, True, None),
+        ({"cache_bytes": -1}, False, "cache_bytes"),
+        ({"prefetch_batches": True}, True, "prefetch_batches"),
+        ({"prefetch_bytes": 1.5}, True, "prefetch_bytes"),
+        ({"prefetch_batches": 1}, True, "positive prefetch_bytes"),
+        (
+            {"prefetch_batches": 1, "prefetch_bytes": 4096},
+            False,
+            "enable_token_space_processor",
+        ),
+    ],
+)
+def test_multimodal_learner_budgets_without_rpent(settings, token_space, error):
+    from omegaconf import OmegaConf
+
+    from rlinf.config import validate_multimodal_learner_cfg
+
+    cfg = OmegaConf.create(
+        {
+            "actor": {"multimodal": settings},
+            "rollout": {"sglang": {"enable_token_space_processor": token_space}},
+        }
+    )
+    if error:
+        with pytest.raises(ValueError, match=error):
+            validate_multimodal_learner_cfg(cfg)
+    else:
+        snapshot = OmegaConf.to_container(cfg)
+        validate_multimodal_learner_cfg(cfg)
+        assert OmegaConf.to_container(cfg) == snapshot

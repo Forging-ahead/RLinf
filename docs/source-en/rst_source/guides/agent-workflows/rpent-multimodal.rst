@@ -70,14 +70,22 @@ Shared preprocessing caches and CPU prefetching are disabled by default. To enab
        token_space_preprocess_cache_dir: <cache-dir>
        token_space_preprocess_cache_trust_url: true
        token_space_preprocess_cache_check_rate: 0.0
-   tools:
-     rpent:
-       training_image_prefetch_batches: 2
-       training_image_prefetch_bytes: 268435456
+   actor:
+     multimodal:
+       cache_bytes: 0
+       prefetch_batches: 2
+       prefetch_bytes: 268435456
+   critic:
+     multimodal:
+       cache_bytes: 0
+       prefetch_batches: 2
+       prefetch_bytes: 268435456
+
+Actor and critic budgets are independent. If neither a learner field nor its legacy setting is present, the value defaults to zero, disabling the corresponding cache or prefetch feature. The legacy fields under ``tools.rpent`` (``training_image_cache_bytes``, ``training_image_prefetch_batches`` and ``training_image_prefetch_bytes``) still apply to both learners. If a legacy setting and its learner setting are both present, their values must match; conflicting values fail validation. Standalone evaluation needs no actor or critic configuration. The example template uses the learner fields. To override a legacy field from the command line, use Hydra’s ``++`` syntax, for example ``++tools.rpent.training_image_cache_bytes=268435456``.
 
 Cached image paths must always refer to the same image contents. The cache stores preprocessed outputs in a separate directory for each processor fingerprint. Set the check rate between 0 and 1 to recompute a sample of cache hits and verify their contents. Keep this setting identical across processes.
 
-The prefetch settings limit the number and total bytes of prepared microbatches per learner rank, including the current microbatch. One CPU thread prepares the following batch while the training thread runs the forward pass for the current microbatch. The 256 MiB example excludes processor scratch space and the separate ``training_image_cache_bytes`` cache. Multiply the per-rank budgets by the number of actor and critic ranks, and measure peak host memory before increasing them. A microbatch larger than the budget fails with an error. Prefetching requires token-space trajectories that record the size of the preprocessed pixel data in bytes. Set ``training_image_prefetch_batches: 0`` when replaying older trajectories.
+The prefetch settings limit the number and total bytes of prepared microbatches per learner rank, including the current microbatch. One CPU thread prepares the following batch while the training thread runs the forward pass for the current microbatch. The 256 MiB example excludes processor scratch space and the separate ``multimodal.cache_bytes`` cache. Multiply the per-rank budgets by the number of actor and critic ranks, and measure peak host memory before increasing them. A microbatch larger than the budget fails with an error. Prefetching requires token-space trajectories that record the size of the preprocessed pixel data in bytes. Set ``multimodal.prefetch_batches: 0`` when replaying older trajectories.
 
 .. warning::
 

@@ -15,7 +15,7 @@
 
 """Configuration contracts for RPent planner workflows."""
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 
 def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
@@ -81,29 +81,21 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
                 raise ValueError(
                     "Token-space position verification currently requires PP=1 and CP=1"
                 )
-    cache_bytes = rpent.get("training_image_cache_bytes", 0)
-    if type(cache_bytes) is not int or cache_bytes < 0:
-        raise ValueError(
-            "tools.rpent.training_image_cache_bytes must be a nonnegative integer."
-        )
-    prefetch_batches = rpent.get("training_image_prefetch_batches", 0)
-    prefetch_bytes = rpent.get("training_image_prefetch_bytes", 0)
-    if type(prefetch_batches) is not int or prefetch_batches < 0:
-        raise ValueError(
-            "training_image_prefetch_batches must be a nonnegative integer."
-        )
-    if type(prefetch_bytes) is not int or prefetch_bytes < 0:
-        raise ValueError("training_image_prefetch_bytes must be a nonnegative integer.")
-    if prefetch_batches and (
-        prefetch_bytes == 0
-        or not OmegaConf.select(
-            cfg, "rollout.sglang.enable_token_space_processor", default=False
-        )
-    ):
-        raise ValueError(
-            "Image prefetch requires enable_token_space_processor=True and positive "
-            "training_image_prefetch_bytes per learner rank."
-        )
+    # Resolve legacy RPent budgets before the generic learner config is validated.
+    for role in ("actor", "critic"):
+        if cfg.get(role) is None:
+            continue
+        for field in ("cache_bytes", "prefetch_batches", "prefetch_bytes"):
+            legacy = f"training_image_{field}"
+            if legacy not in rpent:
+                continue
+            target = f"{role}.multimodal.{field}"
+            multimodal = cfg[role].get("multimodal") or {}
+            if field in multimodal and multimodal[field] != rpent[legacy]:
+                raise ValueError(f"{target} conflicts with tools.rpent.{legacy}.")
+            if field not in multimodal:
+                with open_dict(cfg):
+                    OmegaConf.update(cfg, target, rpent[legacy], force_add=True)
     agentloop = cfg.agentloop
     thinking_budget = agentloop.get("thinking_token_budget")
     if thinking_budget is not None:

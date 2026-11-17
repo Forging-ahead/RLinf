@@ -287,7 +287,7 @@ class MultimodalBatchPreparer:
                 if "pixel_values_bytes" not in entry:
                     raise ValueError(
                         "Image prefetch needs pixel_values_bytes; generate fresh "
-                        "token-space rollouts or disable training_image_prefetch_batches."
+                        "token-space rollouts or disable multimodal.prefetch_batches."
                     )
                 size += entry["pixel_values_bytes"]
             else:
@@ -296,7 +296,7 @@ class MultimodalBatchPreparer:
         if size > self.prefetch_bytes:
             raise ValueError(
                 f"Image microbatch needs {size} prepared bytes, exceeding "
-                f"training_image_prefetch_bytes={self.prefetch_bytes}; reduce the "
+                f"multimodal.prefetch_bytes={self.prefetch_bytes}; reduce the "
                 "microbatch or increase this per-rank budget."
             )
         return size

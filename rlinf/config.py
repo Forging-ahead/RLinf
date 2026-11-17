@@ -2509,6 +2509,29 @@ def validate_searchr1_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def validate_multimodal_learner_cfg(cfg: DictConfig) -> None:
+    """Validate per-rank image cache and prefetch budgets for agent learners."""
+    for role in ("actor", "critic"):
+        multimodal = (cfg.get(role) or {}).get("multimodal") or {}
+        for field in ("cache_bytes", "prefetch_batches", "prefetch_bytes"):
+            value = multimodal.get(field, 0)
+            if type(value) is not int or value < 0:
+                raise ValueError(
+                    f"{role}.multimodal.{field} must be a nonnegative integer, "
+                    f"got {value!r}."
+                )
+        if multimodal.get("prefetch_batches", 0) and (
+            not multimodal.get("prefetch_bytes", 0)
+            or not OmegaConf.select(
+                cfg, "rollout.sglang.enable_token_space_processor", default=False
+            )
+        ):
+            raise ValueError(
+                f"{role}.multimodal prefetch requires enable_token_space_processor=True "
+                "and positive prefetch_bytes per learner rank."
+            )
+
+
 def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
     """Validate RPent configuration through the integration-owned validator."""
     from rlinf.agents.rpent.config_validation import validate_rpent_cfg as validate
@@ -2832,6 +2855,7 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         validate_qwen_vl_chunked_cfg(cfg)
         cfg = validate_searchr1_cfg(cfg)
         cfg = validate_rpent_cfg(cfg)
+        validate_multimodal_learner_cfg(cfg)
 
     return cfg
 

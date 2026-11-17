@@ -61,8 +61,6 @@ tools:
     output_dir: ???
     # Requires a shared output_dir retained through checkpoint recovery.
     store_images_on_disk: false
-    training_image_prefetch_batches: 0
-    training_image_prefetch_bytes: 268435456
     keep_episodes: all
     process_timeout_s: 15000
 
@@ -91,6 +89,7 @@ rollout:
     enable_custom_logit_processor: false
 
 actor:
+  multimodal: {}
   expect_multi_modal_inputs: true
   trim_right_padding: true
   model:
@@ -107,6 +106,7 @@ actor:
       hf_model_path: ${rollout.model.model_path}
 
 critic:
+  multimodal: {}
   trim_right_padding: true
   model:
     attention_backend: flash

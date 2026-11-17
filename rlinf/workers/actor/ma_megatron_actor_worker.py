@@ -143,13 +143,13 @@ class MAMegatronActor(MegatronActor):
                 cfg, "rollout.sglang.enable_token_space_processor", default=False
             ),
             cache_bytes=OmegaConf.select(
-                cfg, "tools.rpent.training_image_cache_bytes", default=0
+                cfg, "actor.multimodal.cache_bytes", default=0
             ),
             prefetch_batches=OmegaConf.select(
-                cfg, "tools.rpent.training_image_prefetch_batches", default=0
+                cfg, "actor.multimodal.prefetch_batches", default=0
             ),
             prefetch_bytes=OmegaConf.select(
-                cfg, "tools.rpent.training_image_prefetch_bytes", default=0
+                cfg, "actor.multimodal.prefetch_bytes", default=0
             ),
         )
         # Long agent rows would otherwise materialize vocabulary logits for every

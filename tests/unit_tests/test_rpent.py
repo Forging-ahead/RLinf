@@ -553,6 +553,39 @@ def test_token_space_validation_scopes_learner_checks(mode, invalid, value, erro
             assert "actor" not in cfg and "critic" not in cfg
 
 
+@pytest.mark.parametrize("field", ["cache_bytes", "prefetch_batches", "prefetch_bytes"])
+def test_legacy_image_budgets_normalize_and_reject_conflicts(field):
+    from rlinf.config import validate_multimodal_learner_cfg, validate_rpent_cfg
+
+    cfg = compose(
+        [
+            "rollout.sglang.enable_token_space_processor=true",
+            "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
+            "tools.rpent.store_images_on_disk=true",
+        ]
+    )
+    budgets = {"cache_bytes": 1024, "prefetch_batches": 2, "prefetch_bytes": 4096}
+    for key, value in budgets.items():
+        OmegaConf.update(
+            cfg, f"tools.rpent.training_image_{key}", value, force_add=True
+        )
+    OmegaConf.set_struct(cfg, True)
+    validate_rpent_cfg(cfg)
+    validate_multimodal_learner_cfg(cfg)
+    assert dict(cfg.actor.multimodal) == dict(cfg.critic.multimodal) == budgets
+    snapshot = OmegaConf.to_container(cfg)
+    validate_rpent_cfg(cfg)
+    assert OmegaConf.to_container(cfg) == snapshot
+    OmegaConf.update(cfg, f"critic.multimodal.{field}", budgets[field] + 1)
+    with pytest.raises(ValueError, match=f"critic.multimodal.{field} conflicts"):
+        validate_rpent_cfg(cfg)
+    del cfg.tools.rpent
+    # Generic consumers can choose independent actor and critic budgets.
+    validate_multimodal_learner_cfg(cfg)
+    assert cfg.actor.multimodal[field] == budgets[field]
+    assert cfg.critic.multimodal[field] == budgets[field] + 1
+
+
 @pytest.fixture(params=[False, True], ids=["uncached", "disk-cache"])
 def native_token_space(tmp_path, request):
     """Use real SGLang preprocessing when local processor assets are supplied."""
