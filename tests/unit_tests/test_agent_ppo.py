@@ -569,7 +569,7 @@ def test_batch_merge_pads_rows_for_a_text_only_batch():
         (
             {"prefetch_batches": 1, "prefetch_bytes": 4096},
             False,
-            "enable_token_space_processor",
+            "enable_shared_multi_modal_processor",
         ),
     ],
 )
@@ -581,7 +581,7 @@ def test_multimodal_learner_budgets_without_rpent(settings, token_space, error):
     cfg = OmegaConf.create(
         {
             "actor": {"multimodal": settings},
-            "rollout": {"sglang": {"enable_token_space_processor": token_space}},
+            "rollout": {"sglang": {"enable_shared_multi_modal_processor": token_space}},
         }
     )
     if error:

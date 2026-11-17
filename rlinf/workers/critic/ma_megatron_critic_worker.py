@@ -20,6 +20,7 @@ from megatron.training.training import unwrap_model
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
+from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
@@ -54,8 +55,8 @@ class MAMegatronCritic(MegatronCritic):
         self.pack_traj = cfg.actor.get("pack_traj", True)
         self.multimodal_preparer = MultimodalBatchPreparer(
             cfg.rollout.model.model_path,
-            token_space=OmegaConf.select(
-                cfg, "rollout.sglang.enable_token_space_processor", default=False
+            token_space=shared_multi_modal_processor_enabled(
+                OmegaConf.select(cfg, "rollout.sglang")
             ),
             cache_bytes=OmegaConf.select(
                 cfg, "critic.multimodal.cache_bytes", default=0

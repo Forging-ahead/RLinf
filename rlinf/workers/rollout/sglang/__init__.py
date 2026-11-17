@@ -51,7 +51,7 @@ def require_supported_sglang(*, token_space: bool = False) -> None:
     if not parse("0.4.4") <= sglang_version <= parse("0.5.19") and not token_space:
         raise ValueError(
             "The pinned experimental SGLang build requires "
-            "rollout.sglang.enable_token_space_processor=true. "
+            "rollout.sglang.enable_shared_multi_modal_processor=true. "
             "Use a supported release for other rollout, reward and embodied servers."
         )
 

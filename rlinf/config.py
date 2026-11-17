@@ -276,8 +276,26 @@ def activation_to_func(
     return activation_func
 
 
+def shared_multi_modal_processor_enabled(cfg: DictConfig | dict | None) -> bool:
+    """Read the SGLang config switch, accepting legacy saved configurations."""
+    if cfg is None:
+        return False
+    current = "enable_shared_multi_modal_processor"
+    legacy = "enable_token_space_processor"
+    if current in cfg and legacy in cfg:
+        raise ValueError(
+            f"rollout.sglang contains both {current} and {legacy}; keep only {current}."
+        )
+    key = legacy if legacy in cfg else current
+    enabled = cfg.get(key, False)
+    if type(enabled) is not bool:
+        raise ValueError(f"rollout.sglang.{key} must be a boolean, got {enabled!r}.")
+    return enabled
+
+
 def validate_sglang_multimodal_cfg(cfg: DictConfig) -> None:
-    """Check native multimodal options supported by the default serving worker."""
+    """Check multimodal options supported by the default serving worker."""
+    shared_processor = shared_multi_modal_processor_enabled(cfg)
     serving_mode = cfg.get("serving_mode")
     cache_enabled = cfg.get("enable_token_space_preprocess_cache", False)
     cache_directory = cfg.get("token_space_preprocess_cache_dir")
@@ -285,14 +303,14 @@ def validate_sglang_multimodal_cfg(cfg: DictConfig) -> None:
     if cache_enabled:
         if (
             serving_mode is not None
-            or not cfg.get("enable_token_space_processor", False)
+            or not shared_processor
             or not cfg.get("token_space_preprocess_cache_trust_url", False)
             or not cache_directory
             or not os.path.isabs(cache_directory)
         ):
             raise ValueError(
                 "Shared preprocessing cache requires the default SGLang worker, "
-                "enable_token_space_processor=True, "
+                "enable_shared_multi_modal_processor=True, "
                 "token_space_preprocess_cache_trust_url=True and an absolute "
                 "token_space_preprocess_cache_dir visible to rollout and learners."
             )
@@ -2522,12 +2540,12 @@ def validate_multimodal_learner_cfg(cfg: DictConfig) -> None:
                 )
         if multimodal.get("prefetch_batches", 0) and (
             not multimodal.get("prefetch_bytes", 0)
-            or not OmegaConf.select(
-                cfg, "rollout.sglang.enable_token_space_processor", default=False
+            or not shared_multi_modal_processor_enabled(
+                OmegaConf.select(cfg, "rollout.sglang")
             )
         ):
             raise ValueError(
-                f"{role}.multimodal prefetch requires enable_token_space_processor=True "
+                f"{role}.multimodal prefetch requires enable_shared_multi_modal_processor=True "
                 "and positive prefetch_bytes per learner rank."
             )
 

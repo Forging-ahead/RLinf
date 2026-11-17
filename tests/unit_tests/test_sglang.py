@@ -39,10 +39,31 @@ def sglang_args_modules(monkeypatch):
         "version",
         lambda name: "0.5.19" if name == "sglang" else original_version(name),
     )
+    monkeypatch.delenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", raising=False)
+    # Vendor capability checks run against CPU-only stand-ins for its APIs.
+    for module_name, class_name, names in (
+        ("server_args", "ServerArgs", ["enable_token_space_processor"]),
+        (
+            "managers.io_struct",
+            "GenerateReqInput",
+            ["mm_token_expansion_start_len", "return_prompt_token_ids"],
+        ),
+    ):
+        monkeypatch.setitem(
+            sys.modules,
+            f"sglang.srt.{module_name}",
+            SimpleNamespace(
+                **{class_name: dataclasses.make_dataclass(class_name, names)}
+            ),
+        )
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.server_args",
-        SimpleNamespace(ServerArgs=dataclasses.make_dataclass("ServerArgs", [])),
+        "sglang.srt.multimodal.token_space_mm_process.processor",
+        SimpleNamespace(
+            TokenSpaceProcessor=SimpleNamespace(
+                process=lambda mm_token_expansion_start_len: None
+            )
+        ),
     )
     # The backend owns vendor engine/process creation; no backend is launched here.
     monkeypatch.setitem(
@@ -66,20 +87,67 @@ def sglang_args_modules(monkeypatch):
     return modules
 
 
+@pytest.fixture
+def sglang_args_worker():
+    from omegaconf import OmegaConf
+
+    rollout = OmegaConf.create(
+        {
+            "enforce_eager": False,
+            "validate_weight": False,
+            "validate_weight_first_sync": True,
+            "model": {
+                "model_path": "/model",
+                "precision": "bf16",
+                "trust_remote_code": True,
+            },
+            "sglang": {
+                "use_torch_compile": False,
+                "torch_compile_max_bs": 4,
+                "decode_log_interval": 100,
+                "attention_backend": "triton",
+                "disable_overlap_schedule": True,
+                "chunked_prefill_size": 4096,
+            },
+            "cuda_graph_max_bs": 4,
+            "max_running_requests": 2,
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.7,
+            "detokenize": False,
+        }
+    )
+    return SimpleNamespace(
+        _cfg=SimpleNamespace(runner=SimpleNamespace(resume_dir=None)),
+        _cfg_rollout=rollout,
+        _rank=0,
+        weight_reload="sync",
+        acquire_free_port=lambda: 12345,
+        log_on_first_rank=lambda message: None,
+    )
+
+
 @pytest.mark.parametrize(
-    "args_api,backup,resume_dir",
+    "args_api,backup,resume_dir,processor_key,enabled",
     [
-        ("dataclass-old", False, None),
-        ("dataclass-new", True, "/checkpoint"),
-        ("struct", False, "/checkpoint"),
+        ("dataclass-old", False, None, None, False),
+        ("dataclass-new", True, "/checkpoint", None, False),
+        ("struct", False, "/checkpoint", None, False),
+        ("dataclass-new", False, None, "enable_shared_multi_modal_processor", True),
+        ("dataclass-new", False, None, "enable_token_space_processor", True),
+        ("struct", False, None, "enable_shared_multi_modal_processor", False),
     ],
 )
-def test_sglang_cpu_backup_loads_unsynchronized_weights(
-    monkeypatch, resume_dir, backup, args_api, sglang_args_modules
+def test_sglang_server_args_preserve_loading_and_processor_settings(
+    monkeypatch,
+    resume_dir,
+    backup,
+    args_api,
+    processor_key,
+    enabled,
+    sglang_args_modules,
+    sglang_args_worker,
 ):
     import dataclasses
-
-    from omegaconf import OmegaConf
 
     _, sglang_worker, _ = sglang_args_modules
 
@@ -114,48 +182,72 @@ def test_sglang_cpu_backup_loads_unsynchronized_weights(
     monkeypatch.setattr(
         sglang_worker, "_SERVER_ARGS_FIELDS", {graph_field, "chunked_prefill_size"}
     )
-    rollout = OmegaConf.create(
-        {
-            "enforce_eager": False,
-            "validate_weight": False,
-            "validate_weight_first_sync": True,
-            "model": {
-                "model_path": "/model",
-                "precision": "bf16",
-                "trust_remote_code": True,
-            },
-            "sglang": {
-                "use_torch_compile": False,
-                "torch_compile_max_bs": 4,
-                "decode_log_interval": 100,
-                "attention_backend": "triton",
-                "disable_overlap_schedule": True,
-                "chunked_prefill_size": 4096,
-            },
-            "cuda_graph_max_bs": 4,
-            "max_running_requests": 2,
-            "tensor_parallel_size": 1,
-            "gpu_memory_utilization": 0.7,
-            "detokenize": False,
-        }
-    )
-    if backup is not None:
-        rollout.sglang.enable_weights_cpu_backup = backup
-    worker = SimpleNamespace(
-        _cfg=SimpleNamespace(runner=SimpleNamespace(resume_dir=resume_dir)),
-        _cfg_rollout=rollout,
-        _rank=0,
-        weight_reload="sync",
-        acquire_free_port=lambda: 12345,
-        log_on_first_rank=lambda message: None,
-    )
+    worker = sglang_args_worker
+    worker._cfg.runner.resume_dir = resume_dir
+    worker._cfg_rollout.sglang.enable_weights_cpu_backup = backup
+    if processor_key is not None:
+        worker._cfg_rollout.sglang[processor_key] = enabled
     args = sglang_worker.SGLangWorker._build_server_args(worker)
     assert args["disable_overlap_schedule"] is True
     assert args["enable_weights_cpu_backup"] is bool(backup)
     assert args["load_format"] == ("auto" if backup or resume_dir is None else "dummy")
     assert args[graph_field] == 2
     assert args["chunked_prefill_size"] == 4096
-    assert "enable_token_space_processor" not in args
+    assert "enable_shared_multi_modal_processor" not in args
+    assert args.get("enable_token_space_processor", False) is enabled
+    if enabled:
+        assert args["disable_fast_image_processor"] is True
+        assert args["image_processor_backend"] == "pil"
+    else:
+        assert "enable_token_space_processor" not in args
+        assert "disable_fast_image_processor" not in args
+        assert "image_processor_backend" not in args
+
+
+@pytest.mark.parametrize(
+    "settings,enabled,error",
+    [
+        ({}, False, None),
+        ({"enable_shared_multi_modal_processor": True}, True, None),
+        ({"enable_token_space_processor": True}, True, None),
+        ({"enable_shared_multi_modal_processor": False}, False, None),
+        ({"enable_shared_multi_modal_processor": None}, None, "must be a boolean"),
+        ({"enable_token_space_processor": "false"}, None, "must be a boolean"),
+        (
+            {
+                "enable_shared_multi_modal_processor": True,
+                "enable_token_space_processor": True,
+            },
+            None,
+            "keep only",
+        ),
+        (
+            {
+                "enable_shared_multi_modal_processor": False,
+                "enable_token_space_processor": True,
+            },
+            None,
+            "keep only",
+        ),
+    ],
+)
+def test_shared_multimodal_switch_accepts_legacy_configs(settings, enabled, error):
+    from omegaconf import OmegaConf
+
+    from rlinf.config import (
+        shared_multi_modal_processor_enabled,
+        validate_sglang_multimodal_cfg,
+    )
+
+    cfg = OmegaConf.create(settings)
+    OmegaConf.set_struct(cfg, True)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            validate_sglang_multimodal_cfg(cfg)
+    else:
+        validate_sglang_multimodal_cfg(cfg)
+        assert shared_multi_modal_processor_enabled(cfg) is enabled
+    assert OmegaConf.to_container(cfg) == settings
 
 
 @pytest.mark.parametrize("release", ["0.5.12.post1", "0.5.19", "0.5.20.dev0"])
@@ -170,7 +262,7 @@ def test_sglang_experimental_build_requires_explicit_rollout(
     if release != "0.5.20.dev0":
         package.require_supported_sglang()
         return
-    with pytest.raises(ValueError, match="enable_token_space_processor=true"):
+    with pytest.raises(ValueError, match="enable_shared_multi_modal_processor=true"):
         package.require_supported_sglang()
     for server_type in ("srt", "embodied"):
         server = process.SGLangServerProcess(

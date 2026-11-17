@@ -5,7 +5,7 @@ Train a Qwen3.5-4B planner on LIBERO with RPent and RLinf. RPent executes six en
 
 .. important::
 
-   The default image path preserves sampled tokens and checks image grids and positions. Experimental TokenSpace also checks processor, pixel-value and M-RoPE replay. These checks establish input consistency, not measured SGLang/Megatron logprob parity for either path. TokenSpace is off by default and requires the dependency versions in the installation guide.
+   The default image path preserves sampled tokens and checks image grids and positions. Experimental shared multimodal preprocessing also checks processor, pixel-value and M-RoPE replay. These checks establish input consistency, not measured SGLang/Megatron logprob parity for either path. Shared multimodal preprocessing is off by default and requires the dependency versions in the installation guide.
 
 Overview
 --------
@@ -139,7 +139,7 @@ Visualization and Results
    * - CPU component regression
      - Covers prefixes, masks, trajectory merging, Gloo data exchange, process cleanup and config composition. Tests skipped for missing Megatron/SGLang dependencies do not count as passes.
    * - Real GPU numerical checks
-     - Not yet validated. Validate the default and TokenSpace paths separately on the fixed 96 points (mean/P95/max; 0.03/0.10 are diagnostic references), multi-turn images and M-RoPE. Recomputing logprobs or using TIS does not eliminate native logprob error.
+     - Not yet validated. Validate the default and shared preprocessing paths separately on the fixed 96 points (mean/P95/max; 0.03/0.10 are diagnostic references), multi-turn images and M-RoPE. Recomputing logprobs or using TIS does not eliminate native logprob error.
    * - Checkpoint and recovery
      - Full training acceptance is pending for this branch. Verify both optimizers, post-update weight synchronization and fresh-process resume; SAO also needs buffer/pending-state and policy-version checks.
    * - Independent evaluation
@@ -205,7 +205,7 @@ SAO uses DIS actor loss (clip bounds 0.3/5.0), ``sao_gae`` (alpha 1.5), the SAO 
 
 For long updates, ``rollout.drain_before_training=true`` finishes active episodes before pausing generation. Its buffer capacity must cover the in-flight limit. This changes admission timing, not task timeouts.
 
-For recalculation/TIS, thinking budgets, TokenSpace, caching and prefetching, use :doc:`../../guides/agent-workflows/rpent-multimodal`. SAO defaults to ``recompute_logprobs=false`` and ``importance_sampling_fix=false``: it trains from sampling logprobs without correcting backend differences or policy lag. Validate that choice on the target workload before scaling.
+For recalculation/TIS, thinking budgets, shared multimodal preprocessing, caching and prefetching, use :doc:`../../guides/agent-workflows/rpent-multimodal`. SAO defaults to ``recompute_logprobs=false`` and ``importance_sampling_fix=false``: it trains from sampling logprobs without correcting backend differences or policy lag. Validate that choice on the target workload before scaling.
 
 Keep a Reproduction Record
 --------------------------

@@ -5,7 +5,7 @@ RPent 多模态强化学习
 
 .. important::
 
-   默认图像路径保留采样 token，并校验图像网格与位置；实验 TokenSpace 路径还校验 processor、pixel values 和 M-RoPE 重放。这些是输入一致性检查，两条路径都不能据此宣称真实 SGLang/Megatron logprob 已通过数值验收。TokenSpace 默认关闭，依赖版本见安装页。
+   默认图像路径保留采样 token，并校验图像网格与位置；实验性共享多模态预处理路径还校验 processor、pixel values 和 M-RoPE 重放。这些是输入一致性检查，两条路径都不能据此宣称真实 SGLang/Megatron logprob 已通过数值验收。共享多模态预处理默认关闭，依赖版本见安装页。
 
 概述
 ----
@@ -139,7 +139,7 @@ RPent 多模态强化学习
    * - CPU 组件回归
      - 覆盖前缀、mask、轨迹合并、Gloo 数据交换、进程清理和配置组合；未安装 Megatron/SGLang 的测试会跳过，不能计为通过。
    * - 真实 GPU 数值
-     - 未验收。默认与 TokenSpace 路径须分别验证固定 96 点（报告 mean/P95/max，0.03/0.10 为诊断参考）、多轮图像及 M-RoPE。重算或 TIS 不等于消除原生 logprob 误差。
+     - 未验收。默认与共享预处理路径须分别验证固定 96 点（报告 mean/P95/max，0.03/0.10 为诊断参考）、多轮图像及 M-RoPE。重算或 TIS 不等于消除原生 logprob 误差。
    * - Checkpoint 与恢复
      - 未完成本分支真实训练验收。须验证两套优化器、更新后权重同步及新进程恢复；SAO 还须核对 buffered/pending 状态与 policy 版本。
    * - 独立效果评测
@@ -205,7 +205,7 @@ SAO 使用 DIS actor loss（clip 边界 0.3/5.0）、``sao_gae``\ （alpha 为 1
 
 更新耗时较长时，可设置 ``rollout.drain_before_training=true``，先完成在途 episode 再暂停生成。Buffer 容量必须覆盖在途上限；该选项不改变任务超时预算。
 
-重算与 TIS、Thinking 预算、TokenSpace、缓存和预取的设置见 :doc:`../../guides/agent-workflows/rpent-multimodal`。SAO 默认 ``recompute_logprobs=false``、``importance_sampling_fix=false``，直接使用采样 logprob，不校正后端差异与 policy 滞后。扩批前需在目标工作负载上验证这一选择。
+重算与 TIS、Thinking 预算、共享多模态预处理、缓存和预取的设置见 :doc:`../../guides/agent-workflows/rpent-multimodal`。SAO 默认 ``recompute_logprobs=false``、``importance_sampling_fix=false``，直接使用采样 logprob，不校正后端差异与 policy 滞后。扩批前需在目标工作负载上验证这一选择。
 
 保留复现记录
 ------------

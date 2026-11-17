@@ -77,7 +77,7 @@ rollout:
   replica_affinity: false
   sglang:
     # Experimental; see the deployment guide for dependency and media requirements.
-    enable_token_space_processor: false
+    enable_shared_multi_modal_processor: false
     enable_token_space_preprocess_cache: false
     token_space_preprocess_cache_dir: null
     token_space_preprocess_cache_trust_url: false

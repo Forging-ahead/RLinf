@@ -255,8 +255,6 @@ def test_producer_drain_waits_for_a_blocked_result_send(producer_worker):
 
 @pytest.fixture
 def async_data_runner():
-    pytest.importorskip("megatron.training")
-
     from omegaconf import OmegaConf
     from torch.utils.data import RandomSampler, SequentialSampler
     from torchdata.stateful_dataloader import StatefulDataLoader
@@ -315,19 +313,32 @@ def async_data_runner():
     return create
 
 
-@pytest.mark.parametrize("shuffle,produced", [(True, 40), (False, 40)])
+@pytest.mark.parametrize(
+    "shuffle,old_key,new_key",
+    [
+        (True, None, None),
+        (False, None, None),
+        (True, "enable_token_space_processor", "enable_shared_multi_modal_processor"),
+        (True, "enable_shared_multi_modal_processor", "enable_token_space_processor"),
+    ],
+)
 def test_async_resume_preserves_producer_sampler_order(
-    async_data_runner, shuffle, produced
+    async_data_runner, shuffle, old_key, new_key
 ):
     reference = async_data_runner(shuffle)
-    reference.global_steps = max(1, produced // 8 - 2)
-    for _ in range(produced):
+    if old_key:
+        reference.cfg.rollout.sglang = {old_key: True}
+    reference.global_steps = 3
+    for _ in range(40):
         prompt = reference._next_prompt()
     reference._pending = {prompt[0]: prompt}
     snapshot = copy.deepcopy(reference._save_data_state())
+    assert snapshot["async_rollout"]["token_space"] is (old_key is not None)
     expected = [reference._next_prompt() for _ in range(48)]
 
     restored = async_data_runner(shuffle)
+    if new_key:
+        restored.cfg.rollout.sglang = {new_key: True}
     restored.global_steps = reference.global_steps
     restored._load_data_state(snapshot)
 
@@ -337,7 +348,6 @@ def test_async_resume_preserves_producer_sampler_order(
 
 @pytest.mark.parametrize("saved,current", [(False, True), (True, False)])
 def test_resume_rejects_changed_multimodal_contract(saved, current):
-    pytest.importorskip("megatron.training")
     from types import SimpleNamespace
 
     from omegaconf import OmegaConf
@@ -346,7 +356,7 @@ def test_resume_rejects_changed_multimodal_contract(saved, current):
 
     runner = SimpleNamespace(
         cfg=OmegaConf.create(
-            {"rollout": {"sglang": {"enable_token_space_processor": current}}}
+            {"rollout": {"sglang": {"enable_shared_multi_modal_processor": current}}}
         )
     )
     with pytest.raises(ValueError, match="rollout input contract changed"):

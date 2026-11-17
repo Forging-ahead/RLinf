@@ -38,6 +38,7 @@ from rlinf.algorithms.utils import (
     kl_penalty,
     truncated_importance_weights,
 )
+from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.data.schema.reasoning_requests import get_seq_length
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.hybrid_engines.megatron.utils import (
@@ -139,8 +140,8 @@ class MAMegatronActor(MegatronActor):
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
         self.multimodal_preparer = MultimodalBatchPreparer(
             cfg.rollout.model.model_path,
-            token_space=OmegaConf.select(
-                cfg, "rollout.sglang.enable_token_space_processor", default=False
+            token_space=shared_multi_modal_processor_enabled(
+                OmegaConf.select(cfg, "rollout.sglang")
             ),
             cache_bytes=OmegaConf.select(
                 cfg, "actor.multimodal.cache_bytes", default=0

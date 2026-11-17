@@ -1,7 +1,7 @@
 Configure RPent Multimodal Training
 ===================================
 
-Use these options after completing :doc:`the single-node smoke <../../examples/agentic/rpent_libero_rl>`. Keep the default and experimental TokenSpace environments separate.
+Use these options after completing :doc:`the single-node smoke <../../examples/agentic/rpent_libero_rl>`. Keep the default and experimental shared preprocessing environments separate.
 
 Enable Logprob Recalculation and TIS
 ---------------------------------------------
@@ -24,18 +24,18 @@ Each batch retains its sampling logprobs and per-token policy versions. Before t
 
    Enabling these options changes how SAO computes its loss and adds an actor forward pass. Check TIS weight clipping, effective sample size and policy lag during a small run before scaling. Optimizer updates, weight synchronization and checkpoint recovery with these options have not been validated. Logprob recalculation and TIS do not establish numerical agreement between SGLang and Megatron.
 
-Try Token-Space Image Inputs (Experimental)
--------------------------------------------
+Try Shared Multimodal Preprocessing (Experimental)
+--------------------------------------------------
 
-Token-space mode uses SGLang's image preprocessing for rollout and training. It checks the prompt IDs returned by inference, replays images from checksum-protected files, and checks the M-RoPE positions at the training model's language input. This mode supports Qwen3.5 image inputs with PIL preprocessing and Megatron-Bridge. It requires PP=1 and CP=1. Literal vision markers in text and generated responses are unsupported; video and audio are outside this path.
+Shared Multimodal Preprocessing uses SGLang TokenSpace to process images for rollout and training. It checks the prompt IDs returned by inference, replays images from checksum-protected files, and checks the M-RoPE positions at the training model's language input. This mode supports Qwen3.5 image inputs with PIL preprocessing and Megatron-Bridge. It requires PP=1 and CP=1. Literal vision markers in text and generated responses are unsupported; video and audio are outside this path.
 
 .. warning::
 
    This path is experimental. The default SGLang 0.5.12.post1 environment cannot run it. The candidate dependency file, ``requirements/agentic/sglang-token-space.txt``, pins SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``, Torch 2.14.1 and Transformers 5.19.0. Prepare a separate environment with matching CUDA and Megatron-Bridge kernels; GPU serving, weight synchronization and training still need to be validated together in this environment. Keep the existing training environment unchanged.
 
-   RLinf permits this development build only for rollout with ``rollout.sglang.enable_token_space_processor=true``. Other rollout paths and standalone reward or embodied servers reject it before launch. Use a supported SGLang release for those workloads; installing this build does not establish their compatibility.
+   RLinf permits this development build only for rollout with shared multimodal preprocessing enabled. Other rollout paths and standalone reward or embodied servers reject it before launch. Use a supported SGLang release for those workloads; installing this build does not establish their compatibility.
 
-Keep using ``rollout.cuda_graph_max_bs`` with supported SGLang releases, including 0.5.19, which renamed the corresponding server option. RLinf caps the value at ``rollout.max_running_requests``. These rules also apply when TokenSpace is disabled. GPU regression checks for Search-R1 and embodied workloads remain pending.
+Keep using ``rollout.cuda_graph_max_bs`` with supported SGLang releases, including 0.5.19, which renamed the corresponding server option. RLinf caps the value at ``rollout.max_running_requests``. These rules also apply when shared multimodal preprocessing is disabled. GPU regression checks for Search-R1 and embodied workloads remain pending.
 
 After validating that environment, enable the following settings in the deployment profile. Remove ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`` from the rollout environment, including inherited shell settings. Keep ``output_dir`` accessible at the same path on rollout, actor and critic nodes.
 
@@ -43,13 +43,17 @@ After validating that environment, enable the following settings in the deployme
 
    rollout:
      sglang:
-       enable_token_space_processor: true
+       enable_shared_multi_modal_processor: true
    tools:
      rpent:
        store_images_on_disk: true
        keep_episodes: all
 
-Rollout initialization fails if the TokenSpace APIs are unavailable. Both Server and Engine must return the prompt token IDs they actually use. An image preprocessing pass runs before sampling to calculate output and thinking budgets from the expanded prompt; its throughput cost has not been measured.
+The public switch is ``rollout.sglang.enable_shared_multi_modal_processor`` and defaults to false. RLinf still accepts ``rollout.sglang.enable_token_space_processor`` as a legacy config alias with the same behavior. A config containing both names is rejected, even if the values agree; replace the old key when migrating. In commands that use the current training templates, set ``rollout.sglang.enable_shared_multi_modal_processor=true``. The evaluation template has no default key, so use ``+rollout.sglang.enable_shared_multi_modal_processor=true``.
+
+RLinf maps this switch to SGLang's native ``enable_token_space_processor`` argument. The SGLang cache option names below, the ``sglang-token-space-v1`` trajectory format and checkpoint mode markers are unchanged. Renaming the config key alone does not change the checkpoint input contract.
+
+Rollout initialization fails if the SGLang TokenSpace APIs are unavailable. Both Server and Engine must return the prompt token IDs they actually use. An image preprocessing pass runs before sampling to calculate output and thinking budgets from the expanded prompt; its throughput cost has not been measured.
 
 Start with fresh rollout state when switching modes. Async checkpoint recovery rejects a different mode, and the learner rejects changed processor fingerprints or mixed media formats. Do not assume optimizer state is portable across the Torch/kernel upgrade. Retain image files for checkpoint recovery.
 
@@ -58,7 +62,7 @@ To validate the stack for training, first verify multi-turn images, compaction a
 Reduce Repeated Image Preprocessing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Token-space mode can share preprocessed images between rollout, actor and critic. The cache contains processed pixels and grid metadata. Each backend still runs its own frozen vision encoder; visual embeddings are not shared.
+This mode can share preprocessed images between rollout, actor and critic. The cache contains processed pixels and grid metadata. Each backend still runs its own frozen vision encoder; visual embeddings are not shared.
 
 Shared preprocessing caches and CPU prefetching are disabled by default. To enable them, add the following to the deployment profile above. Replace ``<cache-dir>`` with the absolute path to a directory reserved for this job. Every process in the job must be able to access the directory at that path.
 

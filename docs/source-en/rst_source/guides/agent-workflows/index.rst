@@ -14,7 +14,7 @@ embodied RL jobs.
      - Operational workflows for agentic tasks.
 
    * - :doc:`RPent Multimodal Training <rpent-multimodal>`
-     - Configure logprob recalculation, TokenSpace and image memory budgets.
+     - Configure logprob recalculation, shared multimodal preprocessing and image memory budgets.
 
 .. toctree::
    :hidden:

@@ -24,7 +24,10 @@ from omegaconf import DictConfig
 from sglang.srt.server_args import ServerArgs
 from transformers import AutoTokenizer
 
-from rlinf.config import torch_dtype_from_precision
+from rlinf.config import (
+    shared_multi_modal_processor_enabled,
+    torch_dtype_from_precision,
+)
 from rlinf.data.schema.reasoning_requests import RolloutRequest, SeqGroupInfo
 from rlinf.data.schema.reasoning_results import RolloutResult
 from rlinf.hybrid_engines.sglang.common.token_metadata import decode_generation_result
@@ -80,9 +83,7 @@ class SGLangWorker(Worker):
             config_rollout = self._cfg.rollout
         self._cfg_rollout = config_rollout
         require_supported_sglang(
-            token_space=self._cfg_rollout.sglang.get(
-                "enable_token_space_processor", False
-            )
+            token_space=shared_multi_modal_processor_enabled(self._cfg_rollout.sglang)
         )
         self._placement = placement
         # Only the entry (node_rank 0) of a model instance serves channels
@@ -241,14 +242,14 @@ class SGLangWorker(Worker):
                     f"the configured value {value!r} is ignored"
                 )
 
-        if self._cfg_rollout.sglang.get("enable_token_space_processor", False):
+        if shared_multi_modal_processor_enabled(self._cfg_rollout.sglang):
             from rlinf.hybrid_engines.sglang.multimodal.token_space import (
                 require_token_space_support,
             )
 
             if os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"):
                 raise ValueError(
-                    "Token-space processing requires removing SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"
+                    "Shared multimodal preprocessing requires removing SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"
                 )
             require_token_space_support()
             version_dependent_args.update(
@@ -475,7 +476,7 @@ class SGLangWorker(Worker):
                     "node_rank": node_rank,
                 }
         server_args = self._build_server_args()
-        if self._cfg_rollout.sglang.get("enable_token_space_processor", False):
+        if shared_multi_modal_processor_enabled(self._cfg_rollout.sglang):
             from rlinf.hybrid_engines.sglang.multimodal.token_space import (
                 SGLangTokenSpace,
                 processor_settings,

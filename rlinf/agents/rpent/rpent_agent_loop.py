@@ -38,6 +38,7 @@ from rlinf.agents.rpent.thinking_budget import (
     serialized_thinking_processor,
 )
 from rlinf.agents.tokenization import get_agentic_tokenizer
+from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.scheduler import Channel
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.agent_loop import (
@@ -247,8 +248,8 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         stays a token prefix of the next and consecutive turns can merge into
         one training row. Text-only turns append to the sampled tokens as usual.
         """
-        if OmegaConf.select(
-            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        if shared_multi_modal_processor_enabled(
+            OmegaConf.select(self.cfg, "rollout.sglang")
         ):
             rendered = await asyncio.to_thread(
                 episode.history.render_token_space, request
@@ -322,8 +323,8 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             sampling_params["custom_logit_processor"] = serialized_thinking_processor()
         # A text turn keeps the plain request; only an image turn carries bytes.
         extra = {"image_data": images} if images else {}
-        if OmegaConf.select(
-            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        if shared_multi_modal_processor_enabled(
+            OmegaConf.select(self.cfg, "rollout.sglang")
         ):
             extra["return_prompt_token_ids"] = True
             extra["mm_token_expansion_start_len"] = len(prompt_ids)
@@ -392,8 +393,8 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
 
     def _check_generation(self, generated: dict, prompt_ids: list[int]) -> None:
         """Reject a response that cannot be trained against its behavior policy."""
-        if OmegaConf.select(
-            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        if shared_multi_modal_processor_enabled(
+            OmegaConf.select(self.cfg, "rollout.sglang")
         ):
             if generated.get("prompt_token_ids") != prompt_ids:
                 raise ValueError(

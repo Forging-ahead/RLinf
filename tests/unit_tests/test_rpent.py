@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from _qwen35_chat import Qwen35ToyTokenizer, qwen35_agentic_tokenizer
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from rlinf.agents.rpent.episode import merge_prefix_turns
 from rlinf.agents.rpent.history import (
@@ -388,9 +388,12 @@ def test_token_space_history_preserves_sampled_ids_and_expands_only_new_images(q
         )
 
 
-def test_token_space_checks_exact_served_prompt_ids(make_agent):
+@pytest.mark.parametrize(
+    "key", ["enable_shared_multi_modal_processor", "enable_token_space_processor"]
+)
+def test_token_space_checks_exact_served_prompt_ids(make_agent, key):
     worker = make_agent(FakeRPent(turns=1))
-    worker.cfg.rollout.sglang = {"enable_token_space_processor": True}
+    worker.cfg.rollout.sglang = {key: True}
     generated = {
         "output_ids": [9],
         "prompt_tokens": 2,
@@ -535,7 +538,7 @@ def test_token_space_validation_scopes_learner_checks(mode, invalid, value, erro
     )
     cfg = compose(
         [
-            "++rollout.sglang.enable_token_space_processor=true",
+            "++rollout.sglang.enable_shared_multi_modal_processor=true",
             "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
             "++tools.rpent.store_images_on_disk=true",
             "tools.rpent.keep_episodes=all",
@@ -553,13 +556,44 @@ def test_token_space_validation_scopes_learner_checks(mode, invalid, value, erro
             assert "actor" not in cfg and "critic" not in cfg
 
 
+@pytest.mark.parametrize("mode", ["ppo", "sao", "eval"])
+def test_legacy_multimodal_config_reloads_with_the_same_mode(tmp_path, mode):
+    from rlinf.config import shared_multi_modal_processor_enabled, validate_rpent_cfg
+
+    name = (
+        "eval_qwen3.5_4b_libero_rl"
+        if mode == "eval"
+        else f"train_qwen3.5_4b_libero_rl_{mode}"
+    )
+    cfg = compose(
+        [
+            "++rollout.sglang.enable_shared_multi_modal_processor=true",
+            "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
+            "++tools.rpent.store_images_on_disk=true",
+            "tools.rpent.keep_episodes=all",
+        ],
+        config_name=name,
+    )
+    validate_rpent_cfg(cfg)
+    with open_dict(cfg.rollout.sglang):
+        cfg.rollout.sglang.enable_token_space_processor = cfg.rollout.sglang.pop(
+            "enable_shared_multi_modal_processor"
+        )
+    saved_config = tmp_path / "config.yaml"
+    OmegaConf.save(cfg, saved_config)
+    restored = OmegaConf.load(saved_config)
+    validate_rpent_cfg(restored)
+    assert shared_multi_modal_processor_enabled(restored.rollout.sglang) is True
+    assert OmegaConf.to_container(restored) == OmegaConf.to_container(cfg)
+
+
 @pytest.mark.parametrize("field", ["cache_bytes", "prefetch_batches", "prefetch_bytes"])
 def test_legacy_image_budgets_normalize_and_reject_conflicts(field):
     from rlinf.config import validate_multimodal_learner_cfg, validate_rpent_cfg
 
     cfg = compose(
         [
-            "rollout.sglang.enable_token_space_processor=true",
+            "rollout.sglang.enable_shared_multi_modal_processor=true",
             "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
             "tools.rpent.store_images_on_disk=true",
         ]
@@ -770,8 +804,8 @@ def test_native_token_space_prefetch_matches_synchronous_replay(native_multiturn
             "between 0 and 1",
         ),
         (
-            ["rollout.sglang.enable_token_space_processor=false"],
-            "enable_token_space_processor",
+            ["rollout.sglang.enable_shared_multi_modal_processor=false"],
+            "enable_shared_multi_modal_processor",
         ),
     ],
 )
@@ -781,7 +815,7 @@ def test_shared_preprocess_cache_rejects_invalid_settings(tmp_path, overrides, e
     cfg = compose(
         [
             "rollout.model.model_path=/unused/model",
-            "rollout.sglang.enable_token_space_processor=true",
+            "rollout.sglang.enable_shared_multi_modal_processor=true",
             "rollout.sglang.enable_token_space_preprocess_cache=true",
             "rollout.sglang.token_space_preprocess_cache_trust_url=true",
             f"rollout.sglang.token_space_preprocess_cache_dir={tmp_path}",

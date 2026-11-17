@@ -20,7 +20,11 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
     """Validate RPent planner PPO or evaluation, selected by ``tools.rpent``."""
-    from rlinf.config import validate_agent_ppo_cfg, validate_async_agent_ppo_cfg
+    from rlinf.config import (
+        shared_multi_modal_processor_enabled,
+        validate_agent_ppo_cfg,
+        validate_async_agent_ppo_cfg,
+    )
 
     rpent = cfg.get("tools", {}).get("rpent")
     if rpent is None:
@@ -48,18 +52,16 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             "tools.rpent.store_images_on_disk requires keep_episodes=all; "
             "training and checkpoint recovery still reference episode images."
         )
-    if OmegaConf.select(
-        cfg, "rollout.sglang.enable_token_space_processor", default=False
-    ):
+    if shared_multi_modal_processor_enabled(OmegaConf.select(cfg, "rollout.sglang")):
         if cfg.rollout.rollout_backend != "sglang" or not rpent.get(
             "store_images_on_disk", False
         ):
             raise ValueError(
-                "Token-space RPent requires SGLang and store_images_on_disk=True"
+                "Shared multimodal preprocessing for RPent requires SGLang and store_images_on_disk=True"
             )
         if cfg.rollout.get("env_vars", {}).get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"):
             raise ValueError(
-                "Remove SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE when enabling token-space processing"
+                "Remove SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE when enabling shared multimodal preprocessing"
             )
         learner_roles = (
             ("actor", "critic") if cfg.runner.task_type == "reasoning" else ()
@@ -72,14 +74,14 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
                 or worker.model.model_type != "qwen3_5"
             ):
                 raise ValueError(
-                    "Token-space training currently requires Qwen3.5 Megatron-Bridge actor/critic"
+                    "Shared multimodal training currently requires Qwen3.5 Megatron-Bridge actor/critic"
                 )
             if (
                 worker.model.pipeline_model_parallel_size != 1
                 or worker.model.get("context_parallel_size", 1) != 1
             ):
                 raise ValueError(
-                    "Token-space position verification currently requires PP=1 and CP=1"
+                    "Shared multimodal position verification currently requires PP=1 and CP=1"
                 )
     # Resolve legacy RPent budgets before the generic learner config is validated.
     for role in ("actor", "critic"):

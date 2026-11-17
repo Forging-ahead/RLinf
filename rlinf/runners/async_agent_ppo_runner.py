@@ -23,6 +23,7 @@ from typing import Any
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.data.schema.agent_trajectory import (
     construct_rollout_batch,
     prepare_agent_ppo_targets,
@@ -138,10 +139,8 @@ class AsyncAgentPPORunner(AgentPPORunner):
         return {
             "dataloader": self.train_dataloader.state_dict(),
             "async_rollout": {
-                "token_space": OmegaConf.select(
-                    self.cfg,
-                    "rollout.sglang.enable_token_space_processor",
-                    default=False,
+                "token_space": shared_multi_modal_processor_enabled(
+                    OmegaConf.select(self.cfg, "rollout.sglang")
                 ),
                 "buffer": buffer,
                 "pending": [
@@ -166,8 +165,8 @@ class AsyncAgentPPORunner(AgentPPORunner):
                 "Async resume requires a checkpoint containing buffered rollout state."
             )
         rollout = state["async_rollout"]
-        token_space = OmegaConf.select(
-            self.cfg, "rollout.sglang.enable_token_space_processor", default=False
+        token_space = shared_multi_modal_processor_enabled(
+            OmegaConf.select(self.cfg, "rollout.sglang")
         )
         if rollout.get("token_space", False) != token_space:
             raise ValueError(

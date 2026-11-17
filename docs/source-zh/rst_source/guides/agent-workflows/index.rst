@@ -13,7 +13,7 @@
      - 智能体任务的操作流程。
 
    * - :doc:`RPent 多模态训练 <rpent-multimodal>`
-     - 设置 Logprob 重算、TokenSpace 和图像内存预算。
+     - 设置 Logprob 重算、共享多模态预处理和图像内存预算。
 
 .. toctree::
    :hidden:
