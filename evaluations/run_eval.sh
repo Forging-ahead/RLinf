@@ -50,7 +50,7 @@ run_eval_cmd() {
         python "${SRC_FILE}"
         --config-path "${config_path}/"
         --config-name "${config_name}"
-        "runner.logger.log_path=\"${log_dir}\""
+        "runner.logger.log_path=${log_dir}"
     )
     if [ ${#extra_args[@]} -gt 0 ]; then
         cmd+=("${extra_args[@]}")

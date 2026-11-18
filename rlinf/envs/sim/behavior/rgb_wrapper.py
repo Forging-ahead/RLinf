@@ -20,7 +20,7 @@ from rlinf.envs.sim.behavior.utils import RGB_RESOLUTIONS, set_head_camera_apert
 
 
 class RGBWrapper(EnvironmentWrapper):
-    """R1Pro RGB profile for the 3.9.3 evaluator's camera configuration."""
+    """A RGB-only wrapper for OmniGibson."""
 
     @classmethod
     def camera_spec(cls) -> dict:

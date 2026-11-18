@@ -748,7 +748,9 @@ configure_nvidia() {
             echo "[install.sh] Could not resolve a driver-compatible CUDA wheel for torch ${_torch_ver}; leaving torch on the default index (UV_TORCH_BACKEND=${UV_TORCH_BACKEND})." >&2
         fi
     fi
-    if [ "$ENV_NAME" = "behavior" ] || { [ "$MODEL" = "openpi" ] && [ -z "$ENV_NAME" ]; }; then
+    if [ "$ENV_NAME" = "behavior" ]; then
+        # Official setup uses pip to replace uv-installed packages.
+        export UV_LINK_MODE=copy
         # Match the official 5.1 SDK CUDA line, including GPU-less image builds.
         PLATFORM_TORCH_STR="+cu128"
         PLATFORM_TORCH_INDEX="https://download.pytorch.org/whl/cu128"
@@ -1693,7 +1695,7 @@ apply_model_default_torch() {
     local model_torch="-"
     case "$MODEL" in
         openpi)
-            if [ "$ENV_NAME" = "yam" ] || [ -z "$ENV_NAME" ]; then
+            if [ "$ENV_NAME" = "yam" ]; then
                 # OpenPI 0.1.1 requires torch 2.7.1; sync its matching vision/codec stack.
                 model_torch="2.7.1"
             fi
@@ -2040,9 +2042,7 @@ EOF
     if [ "$MODEL" = "diffusion" ]; then
         sync_args+=(--inexact)
     fi
-    if [ "${1:-}" != "--no-sync" ]; then
-        uv sync --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
-    fi
+    uv sync --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
 }
 
 install_flash_attn() {
@@ -2413,9 +2413,7 @@ install_common_embodied_deps() {
     if [ "$MODEL" = "diffusion" ]; then
         sync_args+=(--inexact)
     fi
-    if [ "${1:-}" != "--no-sync" ]; then
-        uv sync --extra embodied --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
-    fi
+    uv sync --extra embodied --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
     if [ -n "$PLATFORM_COMMON_REQ_EXCLUDE_RE" ]; then
         { grep -Ev "$PLATFORM_COMMON_REQ_EXCLUDE_RE" "$SCRIPT_DIR/embodied/envs/common.txt" || [ $? -eq 1 ]; } \
             | uv pip install -r -
@@ -2535,11 +2533,14 @@ install_openvla_oft_model() {
             install_flash_attn
             uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openvla-oft.git@RLinf/v0.1 --no-build-isolation
             ;;
-        "")
+        behavior)
             create_and_sync_venv
             install_common_embodied_deps
-            uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git --no-build-isolation
+            uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git  --no-build-isolation
+            install_behavior_env
+            pushd ~ >/dev/null
             install_flash_attn
+            popd >/dev/null
             ;;
         maniskill_libero|libero)
             create_and_sync_venv
@@ -2658,14 +2659,15 @@ EOF
             uv pip install "rlinf-openpi==0.1.1" "${yam_openpi_deps[@]}"
             install_flash_attn
             ;;
-        "")
-            # The replacement step edits installed files; keep the cache immutable.
-            export UV_LINK_MODE=copy
+        behavior)
             create_and_sync_venv
             install_common_embodied_deps
-            uv pip uninstall transformers
-            # PEFT requires the stock distribution name; match the public fork's API.
-            uv pip install "rlinf-openpi==0.1.1" "transformers==4.53.2" peft
+            uv pip install "rlinf-openpi==0.1.1"
+            install_behavior_env
+            uv pip install "${RAY_COMPAT_DEPS[@]}"
+            pushd ~ >/dev/null
+            install_flash_attn
+            popd >/dev/null
             ;;
         maniskill_libero|libero)
             create_and_sync_venv
@@ -3252,6 +3254,15 @@ install_dreamzero_deps() {
 
 install_dreamzero_model() {
     case "$ENV_NAME" in
+        behavior)
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_behavior_env
+            install_dreamzero_deps
+            pushd ~ >/dev/null
+            install_flash_attn
+            popd >/dev/null
+            ;;
         maniskill_libero|libero)
             create_and_sync_venv
             install_common_embodied_deps
@@ -3522,13 +3533,7 @@ install_env_only() {
     if [ "$ENV_NAME" = "d4rl" ] || [ "$ENV_NAME" = "simple" ]; then
         PYTHON_VERSION="3.10"
     fi
-    if [ "$ENV_NAME" = "behavior" ]; then
-        # Official setup uses pip to replace uv-installed packages.
-        export UV_LINK_MODE=copy
-        create_and_sync_venv --no-sync
-    else
-        create_and_sync_venv
-    fi
+    create_and_sync_venv
     SKIP_ROS=${SKIP_ROS:-0}
     # A robot host trains in its env venv, so it takes the same embodied extra,
     # training dependencies and system libraries as a model install.
@@ -3538,10 +3543,6 @@ install_env_only() {
             ;;
     esac
     case "$ENV_NAME" in
-        behavior)
-            install_common_embodied_deps --no-sync
-            install_behavior_env
-            ;;
         d4rl)
             install_d4rl_env
             ;;
@@ -3855,41 +3856,6 @@ install_liberoplus_env() {
     reset_libero_config
 }
 
-# The SDK and the model need different versions of Torch, LeRobot and the HF
-# libraries. Keep the original combined CLI, with the SDK in a sibling venv.
-install_behavior_with_model() {
-    case "$MODEL" in
-        openpi|openvla-oft|dreamzero) ;;
-        *) echo "Unsupported BEHAVIOR model: $MODEL" >&2; return 1 ;;
-    esac
-    local common_args=() model_args=()
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --model|--env|--venv) shift 2 ;;
-            --torch) model_args+=("$1" "$2"); shift 2 ;;
-            *) common_args+=("$1"); shift ;;
-        esac
-    done
-    local model_dir sdk_dir sdk_python ray_version activate_line
-    model_dir=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$VENV_DIR")
-    sdk_dir="$model_dir-behavior"
-    sdk_python="$sdk_dir/bin/python"
-    bash "$SCRIPT_PATH" "${common_args[@]}" --venv "$sdk_dir" --env behavior --no-flash-attn
-    bash "$SCRIPT_PATH" "${common_args[@]}" "${model_args[@]}" --venv "$model_dir" --model "$MODEL"
-    if [ "$("$sdk_python" -V)" != "$("$model_dir/bin/python" -V)" ]; then
-        echo "The BEHAVIOR and model environments require the same Python patch version for Ray." >&2
-        return 1
-    fi
-    ray_version=$("$sdk_python" -c 'from importlib.metadata import version; print(version("ray"))')
-    (
-        export PATH="$model_dir/bin:$PATH"
-        install_uv
-        uv pip install --no-config --python "$model_dir/bin/python" "ray[default]==$ray_version"
-    )
-    printf -v activate_line 'export BEHAVIOR_ENV_PYTHON=%q' "$sdk_python"
-    grep -Fqx "$activate_line" "$model_dir/bin/activate" || printf '%s\n' "$activate_line" >> "$model_dir/bin/activate"
-}
-
 validate_behavior_install() {
     [ "$ENV_NAME" = "behavior" ] || return 0
     if [ "$PLATFORM" != "nvidia" ] || [ "$(uname -s)" != "Linux" ]; then
@@ -3908,6 +3874,8 @@ validate_behavior_install() {
 }
 
 install_behavior_env() {
+    # Use BEHAVIOR_PATH as the checkout location if set (shared, cloned on first use);
+    # otherwise clone into the venv.
     local behavior_dir
     behavior_dir=$(clone_or_reuse_repo BEHAVIOR_PATH "$VENV_DIR/BEHAVIOR-1K" https://github.com/StanfordVL/BEHAVIOR-1K.git -b v3.9.3-post2 --depth 1)
     local expected_ref="a8247a8cc1633fe1ca0cc66aa07243d46c64f155"
@@ -3967,11 +3935,17 @@ SDK_DEPS
 )
     local isaac_requirements=()
     mapfile -t isaac_requirements <<< "$isaac_specs"
-    # Resolve the worker requirements together with the SDK. OpenPI has its
-    # own environment: its Hub/Datasets versions cannot satisfy this SDK fork.
+    # Include the original model environment requirements in the same solve.
+    # Otherwise updating the SDK can silently replace dependencies of the model.
+    local model_requirements=()
+    if [ -n "$MODEL" ]; then
+        model_requirements+=(--extra embodied)
+    fi
+    if [ "$MODEL" = "openpi" ]; then
+        model_requirements+=("rlinf-openpi==0.1.1")
+    fi
     uv pip install --no-config --no-build-isolation --index https://pypi.nvidia.com \
-        --override "$SCRIPT_DIR/embodied/envs/behavior-overrides.txt" \
-        -r "$PYPROJECT_FILE" "${RAY_COMPAT_DEPS[@]}" "imageio[ffmpeg]" \
+        -r "$PYPROJECT_FILE" "${model_requirements[@]}" "${RAY_COMPAT_DEPS[@]}" "imageio[ffmpeg]" \
         -e "$behavior_dir/OmniGibson" -e "$behavior_dir/bddl3" "${isaac_requirements[@]}" \
         "lerobot[dataset] @ git+https://github.com/wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687"
     if [ -z "$NO_INSTALL_RLINF_CMD" ]; then
@@ -4886,10 +4860,6 @@ main() {
         echo "--paddle-gpu is only supported with 'embodied --model diffusion'." >&2
         exit 1
     fi
-    if [ "$TARGET" = embodied ] && [ "$ENV_NAME" = behavior ] && [ -n "$MODEL" ]; then
-        install_behavior_with_model "$@"
-        return
-    fi
     validate_behavior_install
     validate_python_version
     validate_engine
@@ -4915,7 +4885,7 @@ main() {
                     echo "Unknown environment: $ENV_NAME. Supported environments: ${SUPPORTED_ENVS[*]}" >&2
                     exit 1
                 fi
-            elif [[ "$MODEL" != "dreamzero" && "$MODEL" != "fastwam" && "$MODEL" != "diffusion" && "$MODEL" != "openpi" && "$MODEL" != "openvla-oft" ]]; then
+            elif [[ "$MODEL" != "dreamzero" && "$MODEL" != "fastwam" && "$MODEL" != "diffusion" ]]; then
                 echo "--env must be specified when target=embodied." >&2
                 exit 1
             fi

@@ -16,12 +16,12 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shlex
 import sys
 import warnings
-from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
@@ -52,6 +52,12 @@ class BehaviorProcess:
         from .simulator import BehaviorSimulator
 
         self.backend = BehaviorSimulator(cfg, num_envs, seed)
+        # Isaac Sim's `omni.kit.app` calls ``gc.disable()`` at startup.
+        # OmniGibson has self-referential cycles and leaks memory when
+        # cyclic GC is disabled. Since we do not need real-time performance,
+        # enable cyclic GC here so that we do not encounter OOMs in long runs.
+        gc.enable()
+
         # Upstream renamed this option; an explicit modern value wins, even False.
         self.skip_obs = bool(
             cfg.get(
@@ -247,25 +253,34 @@ class BehaviorEnv(gym.Env):
         record_metrics: bool = True,
     ) -> None:
         validate_simulator_version(cfg)
-        if num_envs < 1 or total_num_processes % worker_info.group_world_size:
-            raise ValueError(
-                "num_envs must be positive and worker/stage counts divisible."
-            )
         self.cfg = cfg
+        self.reward_coef = cfg.get("reward_coef", 1)
+
         self.num_envs = num_envs
+        self.ignore_terminations = cfg.ignore_terminations
         self.seed_offset = seed_offset
-        self.seed = int(cfg.seed) + seed_offset
+        self.seed = int(self.cfg.seed) + seed_offset
         self.total_num_processes = total_num_processes
         self.worker_info = worker_info
-        self.pipeline_stage_num = total_num_processes // worker_info.group_world_size
         self.record_metrics = record_metrics
-        self.reward_coef = cfg.get("reward_coef", 1.0)
-        self.ignore_terminations = cfg.ignore_terminations
+        self._is_start = True
+        self.enable_offload = cfg.get("enable_offload", False)
+        self.enable_init_offload = cfg.get("enable_init_offload", True)
+        self.pool = None
+        self.pool_offset = None
+        self.task_description = None
+        if num_envs < 1:
+            raise ValueError("num_envs must be positive.")
+        if total_num_processes % worker_info.group_world_size != 0:
+            raise ValueError(
+                f"total_num_processes ({total_num_processes}) must be divisible by "
+                f"worker_info.group_world_size ({worker_info.group_world_size}) to infer pipeline_stage_num."
+            )
+        self.pipeline_stage_num = total_num_processes // worker_info.group_world_size
+
         self.auto_reset = cfg.auto_reset
         self.max_episode_steps = torch.tensor(cfg.max_episode_steps)
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
-        self.enable_offload = cfg.get("enable_offload", False)
-        self.enable_init_offload = cfg.get("enable_init_offload", True)
         if self.auto_reset and self.enable_offload:
             raise ValueError(
                 "BEHAVIOR 3.9.3 cannot combine auto_reset with enable_offload: "
@@ -273,24 +288,12 @@ class BehaviorEnv(gym.Env):
                 "the worker's previous observation. Disable one of these options."
             )
         self._device = cfg.get("device", "cuda")
-        self._is_start = True
-        self.pool = None
-        self.pool_offset = None
-        self.task_description = None
         self._requires_reset = True
         self._steps = torch.zeros(num_envs, dtype=torch.long, device=self.device)
-        self.success_once = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-        self.returns = torch.zeros(num_envs, device=self.device)
+        if self.record_metrics:
+            self._init_metrics()
         if not (self.enable_offload and not self.enable_init_offload):
             self._ensure_pool()
-
-    def _load_tasks_cfg(self, activity_name: str) -> None:
-        path = Path(__file__).with_name("behavior_task.jsonl")
-        with path.open(encoding="utf-8") as stream:
-            tasks = (json.loads(line) for line in stream if line.strip())
-            self.task_description = {task["task_name"]: task["task"] for task in tasks}[
-                activity_name
-            ]
 
     def _ensure_pool(self) -> None:
         if self.pool is None:
@@ -307,6 +310,23 @@ class BehaviorEnv(gym.Env):
                 raise
             self.pool = pool
             self.pool_offset = 0
+
+    def _load_tasks_cfg(self, activity_name: str):
+        # Read task description
+
+        task_description_path = os.path.join(
+            os.path.dirname(__file__), "behavior_task.jsonl"
+        )
+        with open(task_description_path, "r", encoding="utf-8") as f:
+            text = f.read()
+            task_description = [
+                json.loads(x) for x in text.strip().split("\n") if x.strip()
+            ]
+        task_description_map = {
+            task_description[i]["task_name"]: task_description[i]["task"]
+            for i in range(len(task_description))
+        }
+        self.task_description = task_description_map[activity_name]
 
     def env_reset(self, env_indices: list[int] | None = None) -> tuple[list, list]:
         """Return raw simulator observations and per-environment info."""
@@ -368,12 +388,22 @@ class BehaviorEnv(gym.Env):
             "task_descriptions": [self.task_description] * len(extracted_obs_list),
             "states": torch.stack(
                 [obs["state"] for obs in extracted_obs_list], axis=0
-            ),  # [N_ENV, 32]
+            ),  # [N_ENV, 256]
         }
         return obs
 
+    def _init_metrics(self):
+        self.success_once = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.returns = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float32
+        )
+
     def _reset_metrics(self, indices: list[int]) -> None:
         self._steps[indices] = 0
+        if not self.record_metrics:
+            return
         self.success_once[indices] = False
         self.returns[indices] = 0
 

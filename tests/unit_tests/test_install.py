@@ -37,39 +37,30 @@ def test_incompatible_behavior_stack_fails_before_install(python, torch, platfor
     assert "BEHAVIOR 3.9.3 requires" in result.stderr
 
 
-def test_behavior_and_model_select_their_respective_torch_versions():
+def test_behavior_selects_sdk_torch_version():
     result = run_functions(
         'ENV_NAME=behavior; TORCH_VERSION=""; apply_env_default_torch\n'
         'test "$TORCH_VERSION" = 2.7.0\n'
-        'TARGET=embodied; MODEL=openpi; ENV_NAME=""; TORCH_VERSION=""; apply_model_default_torch\n'
-        'test "$TORCH_VERSION" = 2.7.1\n'
     )
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("model", ["", "openpi"])
-def test_behavior_install_reuses_common_helpers(model):
+def test_behavior_install_reuses_common_helpers():
     result = run_functions(
         "create_and_sync_venv() { echo CREATE; }\n"
         "install_common_embodied_deps() { echo COMMON; }\n"
+        "install_flash_attn() { return 0; }\n"
         "install_behavior_env() { echo SDK393; }\n"
         'uv() { echo "UV $*"; }\n'
         "python() { cat >/dev/null; echo 3.11; }\n"
         "cp() { return 0; }\n"
         "bash() { return 0; }\n"
-        + (
-            'ENV_NAME=""\ninstall_openpi_model\n'
-            if model
-            else "ENV_NAME=behavior\ninstall_env_only\n"
-        )
+        'ENV_NAME=behavior\ninstall_openpi_model\n'
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[:2] == ["CREATE", "COMMON"]
-    if model:
-        assert "SDK393" not in result.stdout
-        assert "UV pip install rlinf-openpi==0.1.1" in result.stdout
-    else:
-        assert result.stdout.splitlines()[2] == "SDK393"
+    assert "SDK393" in result.stdout
+    assert "UV pip install rlinf-openpi==0.1.1" in result.stdout
 
 
 def test_wrong_reused_sdk_checkout_does_not_run_setup(tmp_path):
@@ -83,35 +74,6 @@ def test_wrong_reused_sdk_checkout_does_not_run_setup(tmp_path):
     assert result.returncode != 0
     assert "BEHAVIOR_PATH must point to" in result.stderr
     assert not marker.exists()
-
-
-def test_combined_install_routes_model_and_sdk_to_sibling_environments(tmp_path):
-    model = tmp_path / "model"
-    sdk = tmp_path / "model-behavior"
-    for path in (model, sdk):
-        (path / "bin").mkdir(parents=True)
-        py = path / "bin" / "python"
-        py.write_text(
-            '#!/bin/sh\nif [ "$1" = -V ]; then echo 3.11.14; else echo 2.52.1; fi\n'
-        )
-        py.chmod(0o755)
-    (model / "bin" / "activate").touch()
-    uv = model / "bin" / "uv"
-    uv.write_text("#!/bin/sh\nexit 0\n")
-    uv.chmod(0o755)
-    result = run_functions(
-        f'MODEL=openpi; VENV_DIR="{model}"; '
-        'bash() { echo "INSTALL $*"; }\n'
-        "install_behavior_with_model embodied --model openpi --env behavior --no-root\n"
-    )
-    assert result.returncode == 0, result.stderr
-    calls = result.stdout.splitlines()
-    assert len(calls) == 2
-    assert f"--no-root --venv {sdk} --env behavior" in calls[0]
-    assert f"--no-root --venv {model} --model openpi" in calls[1]
-    assert (model / "bin" / "activate").read_text().strip() == (
-        f"export BEHAVIOR_ENV_PYTHON={sdk}/bin/python"
-    )
 
 
 @pytest.mark.parametrize("checkout", ["separate", "same", "symlink"])

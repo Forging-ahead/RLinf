@@ -289,7 +289,8 @@ FROM embodied-common-image AS embodied-behavior-openvlaoft-image
 # Install openvla-oft env
 RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openvla-oft --model openvla-oft --env behavior
 
-ENV BEHAVIOR_ENV_PYTHON=${UV_PATH}/openvla-oft-behavior/bin/python
+# omnigibson downloads assets to /tmp during initialization
+RUN source switch_env openvla-oft && python -c "import omnigibson as og; cfg={}; og.Environment(cfg); og.shutdown()" || exit 0
 
 # Set default env
 RUN echo "source ${UV_PATH}/openvla-oft/bin/activate" >> ~/.bashrc
@@ -299,7 +300,8 @@ FROM embodied-common-image AS embodied-behavior-openpi-image
 # Install openpi env
 RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openpi --model openpi --env behavior
 
-ENV BEHAVIOR_ENV_PYTHON=${UV_PATH}/openpi-behavior/bin/python
+# omnigibson downloads assets to /tmp during initialization
+RUN source switch_env openpi && python -c "import omnigibson as og; cfg={}; og.Environment(cfg); og.shutdown()" || exit 0
 
 RUN source switch_env openpi && download_assets ${INSTALL_MIRROR_OPTION} --dir /opt/assets --assets openpi
 RUN link_assets

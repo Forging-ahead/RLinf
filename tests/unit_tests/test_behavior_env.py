@@ -29,7 +29,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from rlinf.envs.sim.behavior import BehaviorSimulator, behavior_env
@@ -490,33 +489,6 @@ def test_behavior_pipeline_stages_have_independent_simulation_state(make_behavio
     assert second.pool.close_count == 0
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        "evaluations/behavior/behavior_openpi_pi05_eval",
-        "examples/embodiment/config/behavior_ppo_openpi",
-        "examples/embodiment/config/behavior_ppo_openpi_pi05",
-        "examples/embodiment/config/behavior_ppo_openvlaoft",
-        "tests/e2e_tests/embodied/behavior_ppo_openpi",
-        "tests/e2e_tests/embodied/behavior_ppo_openvlaoft",
-        "tests/e2e_tests/evaluations/behavior_openpi_eval",
-    ],
-)
-def test_behavior_jobs_select_the_sdk_interpreter(config, monkeypatch):
-    root = Path(__file__).resolve().parents[2]
-    monkeypatch.setenv("REPO_PATH", str(root))
-    monkeypatch.setenv("EMBODIED_PATH", str(root / "examples/embodiment"))
-    monkeypatch.setenv("BEHAVIOR_ENV_PYTHON", "/sdk/bin/python")
-    config_path = root / config
-    with initialize_config_dir(version_base=None, config_dir=str(config_path.parent)):
-        cfg = compose(config_name=config_path.name)
-    env_group = cfg.cluster.component_placement.env.node_group
-    groups = {group.label: group for group in cfg.cluster.node_groups}
-    assert groups[env_group].env_configs[0].python_interpreter_path == "/sdk/bin/python"
-    assert cfg.env.eval.env_type == "behavior"
-    assert cfg.env.eval.simulator_version == "3.9.3"
-
-
 @pytest.mark.parametrize("version", [None, "3.9.3", "3.9.3-post2", "3.7.1"])
 def test_public_worker_uses_native_simulator_without_starting_sdk(version, monkeypatch):
     from rlinf.envs import get_env_cls
@@ -530,10 +502,7 @@ def test_public_worker_uses_native_simulator_without_starting_sdk(version, monke
         OmegaConf.load(preset),
         {"device": "cpu", "enable_offload": True, "enable_init_offload": False},
     )
-    assert cfg.simulator_version == "3.9.3"
-    if version is None:
-        del cfg.simulator_version
-    else:
+    if version is not None:
         cfg.simulator_version = version
     worker_env = get_env_cls(cfg.env_type, cfg)
     assert worker_env is get_env_cls("behavior") is behavior_env.BehaviorEnv
