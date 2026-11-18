@@ -23,7 +23,7 @@ RPent Episode PPO 与 GRPO
 
    .. grid-item-card:: 硬件
 
-      四台各 8 张 H100 的模型主机，一台 8 张 A100 的环境主机
+      四台各 8 张 H200 的主机；模型、SAM3 与环境进程共卡
 
 任务
 ~~~~
@@ -77,68 +77,22 @@ GRPO 如何训练
 安装
 ----
 
-模型主机需要 Linux x86-64、Git、``uv``、C++ 编译器、Rust、``patch`` 和 CUDA 13 开发工具链。FA4 训练路径需要 H100 或更新的 GPU，以及兼容 CUDA 13 wheel 的驱动。环境主机另外准备 EGL/OpenGL 和下文的 CUDA 12.8 仿真环境。
+每台 H200 主机使用 Linux x86-64 的 ``reason`` 镜像。保留 ``/opt/venv/reason`` 中的 Python 3.12.12、Torch 2.11.0/CUDA 12.8、torchvision 0.26.0、FA2 2.8.3 和 Transformer Engine 2.17。宿主机需具备 NVIDIA 驱动、CUDA 12.8 开发工具链及 EGL/OpenGL 库。
 
-已有 RLinf ``reason`` 镜像可以提供系统工具，但其中默认的 Python 环境不包含这套 TokenSpace 依赖。可以在 CUDA 13 开发镜像内，或已准备好工具链的主机上，安装独立环境。镜像构建选项见 ``docker/README.md``；下文用安装脚本明确依赖，不依赖未记录版本的现有镜像。
-
-选择共享目录，克隆两个仓库的 ``rpent-ppo`` 分支。部署实验时记录具体 commit：
+将两个 ``rpent-ppo`` checkout 放在 ``$STACK_ROOT/repos/RLinf``、``$STACK_ROOT/repos/RPent``，记录各自的 Git revision。完整离线包放在 ``$STACK_ROOT/envs/offline_package``；模型和场景资源分别放在 ``$STACK_ROOT/models``、``$STACK_ROOT/data``。每个节点执行安装，再激活同一个环境：
 
 .. code-block:: bash
 
-   export STACK_ROOT="$HOME/rpent-stack"
-   mkdir -p "$STACK_ROOT/repos"
-   git clone --branch rpent-ppo https://github.com/zhexuanxu/RLinf.git "$STACK_ROOT/repos/RLinf"
-   git clone --branch rpent-ppo https://github.com/zhexuanxu/RPent.git "$STACK_ROOT/repos/RPent"
-   export RLINF_ROOT="$STACK_ROOT/repos/RLinf"
-   export RPENT_ROOT="$STACK_ROOT/repos/RPent"
-   git -C "$RLINF_ROOT" rev-parse HEAD
-   git -C "$RPENT_ROOT" rev-parse HEAD
+   export STACK_ROOT=/mnt/public/xzxuan
+   bash "$STACK_ROOT/envs/offline_package/install.sh"
+   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   python -m pip check
 
-每台模型主机都安装独立的 TokenSpace 环境：
+安装器检查镜像版本与 SHA256，备份被替换的包，再完全离线安装本地 wheel。重复执行不会改变包版本。离线包结构与依赖构建说明见 ``requirements/rpent/README.md``。
 
-.. code-block:: bash
+该配置使用 SGLang ``0.5.12.post1``、Transformers 5.8.1、Megatron-Core ``0.18.0+rpent.cu128.1``、Bridge ``0.5.0+rpent.cu128.1``、NumPy 1.26.4、MuJoCo 3.3.0 和 robosuite 1.5.2。RLinf 上游图像处理器保存推理实际使用的 prompt ID、像素、图片区间、grid 和 M-RoPE，供训练端回放。SGLang 使用未修改的发布版，无需回移源码。Core wheel 包含 CPU offload checkpoint 修补。
 
-   cd "$RLINF_ROOT"
-   UV_TORCH_BACKEND=cu130 UNINSTALL_FA4=0 bash requirements/install.sh agentic \
-     --engine sglang --sglang token-space --torch 2.14.1 \
-     --transformers 5.19.0 --python 3.12.12 \
-     --venv "$STACK_ROOT/envs/model" --install-rlinf
-   source "$STACK_ROOT/envs/model/bin/activate"
-   uv pip freeze > "$STACK_ROOT/model-packages.txt"
-
-该配置固定 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1、Transformers 5.19.0，并安装 Transformer Engine 2.17、Megatron-Bridge 0.5、Megatron 0.18 源码及 CPU offload checkpoint 修补。自行设置 ``MEGATRON_PATH`` 时，使用 commit ``dc0ee41ada177d4c74ba46bb501bba5967264815``，并手动应用以下补丁：
-
-.. code-block:: text
-
-   requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch
-
-安装器还会应用 `Transformer Engine PR 3540 <https://github.com/NVIDIA/TransformerEngine/pull/3540>`__ 中的 FA4 窗口参数适配。该修补只改 FA4 的 Python 调用边界，保留原生 attention 内核。FA2 和 FA4 应放在不同环境中。各节点必须保留完整 Python 环境、Python 源码、依赖源码树和 JIT 头文件；只复制部分 site-packages 无法满足需要读取源码的编译器。不要替换或清理运行中作业使用的环境。
-
-每台模型主机另装 CPU planner 环境。它运行 RPent 模型客户端，通过 RPC 调用远端工具，并用本地 checkpoint processor 统计 prompt token；不加载规划器权重或模拟器：
-
-.. code-block:: bash
-
-   cd "$RPENT_ROOT"
-   uv venv --python 3.12 "$STACK_ROOT/envs/planner"
-   uv pip install --python "$STACK_ROOT/envs/planner/bin/python" \
-     --prerelease=allow --torch-backend cpu -r requirements/episode-planner.txt
-
-将 ``tools.rpent.python`` 指向 ``$STACK_ROOT/envs/planner/bin/python``。启动 Ray 前重新激活 model 环境。
-
-在环境主机安装仿真和 SAM3：
-
-.. code-block:: bash
-
-   cd "$RPENT_ROOT"
-   export RLINF_ROOT
-   uv venv --python 3.12 "$STACK_ROOT/envs/environment"
-   source "$STACK_ROOT/envs/environment/bin/activate"
-   uv pip install --prerelease=allow --torch-backend cu128 \
-     -r requirements/episode-ppo-env.txt
-   export PYTHONPATH="$RPENT_ROOT:$RLINF_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-   export LIBERO_TYPE=pro MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
-
-``episode-ppo-env.txt`` 同时用于 PPO、GRPO 的 episode 环境，包含 LIBERO/LIBERO-PRO、SAM3、MuJoCo、robosuite 和 RPC 依赖。按 RPent 的 ``tools/rl/INSTALL.md`` 下载 LIBERO-PRO 资源，生成 ``LIBERO_CONFIG_PATH/config.yaml``。环境主机的 Transformers 4.57 与模型主机的 Transformers 5.19 分开安装。
+RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv/reason/bin/python``，``tools.rpent.python`` 也设为该路径。安装后的 benchmark 包通过软链接引用共享资源。模型及资源准备见 RPent 的 ``tools/rl/INSTALL.md``。不要替换运行中作业使用的环境。
 
 下载模型
 --------
@@ -189,33 +143,18 @@ GRPO 如何训练
 启动 SAM3 和环境服务
 ~~~~~~~~~~~~~~~~~~~~
 
-每张环境 GPU 启动两个 SAM3 实例，分别使用独立端口。例如第一张卡的两个实例：
+四个节点各自激活环境，并启动本机服务：
 
 .. code-block:: bash
 
-   python -m rpent.robots.components.sam3_server --cuda-device 0 --port 8114
-   python -m rpent.robots.components.sam3_server --cuda-device 0 --port 8115
+   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   python -m robots.rl.services \
+     --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
+     --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
 
-在独立终端或服务监督器下运行，GPU 1–7 也各启动两个实例并分配不同端口。将全部 16 个地址传给 ``rpent.robots.components.sam3_pool --backends``；完整服务示例见 RPent 的 ``tools/rl/WORKFLOWS.md``。把 pool URL 写入 ``SAM_POOL``，再启动环境 backend：
+每次启动使用新的输出目录。该进程统一管理每卡一个 SAM3、端口 28424 的本机 pool 和端口 28490 的环境 backend，退出时关闭自己的子进程。每卡提供三个环境槽位，四个节点可同时运行全部 80 个 smoke 候选。正式的 320 候选配置需要另外验证容量。episode 结束后释放槽位；学习前释放全部环境，SAM3 继续驻留。
 
-.. code-block:: bash
-
-   python -m robots.rl.remote_manager \
-     --output-dir "$STACK_ROOT/environment-runs" \
-     --gpu-slots 0:40,1:40,2:40,3:40,4:40,5:40,6:40,7:40 \
-     --max-initializing-per-gpu 2 --sam3-endpoint "$SAM_POOL" \
-     --host 127.0.0.1 --port 28490
-
-backend 提供 320 个槽位，采样中已结束的 episode 会逐步释放槽位，因此 ready 的瞬时数量可以低于 320。学习阶段应已释放全部环境，SAM3 仍驻留显存。实际容量还取决于 GPU 和主存余量。
-
-用已认证的私有路由将该 loopback 服务提供给每台模型主机。若使用 SSH 反向转发，在环境服务器上为每台模型主机分别运行，并固定主机密钥：
-
-.. code-block:: bash
-
-   ssh -NT -o ExitOnForwardFailure=yes \
-     -R 127.0.0.1:28490:127.0.0.1:28490 model-host-0
-
-在环境服务器上监督这些转发进程。四台模型主机加入同一私有 Ray 集群，并分别设置 ``RLINF_NODE_RANK``，参见 :doc:`/rst_source/guides/multi_node`。环境主机不加入 Ray。启动 Ray 前激活一致的 model 环境并导出路径；训练入口只在 Ray head 执行一次。
+四个节点加入同一私有 Ray 集群。启动 Ray 前激活统一环境，并分别导出不同的 ``RLINF_NODE_RANK``，参见 :doc:`/rst_source/guides/multi_node`。worker 使用所在节点的 loopback backend；训练入口只在 head 启动一次。
 
 准备任务和路径
 ~~~~~~~~~~~~~~
@@ -266,14 +205,16 @@ backend 提供 320 个槽位，采样中已结束的 episode 会逐步释放槽�
 启动训练
 ~~~~~~~~
 
-在 Ray head 启动 GRPO：
+先在 Ray head 运行四节点 smoke test：
 
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/model/bin/activate"
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_episode_sync_grpo \
+   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
+
+该 smoke 从 20 个候选组中选入 16 个完整组，每组 4 条，并发 80 个环境，完成一次更新后保存 checkpoint。正式配置继续使用 ``train_qwen3.5_4b_episode_sync_grpo`` 的 32/40 组、每组 8 条，须另行配置足够的环境容量。
 
 actor 使用 TP2/CP1/DP16，rollout 为 32 个 TP1 副本。actor、critic、rollout 保持 ``NCCL_MAX_CTAS=8``，SGLang 显存比例为 0.55。该比例不是共用 GPU 的总显存上限；对比实验时保持相同的 placement 和显存设置。
 

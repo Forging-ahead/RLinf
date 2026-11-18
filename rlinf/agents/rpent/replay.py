@@ -29,6 +29,7 @@ from omegaconf import DictConfig
 
 from rlinf.agents.rpent.episode import episode_output, episode_task
 from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker
+from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.agent_loop import AgentLoopOutput, MultiAgentLoopOutput
 
@@ -204,14 +205,28 @@ class SavedRPentBatch:
             )
             if token_space and refs:
                 contract = turn.get("multimodal_contract")
-                if (
-                    not contract
-                    or contract.get("format") != "sglang-token-space-v1"
-                    or [ref["sha256"] for ref in contract["image_refs"]] != hashes
-                    or contract["image_grid_thw"] != grid
-                ):
-                    raise ValueError(f"Saved TokenSpace contract differs in {name}")
+                if not contract or contract["image_grid_thw"] != grid:
+                    raise ValueError(f"Saved multimodal contract differs in {name}")
                 multimodal = copy.deepcopy(contract)
+                if contract.get("format") == "sglang-token-space-v1":
+                    if [ref["sha256"] for ref in contract["image_refs"]] != hashes:
+                        raise ValueError(
+                            f"Saved TokenSpace image order differs in {name}"
+                        )
+                elif contract.get("format") == "rlinf-qwen-image-inputs-v1":
+                    from rlinf.hybrid_engines.sglang.multimodal.replay import (
+                        replay_pixels,
+                    )
+
+                    if contract["prompt_token_ids"] != turn["input_ids"]:
+                        raise ValueError(f"Saved serving prompt differs in {name}")
+                    replay_pixels(multimodal)
+                    for field in ("mrope_positions", "mrope_position_delta"):
+                        multimodal[field] = torch.tensor(
+                            multimodal[field], dtype=torch.long
+                        )
+                else:
+                    raise ValueError(f"Unsupported saved multimodal format in {name}")
                 multimodal["image_grid_thw"] = torch.tensor(grid, dtype=torch.long)
             turns.append(
                 AgentLoopOutput(
@@ -263,14 +278,13 @@ class RPentReplayAgentLoopWorker(RPentAgentLoopWorker):
             != cfg.data.rollout_batch_size * cfg.algorithm.group_size
         ):
             raise ValueError("Saved replay batch size differs from rollout_batch_size")
-        self._replayed_episodes: list[str] = []
 
     async def run_one_query(
         self, prompt_ids: list[int], answer: list[str]
     ) -> MultiAgentLoopOutput:
         """Load this task's archived result without invoking a model or tools."""
         candidate = self.rollout_candidate()
-        result = await asyncio.to_thread(
+        return await asyncio.to_thread(
             self._saved_batch.load_episode,
             episode_task(answer),
             merge_prefix=self.cfg.agentloop.merge_prefix_turns,
@@ -278,16 +292,8 @@ class RPentReplayAgentLoopWorker(RPentAgentLoopWorker):
                 "max_scored_tokens", self.cfg.algorithm.sampling_params.max_new_tokens
             ),
             candidate_id=candidate["candidate_id"] if candidate else None,
-            token_space=self.cfg.rollout.sglang.get(
-                "enable_token_space_processor", False
-            ),
+            token_space=shared_multi_modal_processor_enabled(self.cfg.rollout.sglang),
         )
-        self._replayed_episodes.append(result.extra_fields["episode_id"])
-        return result
-
-    def replayed_episode_ids(self) -> list[str]:
-        """Return the archived episode identities supplied by this worker."""
-        return list(self._replayed_episodes)
 
 
 class RPentRecoveryAgentLoopWorker(RPentReplayAgentLoopWorker):

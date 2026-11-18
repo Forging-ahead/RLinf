@@ -26,7 +26,7 @@ Overview
 
    .. grid-item-card:: Hardware
 
-      Four 8-H100 model hosts and one 8-A100 environment host
+      Four 8-H200 hosts; model, SAM3 and environment processes share GPUs
 
 Tasks
 ~~~~~
@@ -89,94 +89,41 @@ batches are not a controlled evaluation of policy improvement.
 Installation
 ------------
 
-Prepare Linux x86-64, Git, ``uv``, a C++ compiler, Rust, ``patch`` and a
-CUDA 13 development toolkit on every model host. Use H100 or newer GPUs for the
-FA4 training path and a driver compatible with the CUDA 13 wheels. The environment
-host needs EGL/OpenGL and the separate CUDA 12.8 simulator environment below.
+Use the Linux x86-64 ``reason`` image on each H200 node. Keep the image’s Python 3.12.12,
+Torch 2.11.0/CUDA 12.8, torchvision 0.26.0, FA2 2.8.3 and Transformer Engine
+2.17 in ``/opt/venv/reason``. The host needs its NVIDIA driver,
+CUDA 12.8 development toolkit and EGL/OpenGL libraries.
 
-An existing RLinf ``reason`` image can supply system tools, but its default
-Python environment does not contain this TokenSpace stack. Build a separate
-environment inside a CUDA 13 development image or on a prepared host. Container
-build options are in ``docker/README.md``; the reproducible path here uses the
-installer rather than relying on an unversioned pre-existing image.
-
-Choose a shared root and clone the ``rpent-ppo`` branch of both repositories. Record immutable revisions
-when deploying a run.
+Put the two ``rpent-ppo`` checkouts under ``$STACK_ROOT/repos/RLinf`` and
+``$STACK_ROOT/repos/RPent``. Copy the complete offline package to
+``$STACK_ROOT/envs/offline_package`` and the separately downloaded models and
+assets to ``$STACK_ROOT/models`` and ``$STACK_ROOT/data``. Record both Git
+revisions. Install on every node, then activate the same environment:
 
 .. code-block:: bash
 
-   export STACK_ROOT="$HOME/rpent-stack"
-   mkdir -p "$STACK_ROOT/repos"
-   git clone --branch rpent-ppo https://github.com/zhexuanxu/RLinf.git "$STACK_ROOT/repos/RLinf"
-   git clone --branch rpent-ppo https://github.com/zhexuanxu/RPent.git "$STACK_ROOT/repos/RPent"
-   export RLINF_ROOT="$STACK_ROOT/repos/RLinf"
-   export RPENT_ROOT="$STACK_ROOT/repos/RPent"
-   git -C "$RLINF_ROOT" rev-parse HEAD
-   git -C "$RPENT_ROOT" rev-parse HEAD
+   export STACK_ROOT=/mnt/public/xzxuan
+   bash "$STACK_ROOT/envs/offline_package/install.sh"
+   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   python -m pip check
 
-On each model host, install the explicit TokenSpace profile into a new environment:
+The installer checks image versions and SHA256 hashes, backs up replaced
+packages and installs local wheels without network access. Repeating it keeps
+the same package versions. ``requirements/rpent/README.md`` describes the
+package layout and dependency builds.
 
-.. code-block:: bash
+This profile uses SGLang ``0.5.12.post1``, Transformers 5.8.1,
+Megatron-Core ``0.18.0+rpent.cu128.1``, Bridge ``0.5.0+rpent.cu128.1``,
+NumPy 1.26.4, MuJoCo 3.3.0 and robosuite 1.5.2. RLinf's upstream image processor captures actual serving prompt IDs,
+pixels, image spans, grid and M-RoPE for learner replay. SGLang is the unmodified
+release; no source backport is needed. The Core wheel includes the CPU-offload
+checkpoint repair.
 
-   cd "$RLINF_ROOT"
-   UV_TORCH_BACKEND=cu130 UNINSTALL_FA4=0 bash requirements/install.sh agentic \
-     --engine sglang --sglang token-space --torch 2.14.1 \
-     --transformers 5.19.0 --python 3.12.12 \
-     --venv "$STACK_ROOT/envs/model" --install-rlinf
-   source "$STACK_ROOT/envs/model/bin/activate"
-   uv pip freeze > "$STACK_ROOT/model-packages.txt"
-
-The profile pins SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``,
-Torch 2.14.1 and Transformers 5.19.0. It installs Transformer Engine 2.17,
-Megatron-Bridge 0.5 and the Megatron 0.18 source, including the CPU-offload
-checkpoint fix. With an explicit ``MEGATRON_PATH``, use commit
-``dc0ee41ada177d4c74ba46bb501bba5967264815`` and apply
-the following patch yourself:
-
-.. code-block:: text
-
-   requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch
-
-The installer also applies the FA4 window-sentinel adapter from
-`Transformer Engine PR 3540 <https://github.com/NVIDIA/TransformerEngine/pull/3540>`__.
-It changes the FA4 Python boundary, keeping the native attention kernels.
-Keep FA2 and FA4 in separate environments. Preserve the complete environment,
-Python sources, dependency source trees and JIT headers on each node; copying
-only a subset of site-packages is insufficient for source-inspecting compilers.
-Never replace or prune an environment used by an active job.
-
-On each model host, install a separate CPU planner environment. It runs RPent's
-model client and tools over RPC, using the local checkpoint processor to count
-prompt tokens. It does not load the planner weights or simulator:
-
-.. code-block:: bash
-
-   cd "$RPENT_ROOT"
-   uv venv --python 3.12 "$STACK_ROOT/envs/planner"
-   uv pip install --python "$STACK_ROOT/envs/planner/bin/python" \
-     --prerelease=allow --torch-backend cpu -r requirements/episode-planner.txt
-
-Set ``tools.rpent.python`` to ``$STACK_ROOT/envs/planner/bin/python``.
-Reactivate the model environment before starting Ray.
-
-On the environment host, install the simulator and SAM3 independently:
-
-.. code-block:: bash
-
-   cd "$RPENT_ROOT"
-   export RLINF_ROOT
-   uv venv --python 3.12 "$STACK_ROOT/envs/environment"
-   source "$STACK_ROOT/envs/environment/bin/activate"
-   uv pip install --prerelease=allow --torch-backend cu128 \
-     -r requirements/episode-ppo-env.txt
-   export PYTHONPATH="$RPENT_ROOT:$RLINF_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-   export LIBERO_TYPE=pro MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
-
-``episode-ppo-env.txt`` is the shared episode environment for PPO and GRPO.
-It supplies LIBERO/LIBERO-PRO, SAM3, MuJoCo, robosuite and the RPC dependencies.
-Follow RPent's ``tools/rl/INSTALL.md`` to download LIBERO-PRO assets and create
-``LIBERO_CONFIG_PATH/config.yaml``. Keep the simulator's Transformers 4.57
-installation separate from the model host's Transformers 5.19.
+RLinf, its RPent planner subprocesses, SGLang, SAM3 and LIBERO all use
+``/opt/venv/reason/bin/python``. Use this path for ``tools.rpent.python``.
+The installed benchmark packages link to the shared assets. Follow RPent's
+``tools/rl/INSTALL.md`` for model and asset preparation. Do not replace an
+environment while its jobs are running.
 
 Download the Model
 ------------------
@@ -231,47 +178,27 @@ Run It
 Start SAM3 and the Environment Backend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Run two SAM3 services per environment GPU, each with a distinct local port.
-For example, the first GPU's two instances can use ports 8114 and 8115:
+On each of the four nodes, activate the environment and start its local services:
 
 .. code-block:: bash
 
-   python -m rpent.robots.components.sam3_server --cuda-device 0 --port 8114
-   python -m rpent.robots.components.sam3_server --cuda-device 0 --port 8115
+   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   python -m robots.rl.services \
+     --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
+     --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
 
-Run the commands in separate terminals or under your service supervisor.
-Repeat for GPUs 1–7 with unique ports, then pass all 16 endpoints to
-``rpent.robots.components.sam3_pool --backends``; its complete service example
-is in RPent's ``tools/rl/WORKFLOWS.md``. Set ``SAM_POOL`` to the pool URL
-and start the environment backend:
+Use a fresh output directory on each start. The service manager launches one SAM3 per
+GPU, a local pool on port 28424 and an environment backend on port 28490.
+It stops its child processes on exit. Each GPU has three environment slots;
+the four nodes can host all 80 smoke candidates concurrently. Production's
+320-candidate recipe needs a separately qualified capacity configuration.
+Completed episodes release their slots; all slots are released before learning.
+SAM3 stays resident during the learner phase.
 
-.. code-block:: bash
-
-   python -m robots.rl.remote_manager \
-     --output-dir "$STACK_ROOT/environment-runs" \
-     --gpu-slots 0:40,1:40,2:40,3:40,4:40,5:40,6:40,7:40 \
-     --max-initializing-per-gpu 2 --sam3-endpoint "$SAM_POOL" \
-     --host 127.0.0.1 --port 28490
-
-The backend retains 320 slots. Completed episodes release slots throughout
-sampling, so an instantaneous ready count can be lower than 320.
-During learning all environment slots should be released; SAM3 remains resident.
-Capacity depends on GPU and host memory as well as slot counts.
-
-Expose this loopback backend on every model host through an authenticated private
-route. For an SSH reverse forward, run this on the environment server for each
-model host, with pinned host keys:
-
-.. code-block:: bash
-
-   ssh -NT -o ExitOnForwardFailure=yes \
-     -R 127.0.0.1:28490:127.0.0.1:28490 model-host-0
-
-Supervise the forwards on the environment server. The four model hosts join
-one private Ray cluster with distinct ``RLINF_NODE_RANK`` values, as described
-in :doc:`/rst_source/guides/multi_node`. The environment host stays outside
-Ray. Activate the matching model environment and export its paths before
-starting Ray; run the training entry script only on the Ray head.
+Join the four nodes to one private Ray cluster. Export a distinct
+``RLINF_NODE_RANK`` and activate the environment before starting Ray, as in
+:doc:`/rst_source/guides/multi_node`. Each worker uses its node's loopback
+backend. Run the training entry script only on the head.
 
 Prepare Tasks and Local Paths
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -320,7 +247,7 @@ Point each of these model paths to the same full SFT directory:
    actor.megatron.ckpt_convertor.hf_model_path
    critic.megatron.ckpt_convertor.hf_model_path
 
-Set ``tools.rpent.python`` to the planner interpreter and ``repo_path``
+Set ``tools.rpent.python`` to ``/opt/venv/reason/bin/python`` and ``repo_path``
 to the matching RPent checkout. The episode output and preprocessing cache
 directories must have the same absolute paths on all model hosts. Keep image
 files while trajectories or checkpoints reference them.
@@ -328,15 +255,19 @@ files while trajectories or checkpoints reference them.
 Launch Training
 ~~~~~~~~~~~~~~~
 
-Start GRPO from the Ray head:
+First run the four-node smoke from the Ray head. It selects 16 complete
+groups of four from 20 candidate groups, runs one update and saves a checkpoint:
 
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/model/bin/activate"
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_episode_sync_grpo \
+   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
+For a full run, use ``train_qwen3.5_4b_episode_sync_grpo``. It selects 32
+complete groups from 40 candidate groups, with eight episodes per group.
+Validate the environment service capacity first.
 Actor placement is TP2/CP1/DP16; rollout uses 32 TP1 replicas.
 The configuration keeps ``NCCL_MAX_CTAS=8`` for actor/critic/rollout and
 SGLang's memory fraction at 0.55. This fraction is not a total memory cap for

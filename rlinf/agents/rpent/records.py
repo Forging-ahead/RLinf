@@ -20,6 +20,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import torch
 
@@ -46,6 +47,19 @@ def write_training_turn(
         if "image_refs" in media
         else [hashlib.sha256(image).hexdigest() for image in images]
     )
+    if media.get("format") == "rlinf-qwen-image-inputs-v1":
+        directory = Path(output_dir) / episode.episode_id / "training_images"
+        directory.mkdir(parents=True, exist_ok=True)
+        for image, digest in zip(images, image_hashes, strict=True):
+            target = directory / digest
+            if not target.exists():
+                with NamedTemporaryFile(dir=directory, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(image)
+                try:
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
     audit = {
         "episode_id": episode.episode_id,
         "task": episode.task,
@@ -78,4 +92,4 @@ def write_training_turn(
     directory = Path(output_dir) / episode.episode_id / "training_audit"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"turn-{turn.extra_fields['turn_id']:05d}.json"
-    path.write_text(json.dumps(audit))
+    path.write_text(json.dumps(audit, default=lambda value: value.tolist()))

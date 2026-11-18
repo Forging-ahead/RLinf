@@ -1,4 +1,4 @@
-# Four 8-GPU model hosts; qualify 40 environments per environment-host GPU.
+# Four 8-GPU hosts; qualify backend capacity for all 320 candidate episodes.
 defaults:
   - train_qwen3.5_4b_episode_sync_ppo
   - _self_

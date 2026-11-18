@@ -4,14 +4,17 @@
 
 Start with the [episode PPO/GRPO guide](../../../docs/source-en/rst_source/examples/agentic/rpent_episode_sync.rst)
 ([中文](../../../docs/source-zh/rst_source/examples/agentic/rpent_episode_sync.rst)).
-It covers isolated model and simulator environments, model assets, services,
+It covers the shared reason environment, model assets, services,
 dataset preparation, training, export and evaluation.
 
 - `train.py` launches synchronous PPO/GRPO or asynchronous SAO.
 - `eval.py` runs the selected planner on a fixed task panel.
 - `prepare_tasks.py` exports native task states and their manifests.
 - `checkpoint.py` exports a trained language policy with its frozen vision model.
-- `replay_train.py` is an explicit saved-batch recovery tool; ordinary training samples online.
+
+For explicit saved-cohort recovery, pass a verified `replay` configuration to
+`train.py`. It verifies the original policy and complete groups, consumes that
+batch once, then resumes online sampling. Ordinary training samples online.
 
 The original Pi0.5 planner and the direct-control SAO examples have separate
 configurations and documentation. Select the workflow used to produce your SFT checkpoint;

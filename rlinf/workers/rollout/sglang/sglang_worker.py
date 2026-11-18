@@ -233,6 +233,7 @@ class SGLangWorker(Worker):
             "disable_radix_cache",
             "enable_metrics",
             "enable_cache_report",
+            "disable_fast_image_processor",
         ):
             if name in self._cfg_rollout.sglang:
                 version_dependent_args[name] = self._cfg_rollout.sglang[name]

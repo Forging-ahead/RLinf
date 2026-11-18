@@ -58,6 +58,7 @@ jobs:
               - 'pyproject.toml'
               - 'requirements/*.sh'
               - 'requirements/**/*.txt'
+              - 'requirements/rpent/**'
               - '.github/workflows/install.yml'
             docker_filter: &docker
               - *install
@@ -212,7 +213,6 @@ jobs:
               - 'examples/agent/rpent/checkpoint.py'
               - 'examples/agent/rpent/eval.py'
               - 'examples/agent/rpent/train.py'
-              - 'examples/agent/rpent/replay_train.py'
               - 'examples/agent/rpent/config/**'
               - 'rlinf/robotics/**'
               - 'rlinf/models/embodiment/openpi/**'

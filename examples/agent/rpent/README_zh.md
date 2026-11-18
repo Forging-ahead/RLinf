@@ -1,13 +1,14 @@
 # RPent 规划器训练
 
 从 [episode PPO/GRPO 指南](../../../docs/source-zh/rst_source/examples/agentic/rpent_episode_sync.rst) 开始
-（[English](README.md)）。指南覆盖独立环境、模型资源、服务、任务清单、训练、导出和评测。
+（[English](README.md)）。指南覆盖共享 reason 环境、模型资源、服务、任务清单、训练、导出和评测。
 
 - `train.py` 启动同步 PPO/GRPO 或异步 SAO。
 - `eval.py` 在固定任务集上运行规划器。
 - `prepare_tasks.py` 导出原生任务状态和 manifest。
 - `checkpoint.py` 将训练后的语言参数与冻结的视觉模型合并导出。
-- `replay_train.py` 从指定的已保存批次恢复训练；常规训练在线采样。
+
+需要从已保存 cohort 恢复时，给 `train.py` 传入经过校验的 `replay` 配置。它校验原始 policy 和完整组，只使用该批一次，再恢复在线采样。常规训练始终在线采样。
 
 原始 Pi0.5 规划器与直接控制的 SAO 示例使用各自的配置和文档。选择生成 SFT checkpoint 时使用的工作流；切换工作流会改变 prompt 和工具。
 

@@ -253,9 +253,16 @@ def test_sglang_server_args_preserve_loading_and_processor_settings(
     monkeypatch.setattr(
         sglang_worker,
         "_SERVER_ARGS_FIELDS",
-        {graph_field, "chunked_prefill_size", "enable_metrics", "enable_cache_report"},
+        {
+            graph_field,
+            "chunked_prefill_size",
+            "enable_metrics",
+            "enable_cache_report",
+            "disable_fast_image_processor",
+        },
     )
     worker = sglang_args_worker
+    worker._cfg_rollout.sglang.disable_fast_image_processor = True
     worker._cfg_rollout.sglang.enable_metrics = True
     worker._cfg_rollout.sglang.enable_cache_report = True
     worker._cfg.runner.resume_dir = resume_dir
@@ -264,6 +271,7 @@ def test_sglang_server_args_preserve_loading_and_processor_settings(
         worker._cfg_rollout.sglang[processor_key] = enabled
     args = sglang_worker.SGLangWorker._build_server_args(worker)
     assert args["disable_overlap_schedule"] is True
+    assert args["disable_fast_image_processor"] is True
     assert args["enable_metrics"] is True
     assert args["enable_cache_report"] is True
     assert args["enable_weights_cpu_backup"] is bool(backup)
@@ -277,7 +285,6 @@ def test_sglang_server_args_preserve_loading_and_processor_settings(
         assert args["image_processor_backend"] == "pil"
     else:
         assert "enable_token_space_processor" not in args
-        assert "disable_fast_image_processor" not in args
         assert "image_processor_backend" not in args
 
 

@@ -97,7 +97,10 @@ def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
     assert second.prompt_ids == [1, 2, 7] and second.response_images["num_images"] == 1
 
 
-def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(tmp_path):
+@pytest.mark.parametrize("capture", [False, True])
+def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
+    tmp_path, capture
+):
     import hashlib
 
     from rlinf.agents.rpent.episode import Episode
@@ -139,6 +142,20 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(tmp_p
             "pixel_values_sha256": "saved-pixels",
             "mrope_sha256": "saved-positions",
         }
+        if capture:
+            from rlinf.hybrid_engines.sglang.multimodal.replay import store_pixels
+
+            contract = {
+                "format": "rlinf-qwen-image-inputs-v1",
+                "prompt_token_ids": [10, 11],
+                "image_spans": [[1, 2]],
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                "pixel_values": torch.ones(4, 2),
+                "mrope_positions": torch.tensor([[0, 1]] * 3),
+                "mrope_position_delta": torch.tensor([0]),
+            }
+            store_pixels(contract, directory / "training_images")
+            path.unlink()
         turn = {
             "episode_id": directory.name,
             "task": task,
@@ -178,7 +195,7 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(tmp_p
                 "prompt_token_ids": turn["input_ids"],
                 "finish_reason": "stop",
             },
-            [],
+            [image] if capture else [],
             0.0,
             {},
         )
@@ -222,8 +239,12 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(tmp_p
     assert [o.single_turn_outputs[0].reward_score for o in outputs] == [0.0, 1.0]
     for output in outputs:
         payload = output.single_turn_outputs[0].response_images
-        assert payload["processor_fingerprint"] == "saved-processor"
-        assert payload["mrope_sha256"] == "saved-positions"
+        if capture:
+            assert payload["mrope_positions"].tolist() == [[0, 1]] * 3
+            assert len(payload["pixel_refs"]) == 1
+        else:
+            assert payload["processor_fingerprint"] == "saved-processor"
+            assert payload["mrope_sha256"] == "saved-positions"
         assert payload["image_grid_thw"].tolist() == [[1, 2, 2]]
     with pytest.raises(ValueError, match="different task"):
         saved.load_episode(
@@ -576,6 +597,36 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
         if node is not None and OmegaConf.is_missing(node, key):
             OmegaConf.update(cfg, name, value)
     return cfg
+
+
+@pytest.mark.parametrize(
+    "evaluation,turns,valid",
+    [
+        (True, 1, True),
+        (True, 0, False),
+        (True, True, False),
+        (False, 25, True),
+        (False, 24, False),
+    ],
+)
+def test_request_budget_preserves_evaluation_and_training_limits(
+    evaluation, turns, valid
+):
+    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+    cfg = compose(
+        config_name=(
+            "eval_qwen3.5_4b_libero_rl"
+            if evaluation
+            else "train_qwen3.5_4b_libero_rl_ppo"
+        )
+    )
+    cfg.agentloop.max_turns = turns
+    if valid:
+        validate_rpent_cfg(cfg)
+    else:
+        with pytest.raises(ValueError, match="max_turns must be an integer"):
+            validate_rpent_cfg(cfg)
 
 
 @pytest.mark.parametrize(

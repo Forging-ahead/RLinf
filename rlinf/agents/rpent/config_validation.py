@@ -58,7 +58,10 @@ def _validate_resources(rpent: DictConfig) -> None:
 
 
 def _validate_multimodal(cfg: DictConfig, rpent: DictConfig) -> None:
-    from rlinf.config import release_image_replay_enabled, shared_multi_modal_processor_enabled
+    from rlinf.config import (
+        release_image_replay_enabled,
+        shared_multi_modal_processor_enabled,
+    )
 
     if shared_multi_modal_processor_enabled(OmegaConf.select(cfg, "rollout.sglang")):
         if cfg.rollout.rollout_backend != "sglang" or not rpent.get(
@@ -205,11 +208,11 @@ def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
             raise ValueError(
                 "agentloop.chat_template_kwargs.enable_thinking must be a boolean."
             )
-        if agentloop.max_turns < 25:
+        minimum_turns = 25 if cfg.runner.task_type == "reasoning" else 1
+        if type(agentloop.max_turns) is not int or agentloop.max_turns < minimum_turns:
             raise ValueError(
-                "agentloop.max_turns caps the planner's model requests; LIBERO episodes "
-                f"need at least 25 and the standalone planner allows 100, got "
-                f"{agentloop.max_turns}."
+                f"agentloop.max_turns must be an integer >= {minimum_turns} for "
+                f"{cfg.runner.task_type}, got {agentloop.max_turns!r}."
             )
         compaction = agentloop.get("history_compaction")
         if compaction is not None and not (
