@@ -231,6 +231,7 @@ def create_behavior_sft_data_loader(
     dataset = BehaviorSftDataset(
         repo_id=repo_id,
         root=behavior_dataset_root,
+        local_only=True,
         tolerance_s=tolerance_s,
         tasks=tasks or None,
         modalities=modalities,

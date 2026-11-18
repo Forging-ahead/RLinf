@@ -85,7 +85,7 @@ def test_behavior_policy_maps_both_r1pro_layouts(dimension, indices):
 
 
 @pytest.fixture
-def shared_shard(tmp_path):
+def shared_shard(tmp_path, request):
     from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 
     if CODEBASE_VERSION != "v3.0":
@@ -93,19 +93,29 @@ def shared_shard(tmp_path):
 
     root = tmp_path / "demonstrations"
     feature = {"dtype": "float32", "shape": (2,), "names": None}
+    features = {"action": feature, "observation.state": feature}
+    camera = "observation.rgb.zed_link_camera_0"
+    use_video = getattr(request, "param", False)
+    if use_video:
+        features[camera] = {
+            "dtype": "video",
+            "shape": (64, 64, 3),
+            "names": ["height", "width", "channel"],
+        }
     writer = LeRobotDataset.create(
         "local/test",
         fps=30,
         root=root,
-        features={"action": feature, "observation.state": feature},
-        use_videos=False,
+        features=features,
+        use_videos=use_video,
     )
     for task, start in (("other_task", 0), ("turning_on_radio", 10)):
         for value in (start, start + 1):
             action = np.array([value, -value], dtype=np.float32)
-            writer.add_frame(
-                {"task": task, "action": action, "observation.state": action}
-            )
+            item = {"task": task, "action": action, "observation.state": action}
+            if use_video:
+                item[camera] = np.full((64, 64, 3), 30 + 15 * value, dtype=np.uint8)
+            writer.add_frame(item)
         writer.save_episode()
     assert len(list((root / "data").rglob("*.parquet"))) == 1
     (root / "meta/tasks.jsonl").write_text(
@@ -149,6 +159,7 @@ def test_behavior_skill_uses_episode_annotation_and_preserves_actions(
     )
     kwargs = {
         "tasks": ["turning_on_radio"],
+        "local_only": True,
         "action_horizon": 3,
         "chunk_streaming_using_keyframe": streaming,
         "shuffle": False,
@@ -182,6 +193,60 @@ def test_behavior_skill_uses_episode_annotation_and_preserves_actions(
     assert len(dataset) == 1
     assert int(dataset[0]["frame_index"]) == 1
     assert dataset[0]["prompt"] == "press radio"
+
+
+@pytest.mark.parametrize("shared_shard", [True], indirect=True)
+def test_behavior_shared_video_preserves_episode_offsets_and_chunk_order(shared_shard):
+    import av
+
+    (path,) = (shared_shard / "videos").rglob("*.mp4")
+    with av.open(str(path)) as container:
+        frames = [
+            frame.to_ndarray(format="rgb24").transpose(2, 0, 1) / 255
+            for frame in container.decode(video=0)
+        ]
+    assert len(frames) == 4 and not np.array_equal(frames[0], frames[2])
+    for streaming, positions in ((False, [1, 0]), (True, [0, 1, 0])):
+        dataset = BehaviorSftDataset(
+            "local/test",
+            shared_shard,
+            tasks=["turning_on_radio"],
+            cameras=["head"],
+            local_only=True,
+            shuffle=False,
+            chunk_streaming_using_keyframe=streaming,
+        )
+        for pos in positions:
+            sample = dataset[pos]
+            assert (
+                int(sample["episode_index"]) == 1 and int(sample["frame_index"]) == pos
+            )
+            np.testing.assert_allclose(
+                sample["observation.rgb.zed_link_camera_0"], frames[pos + 2]
+            )
+
+
+def test_behavior_rejects_unsynchronized_recorded_timestamps(shared_shard):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    (path,) = (shared_shard / "data").rglob("*.parquet")
+    data = pq.read_table(path)
+    timestamps = data["timestamp"].to_pylist()
+    timestamps[-1] += 0.01
+    data = data.set_column(
+        data.schema.get_field_index("timestamp"),
+        "timestamp",
+        pa.array(timestamps, type=data.schema.field("timestamp").type),
+    )
+    pq.write_table(data, path)
+    kwargs = {"tasks": ["turning_on_radio"], "local_only": True}
+    with pytest.raises(ValueError, match="(?i)timestamp"):
+        BehaviorSftDataset("local/test", shared_shard, **kwargs)
+    dataset = BehaviorSftDataset(
+        "local/test", shared_shard, check_timestamp_sync=False, **kwargs
+    )
+    assert len(dataset) == 2
 
 
 def test_behavior_sft_rejects_v21(tmp_path):
