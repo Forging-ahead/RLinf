@@ -3850,27 +3850,25 @@ install_liberoplus_env() {
 install_behavior_env() {
     # Use BEHAVIOR_PATH as the checkout location if set (shared, cloned on first use);
     # otherwise clone into the venv.
-    local behavior_dir sdk_tag="v3.9.3-post2"
-    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_PATH "$VENV_DIR/BEHAVIOR-1K" https://github.com/StanfordVL/BEHAVIOR-1K.git -b "$sdk_tag" --depth 1)
-    if ! git -C "$behavior_dir" describe --exact-match --tags --match "$sdk_tag" HEAD >/dev/null 2>&1; then
-        echo "BEHAVIOR checkout must point to $sdk_tag: $behavior_dir" >&2
-        return 1
-    fi
+    local behavior_dir
+    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_PATH "$VENV_DIR/BEHAVIOR-1K" https://github.com/StanfordVL/BEHAVIOR-1K.git -b v3.9.3-post2 --depth 1)
 
-    # The SDK depends on LeRobot's release/b1k branch, which now requires Python 3.12.
-    # Pin its Python 3.11 revision in the venv, leaving a shared checkout untouched.
-    if [ -n "${BEHAVIOR_PATH:-}" ] || [ -L "$VENV_DIR/BEHAVIOR-1K" ]; then
-        local checkout="$behavior_dir"
-        behavior_dir="$VENV_DIR/BEHAVIOR-1K-$sdk_tag"
-        if [ "$behavior_dir" -ef "$checkout" ] || [ -L "$behavior_dir" ]; then
-            echo "The venv installation directory must be separate from BEHAVIOR_PATH." >&2
-            return 1
+    # The SDK uses pip and directly requests a LeRobot Git branch that now requires
+    # Python 3.12. A pip constraint cannot override that URL for its Python 3.11 install.
+    if grep -Fq 'wensi-ai/lerobot@release/b1k' "$behavior_dir/OmniGibson/setup.py"; then
+        if [ -n "${BEHAVIOR_PATH:-}" ] || [ -L "$behavior_dir" ]; then
+            local checkout
+            checkout=$(realpath "$behavior_dir")
+            behavior_dir=$(mktemp -d "$VENV_DIR/BEHAVIOR-1K-install.XXXXXX")
+            # Stage the three editable packages from the working tree, including local edits.
+            # The SDK finds its installed datasets and UI resources relative to this directory.
+            tar -C "$checkout" --dereference --exclude-vcs --exclude=appdata --exclude=__pycache__ \
+                -cf - setup.sh bddl3 joylo OmniGibson | tar -C "$behavior_dir" -xf -
+            ln -s "$checkout/datasets" "$checkout/docs" "$behavior_dir/"
         fi
-        mkdir -p "$behavior_dir"
-        git -C "$checkout" archive "$sdk_tag" | tar -x -C "$behavior_dir"
+        sed -i 's|wensi-ai/lerobot@release/b1k|wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687|' "$behavior_dir/OmniGibson/setup.py"
     fi
     pushd "$behavior_dir" >/dev/null
-    sed -i 's|wensi-ai/lerobot@release/b1k|wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687|' OmniGibson/setup.py
     uv pip install pip "setuptools>=71,<81" wheel
     ./setup.sh --omnigibson --bddl --joylo --confirm-no-conda --accept-nvidia-eula
     popd >/dev/null

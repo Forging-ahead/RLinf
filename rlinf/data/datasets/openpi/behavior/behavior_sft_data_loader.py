@@ -23,11 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
-try:
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-except ModuleNotFoundError:  # LeRobot < 0.2
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from rlinf.data.datasets.openpi.transform_fn import DataTransformFn, compose
 from rlinf.data.storage.lerobot import (
@@ -50,16 +46,10 @@ __all__ = [
 # Camera views resolved by the BEHAVIOR pi05 transform.
 _IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
-# Raw LeRobot frame keys the streaming dataset yields.
-_LEROBOT_IMAGE_KEY = "observation.images.rgb.head"
-_LEROBOT_LEFT_WRIST_KEY = "observation.images.rgb.left_wrist"
-_LEROBOT_RIGHT_WRIST_KEY = "observation.images.rgb.right_wrist"
-_LEROBOT_STATE_KEY = "observation.state"
-
 
 @dataclasses.dataclass(frozen=True)
 class _Repack(DataTransformFn):
-    """Map raw LeRobot frame keys to the ``observation/*`` names openpi's
+    """Map 2026 LeRobot frame keys to the ``observation/*`` names openpi's
     ``BehaviorInputs`` expects (a ``DataTransformFn``, so it composes
     directly in front of the shared pipeline).
 
@@ -70,46 +60,27 @@ class _Repack(DataTransformFn):
     the channel reorder and the float→uint8 conversion.
     """
 
-    image_keys: tuple[str, str, str] = (
-        _LEROBOT_IMAGE_KEY,
-        _LEROBOT_LEFT_WRIST_KEY,
-        _LEROBOT_RIGHT_WRIST_KEY,
-    )
-
-    task_prompts: dict[str, str] | None = None
+    task_prompts: dict[str, str]
 
     def __call__(self, frame: dict) -> dict:
-        head, left, right = self.image_keys
-        left_wrist = np.asarray(frame[left])
-        right_wrist = np.asarray(frame[right])
-        data: dict = {
-            "observation/image": np.asarray(frame[head]),
-            "observation/wrist_image": np.stack([left_wrist, right_wrist], axis=0),
-            "observation/state": np.asarray(frame[_LEROBOT_STATE_KEY]),
+        return {
+            "observation/image": np.asarray(frame["observation.rgb.zed_link_camera_0"]),
+            "observation/wrist_image": np.stack(
+                [
+                    frame["observation.rgb.left_realsense_link_camera_0"],
+                    frame["observation.rgb.right_realsense_link_camera_0"],
+                ],
+                axis=0,
+            ),
+            "observation/state": np.asarray(frame["observation.state"]),
+            "actions": np.asarray(frame["action"]),
+            "prompt": self.task_prompts[frame["task"]],
         }
-
-        actions = frame.get("action")
-        if actions is not None:
-            data["actions"] = np.asarray(actions)
-
-        prompt = frame.get("prompt", frame.get("task"))
-        if prompt is None:
-            raise ValueError(
-                "BEHAVIOR SFT frame is missing both 'prompt' and 'task'; the "
-                "streaming dataset must set the per-frame task text."
-            )
-        if not isinstance(prompt, str):
-            prompt = prompt.item() if hasattr(prompt, "item") else str(prompt)
-        if self.task_prompts is not None:
-            prompt = self.task_prompts[prompt]
-        data["prompt"] = prompt
-        return data
 
 
 class _LocalBehaviorLeRobotDataset(LeRobotDataset):
     def _check_cached_episodes_sufficient(self) -> bool:
-        # Select unique IDs in Arrow. The initial v3 release converts this entire
-        # column to individual tensors, which cannot fit the full 2026 release.
+        # Read local episode IDs in Arrow without converting every frame ID to a tensor.
         self.local_episodes = self.hf_dataset.unique("episode_index")
         if not self.local_episodes:
             raise ValueError(f"No local BEHAVIOR frames under {self.root}.")
@@ -117,13 +88,7 @@ class _LocalBehaviorLeRobotDataset(LeRobotDataset):
 
 
 class _TransformedStreamingDataset(torch.utils.data.Dataset):
-    """Apply the composed openpi input transform to each streamed frame.
-
-    The transform (``compose([repack, *input_transforms])``) is built once in
-    the main process and picklable, so ``spawn`` workers receive it directly.
-    ``__len__`` only drives torch's default index sampler so iteration proceeds;
-    the 2025 reader partitions chunks internally and the 2026 reader uses frame indices.
-    """
+    """Apply the OpenPI input transform to each selected LeRobot frame."""
 
     def __init__(self, dataset, transform):
         self._dataset = dataset
@@ -133,9 +98,7 @@ class _TransformedStreamingDataset(torch.utils.data.Dataset):
         return self._transform(self._dataset[idx])
 
     def __len__(self) -> int:
-        if isinstance(self._dataset, torch.utils.data.ConcatDataset):
-            return len(self._dataset)
-        return len(self._dataset.hf_dataset)
+        return len(self._dataset)
 
 
 def _sft_collate(items) -> tuple[Observation, torch.Tensor]:
@@ -206,21 +169,14 @@ def create_behavior_sft_data_loader(
     config_name: str,
     repo_id: str,
     tasks: list[str],
-    modalities: list[str],
     action_dim: int,
     action_horizon: int,
     max_token_len: int,
     batch_size: int,
     num_workers: int,
-    fine_grained_level: int,
     tolerance_s: float,
     shuffle: bool,
     seed: int,
-    skill_labels: dict[int, str] | None,
-    use_skill: bool,
-    enable_gap: bool,
-    allow_left: int,
-    allow_right: int,
     dist_rank: int,
     dist_world_size: int,
     data_kwargs: dict | None = None,
@@ -234,24 +190,16 @@ def create_behavior_sft_data_loader(
         config_name: openpi TrainConfig key (e.g. ``pi05_behavior``).
         repo_id: LeRobot dataset repo id (used for metadata bookkeeping).
         tasks: BEHAVIOR task names to include.
-        modalities: Observation modalities to load (e.g. ``["rgb"]``).
         action_dim: Model action dimension (metadata).
         action_horizon: Number of future action steps per sample.
         max_token_len: Maximum tokenized-prompt length (metadata).
         batch_size: Per-rank batch size.
         num_workers: Number of ``DataLoader`` workers (``> 0`` uses ``spawn``).
-        fine_grained_level: Orchestrator level for the prompt task text.
-        tolerance_s: Frame-timestamp sync tolerance.
-        shuffle: Whether the streaming dataset shuffles its chunk order.
-        seed: Base seed for the streaming chunk partition.
-        skill_labels: Optional per-skill labels enabling skill mode.
-        use_skill: Train on per-frame SKILL text (window-resolved) instead of the
-            main-task text; requires explicit ``skill_labels``.
-        enable_gap: Skill mode — absorb a true gap into both adjacent skills.
-        allow_left: Skill mode — frames to extend a contiguous skill start left.
-        allow_right: Skill mode — frames to extend a contiguous skill end right.
-        dist_rank: This rank's id, threaded into the per-rank chunk partition.
-        dist_world_size: Total ranks, threaded into the per-rank chunk partition.
+        tolerance_s: Frame-timestamp sync tolerance in seconds.
+        shuffle: Whether to shuffle the selected training frames.
+        seed: Seed for shuffling and worker initialization.
+        dist_rank: Rank of this training process.
+        dist_world_size: Number of training ranks.
         data_kwargs: Optional ``openpi_data`` overrides forwarded to the
             pipeline (``norm_stats_path`` pins ``norm_stats.json``).
 
@@ -261,114 +209,72 @@ def create_behavior_sft_data_loader(
     root = Path(behavior_dataset_root).expanduser()
     with (root / "meta/info.json").open() as file:
         info = json.load(file)
-    version = info["codebase_version"]
+    if info["codebase_version"] != "v3.0":
+        raise ValueError(
+            f"BEHAVIOR SFT requires 2026 demonstrations (v3.0), found {info['codebase_version']!r}."
+        )
+    # LeRobot tries to download the whole dataset if the local Parquet files are missing.
+    for pattern in (
+        "meta/tasks.parquet",
+        "meta/episodes/*/*.parquet",
+        "data/*/*.parquet",
+    ):
+        if not any(root.glob(pattern)):
+            raise FileNotFoundError(root / pattern)
     action_times = {"action": [i / info["fps"] for i in range(action_horizon)]}
-    repack = _Repack()
-    sampler = None
-    if version == "v3.0":
-        # The 2026 demos carry episode-level task names and native camera keys.
-        if use_skill or fine_grained_level:
-            raise ValueError(
-                "The BEHAVIOR v3 SFT reader supports main-task prompts only."
-            )
-        if (modalities or ["rgb"]) != ["rgb"]:
-            raise ValueError(
-                "The BEHAVIOR 2026 OpenPI model takes the three RGB cameras."
-            )
-        for directory in ("meta/episodes", "data"):
-            if not any((root / directory).glob("*/*.parquet")):
-                raise FileNotFoundError(root / directory)
-        if not (root / "meta/tasks.parquet").is_file():
-            raise FileNotFoundError(root / "meta/tasks.parquet")
-        native = _LocalBehaviorLeRobotDataset(
-            repo_id,
-            root=root,
-            delta_timestamps=action_times,
-            tolerance_s=tolerance_s,
-            video_backend="pyav",
-        )
-        # OpenPI consumes only RGB. Select its streams before LeRobot decodes frames.
-        for key in native.meta.video_keys:
-            if key.startswith("observation.depth_linear."):
-                del native.meta.features[key]
+    native = _LocalBehaviorLeRobotDataset(
+        repo_id,
+        root=root,
+        delta_timestamps=action_times,
+        tolerance_s=tolerance_s,
+        video_backend="pyav",
+    )
+    # OpenPI consumes only RGB. Select its streams before LeRobot decodes frames.
+    for key in native.meta.video_keys:
+        if key.startswith("observation.depth_linear."):
+            del native.meta.features[key]
 
-        # The initial official v3 reader addresses frames by their row number in
-        # the local parquet files. Rebase offsets for a partial download so each
-        # action window stays in its own episode, including its last padded frame.
-        bounds = ["dataset_from_index", "dataset_to_index"]
-        rows = native.meta.episodes.select_columns(
-            ["episode_index", "tasks", *bounds]
-        ).to_pandas()
-        present = rows.episode_index.isin(native.local_episodes)
-        task_set = set(tasks)
-        selected = rows.tasks.map(
-            lambda names: not task_set or not task_set.isdisjoint(names)
+    # The initial official v3 reader addresses frames by their row number in
+    # the local parquet files. Rebase offsets for a partial download so each
+    # action window stays in its own episode, including its last padded frame.
+    bounds = ["dataset_from_index", "dataset_to_index"]
+    rows = native.meta.episodes.select_columns(
+        ["episode_index", "tasks", *bounds]
+    ).to_pandas()
+    present = rows.episode_index.isin(native.local_episodes)
+    task_set = set(tasks)
+    selected = rows.tasks.map(
+        lambda names: not task_set or not task_set.isdisjoint(names)
+    )
+    if not selected.any():
+        raise ValueError(f"No BEHAVIOR 2026 episodes match {tasks}.")
+    if (selected & ~present).any():
+        missing = rows.loc[selected & ~present, "episode_index"].iloc[0]
+        raise FileNotFoundError(f"Missing local BEHAVIOR data for episode {missing}.")
+    lengths = (rows.dataset_to_index - rows.dataset_from_index).loc[present]
+    ends = lengths.cumsum()
+    if ends.iloc[-1] != len(native):
+        raise ValueError(
+            "Local parquet rows do not match the published BEHAVIOR episode lengths."
         )
-        if not selected.any():
-            raise ValueError(f"No BEHAVIOR 2026 episodes match {tasks}.")
-        if (selected & ~present).any():
-            missing = rows.loc[selected & ~present, "episode_index"].iloc[0]
-            raise FileNotFoundError(
-                f"Missing local BEHAVIOR data for episode {missing}."
+    if not ends.equals(rows.dataset_to_index.loc[present]):
+        rows.loc[present, "dataset_from_index"] = ends - lengths
+        rows.loc[present, "dataset_to_index"] = ends
+        updated = native.meta.episodes.remove_columns(bounds)
+        for key in bounds:
+            updated = updated.add_column(key, rows[key].tolist())
+        native.meta.episodes = updated
+    dataset = torch.utils.data.ConcatDataset(
+        [
+            torch.utils.data.Subset(native, range(start, end))
+            for start, end in rows.loc[selected, bounds].itertuples(
+                index=False, name=None
             )
-        lengths = (rows.dataset_to_index - rows.dataset_from_index).loc[present]
-        ends = lengths.cumsum()
-        if ends.iloc[-1] != len(native):
-            raise ValueError(
-                "Local parquet rows do not match the published BEHAVIOR episode lengths."
-            )
-        if not ends.equals(rows.dataset_to_index.loc[present]):
-            rows.loc[present, "dataset_from_index"] = ends - lengths
-            rows.loc[present, "dataset_to_index"] = ends
-            updated = native.meta.episodes.remove_columns(bounds)
-            for key in bounds:
-                updated = updated.add_column(key, rows[key].tolist())
-            native.meta.episodes = updated
-        dataset = torch.utils.data.ConcatDataset(
-            [
-                torch.utils.data.Subset(native, range(start, end))
-                for start, end in rows.loc[selected, bounds].itertuples(
-                    index=False, name=None
-                )
-            ]
-        )
-        with (root / "meta/tasks.jsonl").open() as file:
-            prompts = {row["task_name"]: row["task"] for row in map(json.loads, file)}
-        repack = _Repack(
-            (
-                "observation.rgb.zed_link_camera_0",
-                "observation.rgb.left_realsense_link_camera_0",
-                "observation.rgb.right_realsense_link_camera_0",
-            ),
-            task_prompts=prompts,
-        )
-    elif version == "v2.1":
-        from rlinf.data.datasets.openpi.behavior.behavior_sft_dataset import (
-            BehaviorSftDataset,
-        )
-
-        dataset = BehaviorSftDataset(
-            repo_id=repo_id,
-            root=behavior_dataset_root,
-            tolerance_s=tolerance_s,
-            tasks=tasks or None,
-            modalities=modalities or ["rgb"],
-            local_only=True,
-            delta_timestamps=action_times,
-            chunk_streaming_using_keyframe=True,
-            shuffle=shuffle,
-            seed=seed,
-            fine_grained_level=fine_grained_level,
-            skill_labels=skill_labels,
-            use_skill=use_skill,
-            enable_gap=enable_gap,
-            allow_left=allow_left,
-            allow_right=allow_right,
-            dist_rank=dist_rank,
-            dist_world_size=dist_world_size,
-        )
-    else:
-        raise ValueError(f"Unsupported BEHAVIOR dataset version {version!r}.")
+        ]
+    )
+    with (root / "meta/tasks.jsonl").open() as file:
+        prompts = {row["task_name"]: row["task"] for row in map(json.loads, file)}
+    repack = _Repack(prompts)
 
     # The shared openpi input pipeline (BehaviorInputs -> Normalize -> ModelTransform),
     # keyed off the checkpoint / config_name. Norm stats come from
@@ -383,8 +289,8 @@ def create_behavior_sft_data_loader(
     )
     source = _TransformedStreamingDataset(dataset, compose([repack, *input_transforms]))
 
-    # The 2025 reader partitions its own chunks. The 2026 reader accepts frame indices.
-    if version == "v3.0" and dist_world_size > 1:
+    sampler = None
+    if dist_world_size > 1:
         sampler = torch.utils.data.DistributedSampler(
             source,
             num_replicas=dist_world_size,
@@ -471,13 +377,8 @@ def build_behavior_sft_dataloader(
 ):
     """Build the BEHAVIOR SFT data loader for the SFT worker.
 
-    The streaming dataset partitions chunks per ``(rank, worker)``; ``rank`` /
-    ``world_size`` are captured here (in the main process) and threaded into the
-    dataset so that SPAWNED DataLoader workers -- which cannot read
-    ``torch.distributed`` -- still partition by the correct per-rank id (otherwise
-    every rank replicates rank 0's chunks, collapsing the effective batch to one
-    rank's micro-batch). Every parameter is read directly from YAML (no hidden
-    defaults). Returns ``(loader, loader.data_config())``.
+    The sampler partitions 2026 demonstration frames across training ranks.
+    Returns ``(loader, loader.data_config())``.
     """
     from omegaconf import OmegaConf
 
@@ -493,41 +394,12 @@ def build_behavior_sft_dataloader(
     if data_kwargs is not None:
         data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
 
-    # `cfg.data` is the production source of truth for the BEHAVIOR task set and the
-    # prompt-source flag. `use_skill: true` trains on the per-frame REFERENCE skill
-    # text; `false` trains on the main-task text.
-    use_skill = bool(data_cfg.use_skill)
-    tasks = list(data_cfg.tasks)
-    skill_labels, enable_gap, allow_left, allow_right = None, True, 0, 0
-    if use_skill:
-        # The skill labels are the REFERENCE per-task subtask list from config (NOT
-        # the dataset's collapsed orchestrators, which equal the full task text). The
-        # task-0000 local-skill recipe is exactly one task with a configured subtask
-        # list and the fixed window recipe below.
-        if len(tasks) != 1:
-            raise ValueError(
-                "openpi BEHAVIOR SFT use_skill:true supports exactly one task "
-                f"(the task-0000 skill recipe); got data.tasks={tasks}."
-            )
-        subtask_labels = data_cfg.task_subtasks
-        labels = subtask_labels.get(tasks[0]) if subtask_labels else None
-        if not labels:
-            raise ValueError(
-                "openpi BEHAVIOR SFT use_skill:true requires the reference "
-                f"skill labels at data.task_subtasks.{tasks[0]}; none was configured."
-            )
-        skill_labels = {i: str(label) for i, label in enumerate(labels)}
-        # Fixed reference skill-window recipe (pi05_b1k-task0000_sft_local_skill);
-        # intentionally hardcoded so the reference recipe cannot drift via config.
-        enable_gap, allow_left, allow_right = True, 100, 100
-
     loader = create_behavior_sft_data_loader(
         behavior_dataset_root=str(data_cfg.behavior_dataset_root),
         model_path=str(model_cfg.model_path),
         config_name=config_name,
         repo_id=str(data_cfg.repo_id),
-        tasks=tasks,
-        modalities=list(data_cfg.modalities),
+        tasks=list(data_cfg.tasks),
         action_dim=int(model_cfg.openpi.model_action_dim),
         action_horizon=int(model_cfg.num_action_chunks),
         max_token_len=int(model_cfg.openpi.max_token_len),
@@ -535,15 +407,9 @@ def build_behavior_sft_dataloader(
         if eval_dataset
         else int(cfg.actor.micro_batch_size),
         num_workers=int(data_cfg.num_workers),
-        fine_grained_level=int(data_cfg.fine_grained_level),
         tolerance_s=float(data_cfg.tolerance_s),
         shuffle=not eval_dataset,
         seed=int(cfg.actor.seed),
-        skill_labels=skill_labels,
-        use_skill=use_skill,
-        enable_gap=enable_gap,
-        allow_left=allow_left,
-        allow_right=allow_right,
         dist_rank=rank,
         dist_world_size=world_size,
         data_kwargs=data_kwargs,

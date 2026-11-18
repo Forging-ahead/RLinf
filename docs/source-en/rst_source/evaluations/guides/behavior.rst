@@ -24,13 +24,13 @@ The RLinf OpenPI image for BEHAVIOR 3.9.3 is pending release.
 
 **Environment variables**
 
-Set the OmniGibson data path for the 2026 assets before each run:
+Set the data root to the directory populated during asset setup:
 
 .. code-block:: bash
 
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
 
-For asset downloads and first-run license setup, see “Download the Assets” in :doc:`../../examples/embodied/behavior`.
+OmniGibson 3.9.3 looks for ``behavior-1k-assets/``, ``omnigibson-robot-assets/``, ``omnigibson.key``, and ``2026-challenge-task-instances/`` under this root. Isaac Sim 5.1 resolves its installation path when Python imports the package. See “Download the Assets” in :doc:`../../examples/embodied/behavior` for setup.
 
 Example Configs
 ---------------
@@ -48,7 +48,7 @@ The following example is available under ``evaluations/behavior/``:
      - ``behavior_r1pro``
      - π₀.₅ (``openpi``)
 
-If ``evaluations/behavior/<config>.yaml`` is missing, ``run_eval.sh`` falls back to ``examples/embodiment/config/`` with the same name (e.g. ``behavior_ppo_openpi_pi05``). Fallback configs include ``actor`` / ``algorithm`` sections but still work for evaluation when ``runner.only_eval: True``.
+Use the evaluation config for π₀.₅ checkpoints. It specifies the rollout model type and action chunk length, and the evaluation entry point enables ``runner.only_eval`` automatically.
 
 End-to-End Workflow
 -------------------
@@ -103,7 +103,7 @@ Each evaluation trajectory is determined by:
 
 - ``disabled`` (default): every reset loads the fixed instance for ``activity_instance_id``; if ``activity_instance_dir`` is set, the matching JSON is read from that directory.
 - ``offline``: every reset **randomly** picks a cached instance from the configured split or ``activity_instance_dir`` (download official ``2026-challenge-task-instances`` or generate files with ``instance_generator.py``).
-- ``online``: generate a new arrangement at reset. Give each environment its own simulator process, leave ``activity_instance_dir`` and ``instance_split`` unset, and set ``online_object_sampling: True`` and ``use_presampled_robot_pose: False``.
+- ``online``: generate a fresh arrangement at each reset. In the preset, keep ``activity_instance_dir: null`` and omit ``instance_split``. These settings select saved layouts in the other modes. For online sampling, set ``online_object_sampling: True`` and ``use_presampled_robot_pose: False``, and run one environment per simulator process.
 
 .. note::
 
@@ -202,13 +202,14 @@ This example assumes one environment worker hosts all four environments and runs
      env.eval.total_num_envs=4 \
      env.eval.num_env_subprocess=2
 
-**Evaluate from a training config**
+**Evaluate a trained π₀.₅ checkpoint**
+
+Set the path to your RLinf-format OpenPI checkpoint. If the checkpoint uses the upstream OpenPI format, convert it as described in :doc:`../../examples/embodied/sft_openpi` first.
 
 .. code-block:: bash
 
-   bash evaluations/run_eval.sh behavior_ppo_openpi_pi05 \
-     runner.only_eval=True \
-     rollout.model.model_path=/path/to/model
+   bash evaluations/run_eval.sh behavior behavior_openpi_pi05_eval \
+     rollout.model.model_path=/path/to/rlinf_openpi_checkpoint
 
 FAQ
 ---

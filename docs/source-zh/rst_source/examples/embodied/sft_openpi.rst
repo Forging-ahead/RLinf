@@ -85,7 +85,7 @@ OpenPI 监督微调
 
 官方 LeRobot SFT 的数据窗口也来自 ``TrainConfig.model.action_horizon``，不读 ``num_action_chunks``。常见官方 horizon：BEHAVIOR ``pi05_behavior`` **32**\ ，RoboTwin ``pi0_aloha_robotwin`` / LIBERO ``pi0_libero`` **50**\ ，真机 ``pi0_realworld`` **10**。只有 checkpoint 的 horizon 和该 ``TrainConfig`` 不一致时，才覆写 ``openpi.action_horizon``。
 
-BEHAVIOR / dual-Franka 的流式 SFT 加载器目前仍用 ``num_action_chunks`` 当数据窗口，这两份配置里才需要把它设成和官方 horizon 一样。
+BEHAVIOR 和 dual-Franka 的 SFT 配置用 ``num_action_chunks`` 指定动作窗口长度，应与对应模型的官方 horizon 一致。
 
 设置 ``actor.model.precision: fp32``，让原始参数和优化器更新使用 FP32。
 设置 ``actor.model.openpi.embed_dtype: bf16``，让主干激活和残差使用 BF16。
@@ -149,7 +149,7 @@ Tokenizer 由 OpenPI 的 ``ModelTransformFactory`` 按基础模型加载，YAML 
    * - ``pi0_aloha_robotwin``
      - RoboTwin（ALOHA）
    * - ``pi05_behavior``
-     - BEHAVIOR-1K（流式加载）
+     - BEHAVIOR-1K（2026 挑战示范数据）
    * - ``pi0_maniskill`` · ``pi05_maniskill``
      - ManiSkill
    * - ``pi05_metaworld``
@@ -339,9 +339,7 @@ Pi0.5 + BEHAVIOR-1K
      - model/pi0_5@actor.model
      - hybrid_engines/openpi_fsdp@actor.fsdp_config
 
-将两个数据路径都指向本地的
-`2026 挑战示范数据 <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_
-（LeRobot v3）。这个 SFT 读取器加载头部和左右腕部三个相机的 RGB 图像。
+此配置仅支持 `2026 挑战示范数据 <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_ 的 LeRobot v3.0 格式。两个数据路径都填本地数据集根目录。按任务下载时，请保留元数据。对 ``tasks`` 中指定的任务，每个示范回合都要下载逐帧数据，以及头部、左腕和右腕三路 RGB 视频。
 
 .. code:: yaml
 
@@ -349,10 +347,8 @@ Pi0.5 + BEHAVIOR-1K
      train_data_paths: /path/to/2026-challenge-demos
      behavior_dataset_root: /path/to/2026-challenge-demos
      repo_id: "behavior-1k/2026-challenge-demos"
-     modalities: ["rgb"]
      num_workers: 8
      tasks: ["turning_on_radio"]
-     use_skill: false
 
    actor:
      model:
@@ -363,7 +359,9 @@ Pi0.5 + BEHAVIOR-1K
        openpi_data:
          norm_stats_path: /path/to/norm_stats.json
 
-2026 读取器从 ``meta/tasks.jsonl`` 读取主任务指令，设置 ``use_skill: false`` 和 ``fine_grained_level: 0``。评估这次训练的策略时，按 SDK 中 ``PROPRIOCEPTION_INDICES["R1Pro"]`` 的字段顺序设置 ``omni_config.robots[0].proprio_obs``，使 61 维状态中的底盘速度与训练数据一样采用机器人自身坐标系。
+收音机示范的每条样本都使用 ``meta/tasks.jsonl`` 中与 ``turning_on_radio`` 对应的主任务指令。
+
+评估这次训练的策略时，按 SDK 中 ``PROPRIOCEPTION_INDICES["R1Pro"]`` 的字段顺序设置 ``omni_config.robots[0].proprio_obs``，使 61 维状态中的底盘速度与训练数据一样采用机器人自身坐标系。
 
 先激活“安装”一节的 OpenPI 模型环境，再安装可读取 v3 数据的 Hugging Face LeRobot 版本并启动训练。
 

@@ -87,30 +87,45 @@
 
 **选项 1：Docker 镜像** — 适配 BEHAVIOR 3.9.3 的 RLinf 镜像（OpenVLA-OFT、OpenPI）待发布。
 
-**选项 2：自定义环境** — OmniGibson 3.9.3（``v3.9.3-post2``）使用 Isaac Sim 5.1，需要 PyTorch 2.7.0。RLinf 的 OpenVLA-OFT 和 OpenPI 分别要求 PyTorch 2.2.0 和 2.7.1，按发布的依赖安装时，两种模型都会与仿真器冲突。以下资产下载和运行步骤供已备好相应环境的用户使用。
+**选项 2：自定义环境** — OmniGibson 3.9.3（``v3.9.3-post2``）使用 Isaac Sim 5.1，需要 PyTorch 2.7.0。RLinf 的 OpenVLA-OFT 和 OpenPI 分别要求 PyTorch 2.2.0 和 2.7.1，按发布的依赖安装时，两种模型都会与仿真器冲突。使用 OpenPI 评测时，从模型环境启动 RLinf，将仿真 worker 分配到单独的节点组，在该组的 ``env_configs`` 中将 ``python_interpreter_path`` 指向仿真环境的 Python。配置示例见 :doc:`异构环境指南 <../../guides/hetero>`。
 
 
 下载资产
 ----------------------------------------
 
-在装有 OmniGibson 3.9.3 和 Isaac Sim 5.1 的环境中，请参照 `官方安装与资产指南 <https://behavior.stanford.edu/getting_started/installation.html>`_，或用以下命令从 `官方资产仓库 <https://huggingface.co/datasets/behavior-1k/zipped-datasets/tree/main>`_ 下载机器人资产、场景与物体资产，以及 2026 挑战的任务实例。
+选择一个数据目录，下载量超过 30 GB。之后启动 RLinf 时也指向这个目录。
 
 .. code-block:: bash
 
-   # 数据集会占用超过 30 GB。
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
-   # 之后的 python 命令会下载数据集到 $OMNIGIBSON_DATA_PATH 中。
-   mkdir -p $OMNIGIBSON_DATA_PATH
+   mkdir -p "$OMNIGIBSON_DATA_PATH"
+   # 国内可选用 Hugging Face 镜像：export HF_ENDPOINT=https://hf-mirror.com
 
-   # 在已激活的 venv 中运行。国内用户可设置 HF_ENDPOINT=https://hf-mirror.com。
+**首次安装（Linux、Conda）。** 按照 `官方开发环境安装指南 <https://behavior.stanford.edu/getting_started/installation.html#setup>`_ 获取 `RLinf 使用的 SDK 版本 <https://github.com/StanfordVL/BEHAVIOR-1K/tree/v3.9.3-post2>`_。SDK 创建的是 Python 3.11 环境，因此先在这份新克隆的源码中将 LeRobot 固定到 RLinf 使用的兼容版本。
+
+.. code-block:: bash
+
+   git clone --branch v3.9.3-post2 https://github.com/StanfordVL/BEHAVIOR-1K.git
+   (
+     cd BEHAVIOR-1K
+     # 清除旧版独立安装的 Isaac Sim 路径。
+     unset ISAAC_PATH EXP_PATH CARB_APP_PATH
+     sed -i 's|wensi-ai/lerobot@release/b1k|wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687|' OmniGibson/setup.py
+     ./setup.sh --new-env --omnigibson --bddl --dataset
+   )
+   conda activate behavior
+
+按提示确认许可。``--dataset`` 会下载机器人资产、场景与物体资产，以及 2026 挑战任务实例。这里创建的 ``behavior`` 环境用于仿真，RLinf 模型依赖见上方“安装”一节。后续 RLinf 命令从 RLinf 仓库根目录运行。
+
+**已有 OmniGibson 3.9.3 环境。** 如果只缺资产，在已激活的仿真环境中执行以下命令，使用同一个数据根目录：
+
+.. code-block:: bash
+
    python -c "from omnigibson.utils.asset_utils import download_omnigibson_robot_assets; download_omnigibson_robot_assets()"
-   python -c "from omnigibson.utils.asset_utils import download_behavior_1k_assets; download_behavior_1k_assets(accept_license=True)"
+   python -c "from omnigibson.utils.asset_utils import download_behavior_1k_assets; download_behavior_1k_assets()"
    python -c "from omnigibson.utils.asset_utils import download_2026_challenge_task_instances; download_2026_challenge_task_instances()"
 
-**这些命令会：**
-
-1. 设置训练和评测使用的数据根目录 ``OMNIGIBSON_DATA_PATH``。
-2. 将资产和挑战实例下载并解压到该目录。
+两种方式都从 `官方资产仓库 <https://huggingface.co/datasets/behavior-1k/zipped-datasets/tree/main>`_ 下载。完成后，数据根目录中应有 ``omnigibson-robot-assets/``、``behavior-1k-assets/``、``2026-challenge-task-instances/`` 三个目录和数据集密钥 ``omnigibson.key``。
 
 首次导入 Isaac Sim 时可以按提示接受 `NVIDIA 许可协议 <https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html#running-isaac-sim>`_。无人值守运行时，同意许可后可在启动终端设置 ``export OMNI_KIT_ACCEPT_EULA=YES``。
 
@@ -267,7 +282,7 @@ OmniGibson 的基础配置（``base_config_name``），再应用 ``omni_config``
      - 显式保留 ``BehaviorTask`` / ``InteractiveTraversableScene``，以确保覆盖后选中预期的上游
        OmniGibson 类。
    * - ``omni_config.task.activity_name``
-     - 所选场景中的任务名称，例如 ``turning_on_radio``。
+     - 填任务名称，例如任务表中编号 ``0`` 对应的 ``turning_on_radio``。在固定实例模式（``instance_resample_mode: disabled``）下，``activity_instance_id`` 用于指定初始布局。
    * - ``omni_config.task.instance_resample_mode``
      - reset 时的实例切换：``disabled``\ （加载固定的 ``activity_instance_id``）、``offline``\ （启动时扫描一次 ``activity_instance_dir``，每次 reset 采样一个缓存实例——``*_template.json`` 走较重的场景重载路径，``*_template-tro_state.json`` 走较轻的原地路径）、或 ``online``\ （每次重置时重新采样场景，设置见 :doc:`评测指南 <../../evaluations/guides/behavior>`）。
    * - ``omni_config.task.activity_instance_dir``
@@ -296,10 +311,9 @@ OmniGibson 的基础配置（``base_config_name``），再应用 ``omni_config``
    * - ``omni_config.macro.use_numpy_controller_backend``
      - ``True`` 使用 numpy 控制器后端，在单进程 / 中等并行下通常更快。
    * - ``skip_intermediate_renders``
-     - 为 ``True`` 时跳过动作 chunk 内中间观测的采集（显著提升环境速度）。此时保存的视频只显示策略在
-       chunk 边界观测到的帧。
+     - 为 ``True`` 时跳过动作块的中间渲染，返回块末观察。仿真器每步仍会读取传感器。
    * - ``num_env_subprocess``
-     - 每个本地环境 worker 启动的仿真进程数，预设值为 ``1``。例如，4 个本地环境分给 2 个进程时，每个进程运行 2 个场景。各环境需要独立重置时，为每个环境分配一个进程。
+     - 每个本地环境 worker 启动的仿真进程数，预设值为 ``1``。例如，4 个本地环境分给 2 个进程时，每个进程运行 2 个场景。同一 worker 的各流水线阶段共享这个池。由于一次物理步会推进进程内的所有场景，每个阶段至少需要一个专属仿真进程。各环境需要独立重置时，为每个环境分配一个进程。
 
 生成缓存任务实例
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

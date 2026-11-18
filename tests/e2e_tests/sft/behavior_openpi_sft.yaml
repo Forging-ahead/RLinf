@@ -29,23 +29,13 @@ runner:
   save_interval: 10
 
 data:
-  # Minimal CI fixture (see the ci_behavior README): the task-0000 subset staged
-  # under /workspace.
+  # Local 2026 SFT fixture with the radio demonstrations and their LeRobot v3 metadata.
   train_data_paths: /workspace/dataset/ci_behavior/dataset
   behavior_dataset_root: ${data.train_data_paths}
-  repo_id: "behavior-1k/2025-challenge-demos"
-  modalities: ["rgb"]
+  repo_id: "behavior-1k/2026-challenge-demos"
   num_workers: 1
-  fine_grained_level: 0
   tolerance_s: 1.0e-4
   tasks: ["turning_on_radio"]
-  use_skill: false
-  task_subtasks:
-    turning_on_radio:
-      - "move to radio"
-      - "pick up radio from coffee table"
-      - "press radio"
-      - "place radio on coffee table"
 
 algorithm:
   adv_type: gae
@@ -65,7 +55,7 @@ actor:
       embed_dtype: bf16
       task: sft
     openpi_data:
-      norm_stats_path: /workspace/dataset/ci_behavior/assets/behavior-1k/2025-challenge-demos/norm_stats.json
+      norm_stats_path: /workspace/dataset/ci_behavior/assets/behavior-1k/2026-challenge-demos/norm_stats.json
 
   optim:
     lr: 2.5e-5

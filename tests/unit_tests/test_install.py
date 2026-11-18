@@ -52,34 +52,26 @@ def test_behavior_install_reuses_common_helpers():
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="BEHAVIOR installer runs on Linux")
-@pytest.mark.parametrize("shared", [True, False])
-def test_sdk_setup_pins_the_dependency_in_the_venv(tmp_path, shared):
+@pytest.mark.parametrize(
+    ("shared", "ref"), [(False, "release/b1k"), (True, "release/b1k"), (True, "my-pin")]
+)
+def test_sdk_setup_pins_only_the_floating_dependency_in_the_venv(tmp_path, shared, ref):
     venv = tmp_path / "venv"
     source = tmp_path / "shared" if shared else venv / "BEHAVIOR-1K"
+    venv.mkdir()
     source.mkdir(parents=True)
-    metadata = source / "OmniGibson/setup.py"
-    metadata.parent.mkdir()
+    (source / "bddl3").mkdir()
+    (source / "joylo").mkdir()
+    package = tmp_path / "omnigibson-dev" if shared else source / "OmniGibson"
+    package.mkdir()
+    if shared:
+        (source / "OmniGibson").symlink_to(package, target_is_directory=True)
+    metadata = package / "setup.py"
     dependency = "lerobot[dataset] @ git+https://github.com/wensi-ai/lerobot@"
-    metadata.write_text(dependency + "release/b1k\n")
+    metadata.write_text(dependency + ref + "\n")
     setup = source / "setup.sh"
     setup.write_text('#!/bin/bash\ncat OmniGibson/setup.py\necho "setup $*"\n')
     setup.chmod(0o755)
-    for args in (
-        ["init", "-q"],
-        ["add", "."],
-        [
-            "-c",
-            "user.name=test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-qm",
-            "release",
-        ],
-        ["tag", "v3.9.3-post2"],
-    ):
-        subprocess.run(["git", *args], cwd=source, check=True)
-
     for _ in range(2):
         result = run_functions(
             f"VENV_DIR={quote(str(venv))}\n"
@@ -88,11 +80,14 @@ def test_sdk_setup_pins_the_dependency_in_the_venv(tmp_path, shared):
             "MODEL=openpi\ninstall_behavior_env\n"
         )
         assert result.returncode == 0, result.stderr
-        assert dependency + "436812bd8ee39b768c645c248c91f1330834e687" in result.stdout
+        expected = (
+            "436812bd8ee39b768c645c248c91f1330834e687" if ref == "release/b1k" else ref
+        )
+        assert dependency + expected in result.stdout
         assert (
             "setup --omnigibson --bddl --joylo --confirm-no-conda --accept-nvidia-eula"
             in result.stdout
         )
         assert "uv pip check" in result.stdout
         if shared:
-            assert metadata.read_text() == dependency + "release/b1k\n"
+            assert metadata.read_text() == dependency + ref + "\n"

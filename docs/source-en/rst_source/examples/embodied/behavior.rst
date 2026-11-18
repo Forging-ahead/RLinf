@@ -88,30 +88,45 @@ Installation
 
 **Option 1: Docker image** — the RLinf images for BEHAVIOR 3.9.3 (OpenVLA-OFT and OpenPI) are pending release.
 
-**Option 2: Custom environment** — the RLinf model and simulator packages have conflicting PyTorch requirements. OmniGibson 3.9.3 (``v3.9.3-post2``) uses Isaac Sim 5.1 with PyTorch 2.7.0. OpenVLA-OFT requires 2.2.0 and OpenPI requires 2.7.1. Neither model can share this simulator environment with its declared dependencies. The asset and run instructions below assume a working runtime.
+**Option 2: Custom environment** — the RLinf model and simulator packages have conflicting PyTorch requirements. OmniGibson 3.9.3 (``v3.9.3-post2``) uses Isaac Sim 5.1 with PyTorch 2.7.0. OpenVLA-OFT requires 2.2.0 and OpenPI requires 2.7.1. For OpenPI evaluation, launch RLinf from the model environment and assign the simulation worker to a node group whose ``env_configs`` sets ``python_interpreter_path`` to the simulator environment's Python. See :doc:`the node group configuration example <../../guides/hetero>`.
 
 
 Download the Assets
 -------------------
 
-In an environment with OmniGibson 3.9.3 and Isaac Sim 5.1, follow the `official asset setup guide <https://behavior.stanford.edu/getting_started/installation.html>`_ or run the commands below to download robot assets, scene and object assets, and 2026 task instances from the `official asset repository <https://huggingface.co/datasets/behavior-1k/zipped-datasets/tree/main>`_.
+Choose a data directory with space for more than 30 GB of downloads. Use the same directory when you launch RLinf.
 
 .. code-block:: bash
 
-   # The datasets require more than 30 GB.
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
-   mkdir -p $OMNIGIBSON_DATA_PATH
+   mkdir -p "$OMNIGIBSON_DATA_PATH"
+   # Optional Hugging Face mirror for mainland China: export HF_ENDPOINT=https://hf-mirror.com
 
-   # Run these inside the active venv. Set HF_ENDPOINT=https://hf-mirror.com in mainland China.
-   # The following Python command will download the dataset into $OMNIGIBSON_DATA_PATH.
+**From a fresh checkout (Linux, Conda).** Follow the `official development setup <https://behavior.stanford.edu/getting_started/installation.html#setup>`_ with the `SDK revision used by RLinf <https://github.com/StanfordVL/BEHAVIOR-1K/tree/v3.9.3-post2>`_. The SDK creates a Python 3.11 environment, so use RLinf's Python 3.11-compatible LeRobot revision in this checkout.
+
+.. code-block:: bash
+
+   git clone --branch v3.9.3-post2 https://github.com/StanfordVL/BEHAVIOR-1K.git
+   (
+     cd BEHAVIOR-1K
+     # Clear paths inherited from a standalone Isaac Sim installation.
+     unset ISAAC_PATH EXP_PATH CARB_APP_PATH
+     sed -i 's|wensi-ai/lerobot@release/b1k|wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687|' OmniGibson/setup.py
+     ./setup.sh --new-env --omnigibson --bddl --dataset
+   )
+   conda activate behavior
+
+Follow the license prompts. The ``--dataset`` option downloads the robot assets, scenes and objects, and 2026 challenge task instances. The ``behavior`` environment contains the simulator. See Installation for RLinf model dependencies. Run the RLinf commands below from the RLinf checkout.
+
+**With an existing OmniGibson 3.9.3 environment.** To download missing assets into the same data root, run the following in the active simulator environment:
+
+.. code-block:: bash
+
    python -c "from omnigibson.utils.asset_utils import download_omnigibson_robot_assets; download_omnigibson_robot_assets()"
-   python -c "from omnigibson.utils.asset_utils import download_behavior_1k_assets; download_behavior_1k_assets(accept_license=True)"
+   python -c "from omnigibson.utils.asset_utils import download_behavior_1k_assets; download_behavior_1k_assets()"
    python -c "from omnigibson.utils.asset_utils import download_2026_challenge_task_instances; download_2026_challenge_task_instances()"
 
-**What this does:**
-
-1. Sets ``OMNIGIBSON_DATA_PATH`` to the directory used by training and evaluation.
-2. Downloads and unpacks the assets and challenge instances into that directory.
+Both methods use the `official asset repository <https://huggingface.co/datasets/behavior-1k/zipped-datasets/tree/main>`_. Check that your data root contains ``omnigibson-robot-assets/``, ``behavior-1k-assets/``, ``2026-challenge-task-instances/``, and the dataset key ``omnigibson.key``.
 
 For unattended runs, export ``OMNI_KIT_ACCEPT_EULA=YES`` in the launch shell after accepting the `NVIDIA license <https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html#running-isaac-sim>`_. Interactive runs can accept the license at the first Isaac Sim import.
 
@@ -247,7 +262,7 @@ performance.
      - Keep ``BehaviorTask`` / ``InteractiveTraversableScene`` explicit so the intended
        upstream OmniGibson classes are selected after overrides are applied.
    * - ``omni_config.task.activity_name``
-     - Task name for the selected scene (e.g. ``turning_on_radio``).
+     - Set the task by name. For example, task index ``0`` in the task list corresponds to ``turning_on_radio``. With ``instance_resample_mode: disabled``, ``activity_instance_id`` selects the fixed starting layout.
    * - ``omni_config.task.instance_resample_mode``
      - Reset-time instance switching: ``disabled`` (load the fixed ``activity_instance_id``),
        ``offline`` (scan ``activity_instance_dir`` once and sample a cached instance per reset —
@@ -279,10 +294,9 @@ performance.
    * - ``omni_config.macro.use_numpy_controller_backend``
      - ``True`` uses the numpy controller backend, usually faster in single-/moderate-parallel runs.
    * - ``skip_intermediate_renders``
-     - When ``True``, skips collecting intermediate observations inside an action chunk (large
-       env-speed gain). Saved videos then show only the frames the policy observes at chunk boundaries.
+     - When ``True``, skips intermediate renders and returns the observation at the end of the action chunk. The simulator still reads sensors at each step.
    * - ``num_env_subprocess``
-     - Number of simulator processes per local environment worker (preset default ``1``). For example, with four local environments and two processes, each process runs two scenes. Use one process per environment for independent resets.
+     - Number of simulator processes per local environment worker (preset default ``1``). For example, with four local environments and two processes, each process runs two scenes. Stages share this pool. Each stage needs its own simulator process because a physics step advances every scene in that process. Use one process per environment for independent resets.
 
 Generating cached task instances
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

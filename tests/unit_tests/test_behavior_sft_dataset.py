@@ -25,27 +25,16 @@ from rlinf.models.embodiment.openpi.policies.behavior_policy import (
 )
 
 
-@pytest.mark.parametrize("year", [2025, 2026])
-def test_behavior_sft_repack_preserves_camera_order_state_and_task(year):
+def test_behavior_sft_repack_preserves_camera_order_state_and_task():
     prompt = "Turn on the radio receiver that's on the table in the living room."
-    if year == 2026:
-        keys = (
-            "observation.rgb.zed_link_camera_0",
-            "observation.rgb.left_realsense_link_camera_0",
-            "observation.rgb.right_realsense_link_camera_0",
-        )
-        state = np.arange(61, dtype=np.float32)
-        frame = {"task": "turning_on_radio"}
-        repack = _Repack(keys, {"turning_on_radio": prompt})
-    else:
-        keys = (
-            "observation.images.rgb.head",
-            "observation.images.rgb.left_wrist",
-            "observation.images.rgb.right_wrist",
-        )
-        state = np.arange(256, dtype=np.float32)
-        frame = {"prompt": prompt}
-        repack = _Repack()
+    keys = (
+        "observation.rgb.zed_link_camera_0",
+        "observation.rgb.left_realsense_link_camera_0",
+        "observation.rgb.right_realsense_link_camera_0",
+    )
+    state = np.arange(61, dtype=np.float32)
+    frame = {"task": "turning_on_radio"}
+    repack = _Repack({"turning_on_radio": prompt})
     for index, key in enumerate(keys):
         frame[key] = np.full((3, 4, 4), index, dtype=np.uint8)
     frame["observation.state"] = state

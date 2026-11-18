@@ -24,13 +24,13 @@ BEHAVIOR 依赖 Isaac Sim 5.1，对 GPU 与驱动有额外要求，详见训练�
 
 **环境变量**
 
-每次运行前设置包含 2026 仿真资源的 OmniGibson 数据路径：
+将数据根目录指向下载资产时使用的目录：
 
 .. code-block:: bash
 
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
 
-资产下载和首次启动时的许可设置见 :doc:`../../examples/embodied/behavior` 中的“下载资产”一节。
+OmniGibson 3.9.3 在这个目录下查找场景和物体资产 ``behavior-1k-assets/``、机器人资产 ``omnigibson-robot-assets/``、密钥 ``omnigibson.key`` 和任务实例 ``2026-challenge-task-instances/``。Python 导入 Isaac Sim 5.1 时会自动定位其安装目录。安装和下载步骤见 :doc:`../../examples/embodied/behavior` 中的“下载资产”。
 
 示例配置
 --------
@@ -48,7 +48,7 @@ BEHAVIOR 依赖 Isaac Sim 5.1，对 GPU 与驱动有额外要求，详见训练�
      - ``behavior_r1pro``
      - π₀.₅（``openpi``）
 
-若 ``evaluations/behavior/<config>.yaml`` 不存在，``run_eval.sh`` 会回退到 ``examples/embodiment/config/`` 下同名配置（例如 ``behavior_ppo_openpi_pi05``）。回退配置包含 ``actor`` / ``algorithm`` 等训练段，但设置 ``runner.only_eval: True`` 后仍可正常评测。
+评测 π₀.₅ 权重时使用上表中的配置，其中已指定推理模型类型和每次执行的动作步数。评测入口会自动启用 ``runner.only_eval``。
 
 完整评测流程
 ------------
@@ -103,7 +103,7 @@ BEHAVIOR 评测 **每次运行对应单个任务** （由 ``omni_config.task.act
 
 - ``disabled`` （默认）：每次 reset 加载 ``activity_instance_id`` 对应的固定实例；若设置了 ``activity_instance_dir``，则从该目录读取对应 JSON。
 - ``offline``：每次 reset 从选定的 split 或 ``activity_instance_dir`` 中 **随机** 选取一个缓存实例（需先下载官方 ``2026-challenge-task-instances`` 或用 ``instance_generator.py`` 生成）。
-- ``online``：每次重置时重新生成物体布局。为每个环境分配一个仿真进程，留空 ``activity_instance_dir`` 和 ``instance_split``，并设置 ``online_object_sampling: True`` 和 ``use_presampled_robot_pose: False``。
+- ``online``：每次重置时现场生成物体布局。保持预设中的 ``activity_instance_dir: null``，省略 ``instance_split``；这两个字段用于选择已保存的布局。在线采样时设置 ``online_object_sampling: True`` 和 ``use_presampled_robot_pose: False``，每个仿真进程只运行一个环境。
 
 .. note::
 
@@ -202,13 +202,14 @@ BEHAVIOR 环境步进较慢，通常建议给 env 分配足够 GPU，并与 roll
      env.eval.total_num_envs=4 \
      env.eval.num_env_subprocess=2
 
-**从训练配置评测**
+**评测训练得到的 π₀.₅ 权重**
+
+将模型路径指向 RLinf 格式的 OpenPI checkpoint 目录。如果权重仍是上游 OpenPI 格式，请先按 :doc:`../../examples/embodied/sft_openpi` 中的步骤转换。
 
 .. code-block:: bash
 
-   bash evaluations/run_eval.sh behavior_ppo_openpi_pi05 \
-     runner.only_eval=True \
-     rollout.model.model_path=/path/to/model
+   bash evaluations/run_eval.sh behavior behavior_openpi_pi05_eval \
+     rollout.model.model_path=/path/to/rlinf_openpi_checkpoint
 
 常见问题
 --------

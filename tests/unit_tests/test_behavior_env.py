@@ -32,7 +32,6 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.envs.sim.behavior import BehaviorSimulator, behavior_env
-from rlinf.envs.sim.behavior import simulator as simulator_module
 from rlinf.envs.sim.behavior.instance_loader import ActivityInstanceLoader
 from rlinf.envs.sim.behavior.utils import R1PRO_PROPRIO_KEYS, make_environment_config
 
@@ -66,6 +65,20 @@ class FakeBehaviorPool:
         self.terminate_at = {}
         self.truncate_at = {}
         self.instances.append(self)
+
+    @classmethod
+    def acquire_shared(cls, cfg, worker_info, stages, num_envs, seed_offset):
+        assert stages == 1
+        return cls(cfg, num_envs, cfg.seed + seed_offset * num_envs), 0
+
+    def release_shared(self, offset):
+        self.close()
+
+    def env_reset_slice(self, start, num_envs, indices):
+        return self.reset(indices)
+
+    def env_chunk_step_slice(self, start, num_envs, actions):
+        return self.chunk_step(actions)
 
     def _observation(self, env_id):
         # Different pixel values make head/left/right swaps observable.
@@ -473,23 +486,151 @@ def test_behavior_rejects_auto_reset_with_offload_before_starting_simulator(
     assert FakeBehaviorPool.instances == []
 
 
-def test_behavior_pipeline_stages_have_independent_simulation_state(make_behavior_env):
-    first = make_behavior_env(stages=2, seed_offset=0)
-    second = make_behavior_env(stages=2, seed_offset=1)
-    first.reset()
-    second.reset()
-    assert first.pool is not second.pool
-    assert (first.seed, second.seed) == (42, 43)
-    assert (first.pool.seed, second.pool.seed) == (42, 44)
+def test_behavior_shared_pool_keeps_stages_and_train_eval_independent(
+    inline_behavior_actors,
+):
+    processes, killed = inline_behavior_actors
+    cfg = OmegaConf.create(
+        {
+            "device": "cpu",
+            "seed": 42,
+            "total_num_envs": 8,
+            "num_env_subprocess": 3,
+            "ignore_terminations": False,
+            "auto_reset": False,
+            "max_episode_steps": 100,
+            "use_fixed_reset_state_ids": False,
+        }
+    )
+    worker = SimpleNamespace(group_world_size=1)
+    # Open stage 1 first, then offload and reattach stage 0 while stage 1 stays active.
+    b = behavior_env.BehaviorEnv(cfg, 4, 1, 2, worker)
+    a = behavior_env.BehaviorEnv(cfg, 4, 0, 2, worker)
+    evaluation = behavior_env.BehaviorEnv(OmegaConf.create(cfg), 4, 0, 2, worker)
+    try:
+        assert a.pool is b.pool and a.pool is not evaluation.pool
+        assert (a.pool_offset, b.pool_offset) == (0, 4)
+        assert [list(rows) for rows in a.pool.rows] == [[0, 1], [2, 3], [4, 5, 6, 7]]
+        assert len(processes) == 6
+        a.reset()
+        b.reset()
+        a.chunk_step(torch.zeros(4, 3, 23))
+        assert [proc.steps.tolist() for proc in processes[:3]] == [
+            [3, 3],
+            [3, 3],
+            [0] * 4,
+        ]
+        a.offload()
+        assert not killed
+        b.chunk_step(torch.ones(4, 2, 23))
+        a.reset()
+        assert b.pool is a.pool
+        assert processes[2].steps.tolist() == [2] * 4
+        assert len(processes) == 6
+        a.close()
+        b.close()
+        assert len(killed) == 3
+        evaluation.reset()
+    finally:
+        a.close()
+        b.close()
+        evaluation.close()
+    assert len(killed) == 6
 
-    first.chunk_step(torch.zeros(2, 3, 23))
-    assert first.pool.steps.tolist() == [3, 3]
-    assert second.pool.steps.tolist() == [0, 0]
-    second.chunk_step(torch.ones(2, 2, 23))
-    assert first.pool.steps.tolist() == [3, 3]
-    assert second.pool.steps.tolist() == [2, 2]
-    first.close()
-    assert second.pool.close_count == 0
+
+@pytest.mark.parametrize("operation", ["step", "reset"])
+def test_behavior_partial_shard_failure_requires_full_stage_reset(
+    inline_behavior_actors, monkeypatch, operation
+):
+    processes, _ = inline_behavior_actors
+    cfg = OmegaConf.create(
+        {
+            "device": "cpu",
+            "seed": 42,
+            "total_num_envs": 4,
+            "num_env_subprocess": 4,
+            "ignore_terminations": False,
+            "auto_reset": False,
+            "max_episode_steps": 100,
+            "use_fixed_reset_state_ids": False,
+        }
+    )
+    worker = SimpleNamespace(group_world_size=1)
+    stage = behavior_env.BehaviorEnv(cfg, 2, 0, 2, worker)
+    other = behavior_env.BehaviorEnv(cfg, 2, 1, 2, worker)
+    actions = torch.zeros(2, 1, 23)
+    try:
+        stage.reset()
+        other.reset()
+        stage.chunk_step(actions)
+        second = stage.pool.env_processes[1]
+
+        def fail(*args):
+            raise RuntimeError("one shard failed")
+
+        with monkeypatch.context() as patch:
+            method = second.chunk_step if operation == "step" else second.reset
+            patch.setattr(method, "remote", fail)
+            with pytest.raises(RuntimeError, match="one shard failed"):
+                if operation == "step":
+                    stage.chunk_step(actions)
+                else:
+                    stage.reset()
+        assert processes[0].steps.item() == (2 if operation == "step" else 0)
+        assert processes[1].steps.item() == 1
+        with pytest.raises(RuntimeError, match="entire BEHAVIOR stage"):
+            stage.chunk_step(actions)
+        other.chunk_step(actions)
+        assert [p.steps.item() for p in processes[2:]] == [1, 1]
+        stage.env_reset([0])
+        with pytest.raises(RuntimeError, match="entire BEHAVIOR stage"):
+            stage.chunk_step(actions)
+        stage.reset()
+        stage.chunk_step(actions)
+        assert [p.steps.item() for p in processes] == [1, 1, 1, 1]
+    finally:
+        stage.close()
+        other.close()
+
+
+def test_behavior_stages_cannot_split_a_native_physics_clock(inline_behavior_actors):
+    processes, _ = inline_behavior_actors
+    cfg = OmegaConf.create({"num_env_subprocess": 1, "auto_reset": False})
+    with pytest.raises(ValueError, match="2 independent pipeline stages"):
+        behavior_env.BehaviorProcessPool(cfg, 2, 42, pipeline_stage_num=2)
+    assert not processes
+
+
+def test_behavior_failure_and_timeout_reset_without_reporting_success(
+    make_behavior_env,
+):
+    env = make_behavior_env(num_envs=3, auto_reset=True)
+    env.reset()
+    env.pool.terminate_at = {0: 1}
+    env.pool.truncate_at = {1: 1}
+    info_for_step = env.pool._info
+
+    def with_failure(index, terminated=False, truncated=False):
+        info = info_for_step(index, terminated, truncated)
+        info["done"]["success"] = info["success"] = False
+        info["done"]["termination_conditions"]["failure"] = {"done": bool(terminated)}
+        info["done"]["termination_conditions"]["success"]["done"] = False
+        return info
+
+    env.pool._info = with_failure
+    observations, rewards, terminated, truncated, infos = env.chunk_step(
+        torch.zeros(3, 1, 23)
+    )
+    assert terminated[:, -1].tolist() == [True, False, False]
+    assert truncated[:, -1].tolist() == [False, True, False]
+    final = infos[-1]
+    assert final["_final_observation"].tolist() == [True, True, False]
+    assert not final["final_info"]["episode"]["success_once"].any()
+    torch.testing.assert_close(final["final_info"]["episode"]["return"], rewards[:, 0])
+    assert final["final_info"]["episode"]["episode_length"].tolist() == [1, 1, 1]
+    assert env.elapsed_steps.tolist() == [0, 0, 1]
+    assert final["final_observation"]["states"][:, 0].tolist() == [10000, 11000, 12000]
+    assert observations[-1]["states"][:, 0].tolist() == [0, 1000, 12000]
 
 
 @pytest.mark.parametrize("version", [None, "3.9.3", "3.9.3-post2", "3.7.1"])
@@ -539,7 +680,7 @@ def test_behavior_pool_preserves_shard_and_action_row_order(inline_behavior_acto
     pool = behavior_env.BehaviorProcessPool(cfg, num_envs=4, seed=40)
     try:
         actions = torch.arange(4 * 2 * 23).reshape(4, 2, 23).float()
-        observations, rewards, _, _, _ = pool.chunk_step(actions)
+        observations, rewards, _, _, _ = pool.env_chunk_step_slice(0, 4, actions)
         torch.testing.assert_close(
             torch.stack([row["robot_r1"]["proprio"][1] for row in observations[-1]]),
             actions[:, -1, 0],
@@ -551,7 +692,7 @@ def test_behavior_pool_preserves_shard_and_action_row_order(inline_behavior_acto
             43,
         ]
         torch.testing.assert_close(rewards[-1], torch.tensor([0.25, 0.5, 0.25, 0.5]))
-        reset_obs, _ = pool.reset([3, 1, 2, 0])
+        reset_obs, _ = pool.env_reset_slice(0, 4, [3, 1, 2, 0])
         assert [row["robot_r1"]["proprio"][0] for row in reset_obs] == [
             43,
             41,
@@ -571,8 +712,8 @@ def test_behavior_pool_partial_reset_does_not_touch_other_episodes(
     cfg = OmegaConf.create({"num_env_subprocess": None, "auto_reset": True})
     pool = behavior_env.BehaviorProcessPool(cfg, num_envs=3, seed=40)
     try:
-        pool.chunk_step(torch.zeros(3, 2, 23))
-        observations, _ = pool.reset([2, 0])
+        pool.env_chunk_step_slice(0, 3, torch.zeros(3, 2, 23))
+        observations, _ = pool.env_reset_slice(0, 3, [2, 0])
         assert [process.steps.tolist() for process in processes] == [[0], [2], [0]]
         assert [row["robot_r1"]["proprio"][0] for row in observations] == [42, 40]
         assert processes[1].reset_calls == []
@@ -588,7 +729,7 @@ def test_behavior_pool_rejects_partial_batch_reset_before_resetting_any_actor(
     pool = behavior_env.BehaviorProcessPool(cfg, num_envs=4, seed=40)
     try:
         with pytest.raises(ValueError, match="Partial reset"):
-            pool.reset([0, 1, 2])
+            pool.env_reset_slice(0, 4, [0, 1, 2])
         assert all(process.reset_calls == [] for process in processes)
     finally:
         pool.close()
@@ -799,19 +940,19 @@ def test_behavior_process_accepts_both_render_options(
             self.position = torch.zeros(num_envs)
             self.image = self.position.clone()
 
-        def step(self, actions, *, render):
+        def step(self, actions, *, render, get_obs):
             self.position += actions[:, 0]
             if render:
                 self.image = self.position.clone()
             return (
-                [{"image": self.image.clone()}],
+                [{"image": self.image.clone()}] if get_obs else None,
                 self.position.clone(),
                 torch.zeros(1, dtype=torch.bool),
                 torch.zeros(1, dtype=torch.bool),
                 [{}],
             )
 
-    monkeypatch.setattr(simulator_module, "BehaviorSimulator", Simulator)
+    monkeypatch.setattr(behavior_env, "BehaviorSimulator", Simulator)
     process = behavior_env.BehaviorProcess(OmegaConf.create(options), 1, 0)
     actions = torch.zeros((1, 3, 23))
     actions[0, :, 0] = torch.tensor([1.0, 2.0, 3.0])
@@ -873,9 +1014,10 @@ def test_behavior_config_preserves_existing_observation_wrappers(
     assert actual["task"]["include_obs"] is task_obs
 
 
+@pytest.mark.parametrize("with_lights", [False, True])
 @pytest.mark.parametrize("ignore_terminations,terminal", [(False, True), (True, False)])
 def test_chunk_terminal_frame_is_refreshed_and_episode_stops(
-    ignore_terminations, terminal
+    ignore_terminations, terminal, with_lights
 ):
     backend = backend_without_simulator()
     backend.num_envs = 1
@@ -884,7 +1026,9 @@ def test_chunk_terminal_frame_is_refreshed_and_episode_stops(
     backend._frozen = torch.zeros(1, dtype=torch.bool)
     backend._terminal = [None]
     backend._last_actions = torch.zeros((1, 23))
-    backend._lights = [None]
+    backend._lights = [
+        SimpleNamespace(sync_from_current_state=lambda: None) if with_lights else None
+    ]
     backend._instance_ids = [7]
     calls = {"steps": 0, "renders": 0}
 
@@ -917,16 +1061,17 @@ def test_chunk_terminal_frame_is_refreshed_and_episode_stops(
 
     metric.step = step_metric
     backend.metrics = [metric]
-    first = backend.step(torch.zeros((1, 23)), render=False)
+    first = backend.step(torch.zeros((1, 23)), render=False, get_obs=False)
     second = backend.step(torch.ones((1, 23)), render=False)
+    assert first[0] is None
     if terminal:
         assert calls == {"steps": 1, "renders": 3}
-        assert first[0][0]["frame"].item() == second[0][0]["frame"].item() == 9
+        assert second[0][0]["frame"].item() == 9
         assert first[1].item() == 1 and second[1].item() == 0
         assert second[4][0]["q_score"] == 0.8
         assert first[4][0]["episode_length"] == second[4][0]["episode_length"] == 1
     else:
-        assert calls["steps"] == 2
+        assert calls == {"steps": 2, "renders": 0}
         assert not backend._frozen.any()
 
 
@@ -1159,7 +1304,7 @@ def local_behavior_simulator():
     simulator.close()
 
 
-def test_local_behavior_observe_and_metrics_do_not_advance_episode(
+def test_local_behavior_metric_reads_do_not_advance_episode(
     local_behavior_simulator,
 ):
     simulator, native, metric, _ = local_behavior_simulator
@@ -1167,21 +1312,9 @@ def test_local_behavior_observe_and_metrics_do_not_advance_episode(
     simulator.step(torch.ones((1, 23)))
     metric.forbid_aggregate = True
     before = simulator.get_metrics()
-    observation, info = simulator.observe()
-    assert native.physics_steps == metric.timesteps == 1
-    assert info[0]["image_freshness"] == "not_refreshed"
-    assert info[0]["state_source"] == "live_simulator"
-    refreshed, refreshed_info = simulator.observe(render=True)
-    assert refreshed_info[0]["image_freshness"] == "rendered"
-    assert native.physics_steps == metric.timesteps == 1
     assert simulator.get_metrics() == before
-    assert (
-        refreshed[0]["robot_r1"]["rgb"][0, 0, 0]
-        != observation[0]["robot_r1"]["rgb"][0, 0, 0]
-    )
-    observation[0]["robot_r1"]["rgb"].fill_(99)
+    assert native.physics_steps == metric.timesteps == 1
     before[0]["official_metrics"]["q_score"]["final"] = 99
-    assert native.image[0, 0, 0].item() != 99
     assert simulator.get_metrics()[0]["q_score"] == 0.1
 
 
@@ -1324,7 +1457,7 @@ def test_local_behavior_native_access_and_closed_lifecycle(
     assert simulator.native_env is native
     assert simulator.get_robot() is native.robot
     with pytest.raises(RuntimeError, match="reset"):
-        simulator.observe()
+        simulator.get_metrics()
     with pytest.raises(ValueError, match="env_index"):
         simulator.get_robot(1)
     simulator.reset()
@@ -1354,7 +1487,6 @@ def test_local_behavior_native_access_and_closed_lifecycle(
     for operation in (
         lambda: simulator.native_env,
         simulator.get_robot,
-        simulator.observe,
         simulator.get_robot_state,
         simulator.get_camera_metadata,
         simulator.get_metrics,
@@ -1410,10 +1542,10 @@ def test_local_behavior_constructor_owns_only_its_application(
     og.clear = clear
     og.shutdown = shutdown
     monkeypatch.setitem(sys.modules, "omnigibson", og)
-    monkeypatch.setattr(simulator_module, "configure_macros", lambda cfg: None)
-    monkeypatch.setattr(simulator_module, "make_environment_config", lambda *args: {})
+    monkeypatch.setattr(behavior_env, "configure_macros", lambda cfg: None)
+    monkeypatch.setattr(behavior_env, "make_environment_config", lambda *args: {})
     monkeypatch.setattr(
-        simulator_module,
+        behavior_env,
         "ActivityInstanceLoader",
         lambda *args: SimpleNamespace(
             activity_name="turning_on_radio",

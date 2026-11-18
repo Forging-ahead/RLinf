@@ -22,18 +22,6 @@ from rlinf.data.datasets.openpi.behavior.behavior_sft_data_loader import (
 __all__ = [
     "BehaviorSftDataConfig",
     "BehaviorSftDataLoader",
-    "BehaviorSftDataset",
     "build_behavior_sft_dataloader",
     "create_behavior_sft_data_loader",
 ]
-
-
-def __getattr__(name):
-    if name == "BehaviorSftDataset":
-        # The 2025 streaming dataset imports the LeRobot v2.1 API.
-        from rlinf.data.datasets.openpi.behavior.behavior_sft_dataset import (
-            BehaviorSftDataset,
-        )
-
-        return BehaviorSftDataset
-    raise AttributeError(name)

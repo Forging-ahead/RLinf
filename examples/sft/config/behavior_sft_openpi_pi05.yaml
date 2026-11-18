@@ -33,20 +33,9 @@ data:
   train_data_paths: /path/to/2026-challenge-demos
   behavior_dataset_root: /path/to/2026-challenge-demos
   repo_id: "behavior-1k/2026-challenge-demos"
-  modalities: ["rgb"]
   num_workers: 8
-  fine_grained_level: 0
   tolerance_s: 1.0e-4
-  # The 2026 loader uses the main task from the dataset.
   tasks: ["turning_on_radio"]
-  use_skill: false
-  # The 2025 skill-label loader reads these labels when use_skill is enabled.
-  task_subtasks:
-    turning_on_radio:
-      - "move to radio"
-      - "pick up radio from coffee table"
-      - "press radio"
-      - "place radio on coffee table"
 
 algorithm:
   adv_type: gae

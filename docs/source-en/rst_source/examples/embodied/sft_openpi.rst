@@ -102,9 +102,8 @@ Typical official horizons: BEHAVIOR ``pi05_behavior`` **32**, RoboTwin
 ``pi0_realworld`` **10**. Override ``openpi.action_horizon`` only when the
 checkpoint horizon differs from that ``TrainConfig``.
 
-The BEHAVIOR / dual-Franka streaming SFT loaders currently still use
-``num_action_chunks`` as the data window, so those configurations keep it equal to
-the official horizon.
+The BEHAVIOR and dual-Franka SFT configs use ``num_action_chunks`` for the data
+window. Set it to the official horizon for each model.
 
 Keep original parameters and optimizer updates in FP32 with
 ``actor.model.precision: fp32``. Set ``actor.model.openpi.embed_dtype: bf16``
@@ -173,7 +172,7 @@ Select the data format with ``actor.model.openpi.config_name``:
    * - ``pi0_aloha_robotwin``
      - RoboTwin (ALOHA)
    * - ``pi05_behavior``
-     - BEHAVIOR-1K (streaming loader)
+     - BEHAVIOR-1K (2026 challenge demonstrations)
    * - ``pi0_maniskill`` · ``pi05_maniskill``
      - ManiSkill
    * - ``pi05_metaworld``
@@ -393,9 +392,7 @@ Filesystem paths live in the experiment config; the model shape comes from
      - model/pi0_5@actor.model
      - hybrid_engines/openpi_fsdp@actor.fsdp_config
 
-Set both dataset paths to the local copy of the official
-`2026 challenge demonstrations <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_
-(LeRobot v3). This SFT reader loads RGB from the head and both wrist cameras.
+This recipe requires the `2026 challenge demonstrations <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_ (LeRobot v3.0). Set both dataset paths to the local dataset root. To train on a subset, keep the metadata and download the frame data and three RGB camera streams (head and both wrists) for every episode of each task in ``tasks``.
 
 .. code:: yaml
 
@@ -403,10 +400,8 @@ Set both dataset paths to the local copy of the official
      train_data_paths: /path/to/2026-challenge-demos
      behavior_dataset_root: /path/to/2026-challenge-demos
      repo_id: "behavior-1k/2026-challenge-demos"
-     modalities: ["rgb"]
      num_workers: 8
      tasks: ["turning_on_radio"]
-     use_skill: false
 
    actor:
      model:
@@ -417,8 +412,7 @@ Set both dataset paths to the local copy of the official
        openpi_data:
          norm_stats_path: /path/to/norm_stats.json
 
-Use ``use_skill: false`` and ``fine_grained_level: 0`` for the main-task
-instructions in ``meta/tasks.jsonl``.
+Each radio sample uses the instruction for ``turning_on_radio`` in ``meta/tasks.jsonl``.
 When evaluating the resulting policy, set
 ``omni_config.robots[0].proprio_obs`` to the SDK field order in
 ``PROPRIOCEPTION_INDICES["R1Pro"]`` so that the 61-value state includes
