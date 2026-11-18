@@ -15,12 +15,11 @@
 import json
 import os
 import random
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
-
-from rlinf.envs.sim.behavior.utils import sync_robot_after_pose_override
 
 TASK_INSTANCE_FILE_SUFFIX = "_template-tro_state.json"
 TASK_INSTANCE_TEMPLATE_FILE_SUFFIX = "_template.json"
@@ -153,327 +152,213 @@ def discover_activity_instance_files(
     return [instance_files[k] for k in sorted(instance_files)]
 
 
-def load_activity_instance_tro_state(
-    env,
-    instance_id: int,
-    tro_file_path: str,
-    reset_scene: bool = False,
-) -> None:
-    """Apply a cached tro_state file to an existing OmniGibson env.
-
-    Args:
-        env: OmniGibson environment to mutate in place.
-        instance_id: Activity instance id represented by ``tro_file_path``.
-        tro_file_path: Path to a ``*_template-tro_state.json`` file.
-        reset_scene: Whether to call ``env.scene.reset()`` after applying the
-            cached state.
-    """
-    import omnigibson as og
-    from omnigibson.utils.python_utils import recursively_convert_to_torch
-
-    env.task.activity_instance_id = instance_id
-    with open(tro_file_path, "r", encoding="utf-8") as f:
-        tro_state = recursively_convert_to_torch(json.load(f))
-
-    robot = env.task.get_agent(env)
-    robot_name = getattr(robot, "model_name", getattr(robot, "model", None))
-    assert robot_name is not None, (
-        "Robot model name is required to load task instances."
-    )
-    robot_poses = tro_state.pop("robot_poses", None)
-
-    for tro_key, state in tro_state.items():
-        entity = env.task.object_scope.get(tro_key)
-        assert entity is not None, (
-            f"Cached task-relevant object {tro_key!r} is not present in the current "
-            f"object_scope while loading {tro_file_path}."
-        )
-        if getattr(entity, "synset", None) == "agent":
-            continue
-        if (
-            getattr(env.scene, "idx", 0) != 0
-            and isinstance(state, dict)
-            and isinstance(state.get("root_link"), dict)
-            and "pos" in state["root_link"]
-            and "ori" in state["root_link"]
-        ):
-            rebased_state = dict(state)
-            rebased_root_link = dict(state["root_link"])
-            rebased_pos, rebased_ori = env.scene.convert_scene_relative_pose_to_world(
-                rebased_root_link["pos"],
-                rebased_root_link["ori"],
-            )
-            rebased_root_link["pos"] = rebased_pos
-            rebased_root_link["ori"] = rebased_ori
-            rebased_state["root_link"] = rebased_root_link
-            state = rebased_state
-        entity.load_state(state, serialized=False)
-
-    if robot_poses is not None:
-        assert robot_name in robot_poses, (
-            f"{robot_name} presampled pose is not found in {tro_file_path}"
-        )
-        robot_pose = robot_poses[robot_name][0]
-        robot.set_position_orientation(
-            robot_pose["position"],
-            robot_pose["orientation"],
-            frame="scene",
-        )
-        sync_robot_after_pose_override(robot)
-        env.scene.write_task_metadata(key="robot_poses", data=robot_poses)
-    else:
-        env.scene.write_task_metadata(key="robot_poses", data=None)
-
-    for _ in range(25):
-        og.sim.step_physics()
-        for entity in env.task.object_scope.values():
-            if entity.exists and not entity.is_system:
-                entity.keep_still()
-
-    env.scene.update_initial_file()
-    if reset_scene:
-        env.scene.reset()
-
-
 class ActivityInstanceLoader:
-    """Prepare BEHAVIOR reset-time task instances for one vectorized env."""
+    """Select cached instances without changing RLinf's instance-ID meaning."""
 
-    def __init__(
-        self,
-        omni_cfg: DictConfig,
-        activity_name: str,
-        activity_instance_id: int,
-        instance_resample_mode: str,
-        activity_instances: tuple[ActivityInstanceFile, ...],
-    ):
-        self.omni_cfg = omni_cfg
-        self.activity_name = activity_name
-        self.activity_instance_id = activity_instance_id
-        self.instance_resample_mode = instance_resample_mode
-        self.activity_instances = activity_instances
-
-    @classmethod
-    def from_omni_cfg(cls, omni_cfg: DictConfig) -> "ActivityInstanceLoader":
-        """Build an instance loader from OmniGibson task config.
-
-        Args:
-            omni_cfg: Full OmniGibson config used to construct the BEHAVIOR env.
-
-        Returns:
-            A configured activity instance loader.
-
-        Raises:
-            ValueError: If the instance-resample configuration is invalid.
-        """
-        activity_name = OmegaConf.select(omni_cfg, "task.activity_name")
-        activity_definition_id = OmegaConf.select(
-            omni_cfg, "task.activity_definition_id"
-        )
-        activity_instance_id = OmegaConf.select(omni_cfg, "task.activity_instance_id")
-        activity_instance_dir = OmegaConf.select(omni_cfg, "task.activity_instance_dir")
-        instance_resample_mode = OmegaConf.select(
-            omni_cfg, "task.instance_resample_mode"
-        )
-        instance_file_format = OmegaConf.select(omni_cfg, "task.instance_file_format")
-        online_object_sampling = OmegaConf.select(
-            omni_cfg, "task.online_object_sampling"
-        )
-        use_presampled_robot_pose = OmegaConf.select(
-            omni_cfg, "task.use_presampled_robot_pose"
-        )
-
-        if not isinstance(instance_resample_mode, str):
-            raise ValueError(
-                f"task.instance_resample_mode must be a string, got {instance_resample_mode!r}."
-            )
-        instance_resample_mode = instance_resample_mode.lower()
-        if instance_resample_mode not in SUPPORTED_INSTANCE_RESAMPLE_MODES:
-            raise ValueError(
-                "task.instance_resample_mode must be one of "
-                f"{SUPPORTED_INSTANCE_RESAMPLE_MODES}, got {instance_resample_mode!r}."
-            )
-
-        if instance_file_format is not None:
-            if not isinstance(instance_file_format, str):
+    def __init__(self, cfg: DictConfig, num_envs: int, seed: int):
+        task = OmegaConf.select(cfg, "omni_config.task")
+        self.activity_name = str(task.activity_name)
+        self.definition_id = int(task.get("activity_definition_id", 0))
+        self.instance_id = int(task.get("activity_instance_id", 0))
+        self.mode = str(task.get("instance_resample_mode", "disabled")).lower()
+        self.file_format = str(task.get("instance_file_format", "tro_state")).lower()
+        self.directory = task.get("activity_instance_dir")
+        # Explicit legacy paths take precedence over a preset's default split.
+        self.split = None if self.directory else task.get("instance_split")
+        self.num_envs = num_envs
+        self.random = [random.Random(seed + index) for index in range(num_envs)]
+        self.files = ()
+        self.default_robot_poses = []
+        if self.mode not in SUPPORTED_INSTANCE_RESAMPLE_MODES:
+            raise ValueError(f"Invalid instance_resample_mode: {self.mode!r}")
+        if self.file_format not in SUPPORTED_INSTANCE_FILE_FORMATS:
+            raise ValueError(f"Invalid instance_file_format: {self.file_format!r}")
+        if self.split not in (None, "train", "public_test", "hidden_test"):
+            raise ValueError(f"Invalid instance_split: {self.split!r}")
+        if self.mode == "online":
+            if (
+                self.directory
+                or self.split
+                or not task.get("online_object_sampling", False)
+            ):
                 raise ValueError(
-                    f"task.instance_file_format must be a string, got {instance_file_format!r}."
+                    "online resampling requires online_object_sampling=true and no cached instance source."
                 )
-            instance_file_format = instance_file_format.lower()
-            if instance_file_format not in SUPPORTED_INSTANCE_FILE_FORMATS:
+            if task.get("use_presampled_robot_pose", True):
                 raise ValueError(
-                    "task.instance_file_format must be one of "
-                    f"{SUPPORTED_INSTANCE_FILE_FORMATS}, got {instance_file_format!r}."
+                    "online resampling requires use_presampled_robot_pose=false."
                 )
-
-        if instance_resample_mode == "online":
-            if activity_instance_dir is not None:
+            if num_envs != 1:
                 raise ValueError(
-                    "task.activity_instance_dir is incompatible with "
-                    "task.instance_resample_mode='online'."
+                    "OmniGibson 3.9.3 online sampling requires one environment per process."
                 )
-            if not online_object_sampling:
-                raise ValueError(
-                    "task.instance_resample_mode='online' requires "
-                    "task.online_object_sampling to be True."
-                )
-            if use_presampled_robot_pose:
-                raise ValueError(
-                    "task.instance_resample_mode='online' requires "
-                    "task.use_presampled_robot_pose to be False."
-                )
-            return cls(
-                omni_cfg=omni_cfg,
-                activity_name=activity_name,
-                activity_instance_id=activity_instance_id,
-                instance_resample_mode=instance_resample_mode,
-                activity_instances=(),
-            )
-
-        if activity_instance_dir is None:
-            if instance_resample_mode == "offline":
-                raise ValueError(
-                    "task.activity_instance_dir must be set when "
-                    "task.instance_resample_mode is 'offline'."
-                )
-            return cls(
-                omni_cfg=omni_cfg,
-                activity_name=activity_name,
-                activity_instance_id=activity_instance_id,
-                instance_resample_mode=instance_resample_mode,
-                activity_instances=(),
-            )
-
-        if online_object_sampling:
-            raise ValueError(
-                "task.activity_instance_dir only supports cached offline instances. "
-                "Please disable task.online_object_sampling."
-            )
-        if instance_file_format is None:
-            raise ValueError(
-                "task.instance_file_format must be set to 'template' or "
-                "'tro_state' when task.activity_instance_dir is set."
-            )
-
-        activity_instances = tuple(
-            discover_activity_instance_files(
-                activity_instance_dir=activity_instance_dir,
-                activity_name=activity_name,
-                activity_definition_id=activity_definition_id,
-                instance_file_format=instance_file_format,
-            )
-        )
-        if instance_resample_mode == "disabled":
-            instance_ids = {entry.instance_id for entry in activity_instances}
-            if activity_instance_id not in instance_ids:
-                raise ValueError(
-                    f"task.activity_instance_id={activity_instance_id} is not present in "
-                    f"task.activity_instance_dir={activity_instance_dir}."
-                )
-
-        return cls(
-            omni_cfg=omni_cfg,
-            activity_name=activity_name,
-            activity_instance_id=activity_instance_id,
-            instance_resample_mode=instance_resample_mode,
-            activity_instances=activity_instances,
-        )
-
-    def prepare_reset(self, vec_env) -> None:
-        """Apply any reset-time task-instance mutation required by the config.
-
-        Args:
-            vec_env: Vectorized OmniGibson environment whose child envs should be
-                updated before ``vec_env.reset()``.
-        """
-        if self.instance_resample_mode == "online":
-            task_cfg = OmegaConf.select(self.omni_cfg, "task")
-            for env in vec_env.envs:
-                env.update_task(task_config=task_cfg)
-            return
-
-        if not self.activity_instances:
-            return
-
-        if self.instance_resample_mode == "offline":
-            instance_files = [
-                random.choice(self.activity_instances) for _ in range(len(vec_env.envs))
-            ]
-        else:
-            instance_file = self._get_activity_instance(self.activity_instance_id)
-            instance_files = [instance_file] * len(vec_env.envs)
-
-        self._apply_instance_files(vec_env, instance_files)
-
-    def _get_activity_instance(self, instance_id: int) -> ActivityInstanceFile:
-        for instance_file in self.activity_instances:
-            if instance_file.instance_id == instance_id:
-                return instance_file
-        raise ValueError(f"Activity instance id {instance_id} was not discovered.")
-
-    def _apply_instance_files(
-        self,
-        vec_env,
-        instance_files: list[ActivityInstanceFile],
-    ) -> None:
-        if len(instance_files) != len(vec_env.envs):
-            raise ValueError(
-                "Number of cached activity instance files must match the number of "
-                f"vectorized environments, got {len(instance_files)} and {len(vec_env.envs)}."
-            )
-
-        file_format = instance_files[0].file_format
-        if any(
-            instance_file.file_format != file_format for instance_file in instance_files
+        elif task.get("online_object_sampling", False) and (
+            self.directory or self.split
         ):
+            raise ValueError("Cached instances require online_object_sampling=false.")
+        if self.directory:
+            self.files = tuple(
+                discover_activity_instance_files(
+                    self.directory,
+                    self.activity_name,
+                    self.definition_id,
+                    self.file_format,
+                )
+            )
+        elif self.split is not None:
+            self.files = self._official_files(cfg)
+        elif self.mode == "offline":
             raise ValueError(
-                "Mixed cached instance formats in a single reset are not supported."
+                "offline resampling requires activity_instance_dir or instance_split."
             )
-        if file_format == "template":
-            self._load_template_instances(vec_env, instance_files)
-            return
-        if file_format == "tro_state":
-            self._load_tro_state_instances(vec_env, instance_files)
-            return
-        raise ValueError(f"Unsupported cached instance format: {file_format}")
-
-    def _load_template_instances(
-        self,
-        vec_env,
-        instance_files: list[ActivityInstanceFile],
-    ) -> None:
-        import omnigibson as og
-
-        if not og.sim.is_stopped():
-            og.sim.stop()
-
-        for env, instance_file in zip(vec_env.envs, instance_files, strict=True):
-            env.reload(self._build_reload_config(instance_file))
-
-        og.sim.play()
-        for env in vec_env.envs:
-            env.post_play_load()
-
-    def _load_tro_state_instances(
-        self,
-        vec_env,
-        instance_files: list[ActivityInstanceFile],
-    ) -> None:
-        for env, instance_file in zip(vec_env.envs, instance_files, strict=True):
-            load_activity_instance_tro_state(
-                env,
-                instance_id=instance_file.instance_id,
-                tro_file_path=instance_file.path,
-                reset_scene=False,
+        if self.files and self.mode == "disabled":
+            self._fixed_file()
+        if self.files and self.file_format == "template" and num_envs != 1:
+            raise ValueError(
+                "Template reload requires one environment per process; native batches share one scene config."
             )
 
-    def _build_reload_config(self, instance_file: ActivityInstanceFile) -> dict:
-        cfg = OmegaConf.create(OmegaConf.to_container(self.omni_cfg, resolve=False))
-        OmegaConf.update(cfg, "task.activity_instance_id", instance_file.instance_id)
-        OmegaConf.update(cfg, "task.activity_instance_dir", None, merge=False)
-        OmegaConf.update(cfg, "scene.scene_file", instance_file.path, merge=False)
-        OmegaConf.update(cfg, "scene.scene_instance", None, merge=False)
-        return OmegaConf.to_container(
-            cfg,
-            resolve=True,
-            throw_on_missing=True,
+    def _official_files(self, cfg: DictConfig) -> tuple[ActivityInstanceFile, ...]:
+        from omnigibson.tasks.behavior_task import BehaviorTask
+        from omnigibson.utils.asset_utils import get_task_instance_path
+
+        scene = OmegaConf.select(cfg, "omni_config.scene.scene_model")
+        name = BehaviorTask.get_cached_activity_scene_filename(
+            scene, self.activity_name, self.definition_id, self.instance_id
         )
+        suffix = "-tro_state" if self.file_format == "tro_state" else ""
+        path = get_task_instance_path(
+            scene,
+            f"{scene}_task_{self.activity_name}_instances/{name}{suffix}",
+            mode=self.split,
+        )
+        if path is None:
+            raise FileNotFoundError(
+                f"Official {self.split} instance {self.instance_id} for {self.activity_name!r} "
+                "was not found. activity_instance_id is the actual asset ID (public_test starts "
+                "at 301); this adapter never silently remaps ID 0 to 301."
+            )
+        return tuple(
+            discover_activity_instance_files(
+                Path(path).parent,
+                self.activity_name,
+                self.definition_id,
+                self.file_format,
+            )
+        )
+
+    def _fixed_file(self) -> ActivityInstanceFile:
+        for entry in self.files:
+            if entry.instance_id == self.instance_id:
+                return entry
+        raise ValueError(
+            f"Instance ID {self.instance_id} is absent from the configured source."
+        )
+
+    def initial_config(self, config: dict) -> dict:
+        """A TRO is loaded onto the task's canonical base scene, as in official eval."""
+        result = deepcopy(config)
+        if self.files:
+            if self.file_format == "tro_state":
+                result["task"]["activity_instance_id"] = 0
+            else:
+                entry = self._fixed_file() if self.mode == "disabled" else self.files[0]
+                result = self.template_config(result, entry)
+        return result
+
+    @staticmethod
+    def template_config(config: dict, entry: ActivityInstanceFile) -> dict:
+        result = deepcopy(config)
+        result["task"]["activity_instance_id"] = entry.instance_id
+        result["scene"]["scene_file"] = entry.path
+        result["scene"]["scene_instance"] = None
+        return result
+
+    def bind(self, env) -> None:
+        self.default_robot_poses = [
+            tuple(
+                value.clone()
+                for value in scene.robots[0].get_position_orientation(frame="scene")
+            )
+            for scene in env.scenes
+        ]
+
+    def select(self, env_indices: list[int]) -> dict[int, ActivityInstanceFile]:
+        if not self.files:
+            return {}
+        return {
+            index: self.random[index].choice(self.files)
+            if self.mode == "offline"
+            else self._fixed_file()
+            for index in env_indices
+        }
+
+    def load_tro_batch(self, env, selected: dict[int, ActivityInstanceFile]) -> None:
+        """Restore object states, settle once, and save new per-scene reset states.
+
+        Mirrors official BatchedEvaluator's loading order through public scene,
+        robot, and BehaviorTask APIs; no evaluator policy or run loop is needed.
+        """
+        import omnigibson as og
+        from omnigibson.tasks.behavior_task import get_presampled_robot_poses
+        from omnigibson.utils.bddl_utils import is_system_bddl_inst
+        from omnigibson.utils.python_utils import recursively_convert_to_torch
+
+        for index, entry in selected.items():
+            scene = env.scenes[index]
+            robot = scene.robots[0]
+            robot.reset()
+            with open(entry.path, encoding="utf-8") as stream:
+                states = recursively_convert_to_torch(json.load(stream))
+            poses = states.pop("robot_poses", None)
+            for name, state in states.items():
+                entity = env.task.object_scopes[index].get(name)
+                if entity is None:
+                    raise ValueError(
+                        f"TRO object {name!r} does not exist in environment {index}: {entry.path}"
+                    )
+                if entity is robot:
+                    continue
+                if isinstance(state, dict) and isinstance(state.get("root_link"), dict):
+                    root = state["root_link"]
+                    if "pos" in root and "ori" in root:
+                        root["pos"], root["ori"] = (
+                            scene.convert_scene_relative_pose_to_world(
+                                root["pos"], root["ori"]
+                            )
+                        )
+                entity.load_state(state, serialized=False)
+            if poses is None:
+                # Official reset requires nonempty pose metadata. Use the clean
+                # canonical pose, never stale metadata from the previous TRO.
+                position, orientation = self.default_robot_poses[index]
+                poses = {
+                    "robot": [
+                        {
+                            "position": position.clone(),
+                            "orientation": orientation.clone(),
+                        }
+                    ]
+                }
+            pose = get_presampled_robot_poses(
+                poses, robot.model, pose_key=env.task.presampled_pose_key
+            )[0]
+            robot.set_position_orientation(
+                pose["position"], pose["orientation"], frame="scene"
+            )
+            robot.keep_still()
+            scene.write_task_metadata(key="robot_poses", data=poses)
+            if self.activity_name == "turning_out_all_lights_before_sleep":
+                from omnigibson.eval.utils.light_utils import set_light_control_toggles
+
+                set_light_control_toggles(env.task.object_scopes[index].values(), True)
+        og.sim.update_handles()
+        # Partial resets would also advance the physics of the other scenes.
+        for _ in range(25):
+            og.sim.step_physics()
+            for index in selected:
+                for name, entity in env.task.object_scopes[index].items():
+                    if entity is not None and not is_system_bddl_inst(name):
+                        entity.keep_still()
+        for index in selected:
+            env.scenes[index].update_initial_file()

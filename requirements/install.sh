@@ -187,7 +187,7 @@ Common options:
                            UV_TORCH_BACKEND=rocm<version>. Ignored on other platforms.
     --python <version>     Python version for the venv (e.g. 3.11.14). Defaults to 3.11.14,
                            or 3.12.12 for agentic on the torch 2.11 stack.
-                           Must be >=3.10. Some envs (behavior, d4rl) require 3.10 and will override this.
+                           Must be >=3.10. BEHAVIOR requires 3.11; d4rl selects 3.10.
     --use-mirror           Use mirrors for faster downloads. GitHub downloads go through
                            the proxy in the GITHUB_PREFIX environment variable
                            (default https://gh-proxy.com/).
@@ -748,6 +748,13 @@ configure_nvidia() {
             echo "[install.sh] Could not resolve a driver-compatible CUDA wheel for torch ${_torch_ver}; leaving torch on the default index (UV_TORCH_BACKEND=${UV_TORCH_BACKEND})." >&2
         fi
     fi
+    if [ "$ENV_NAME" = "behavior" ] || { [ "$MODEL" = "openpi" ] && [ -z "$ENV_NAME" ]; }; then
+        # Match the official 5.1 SDK CUDA line, including GPU-less image builds.
+        PLATFORM_TORCH_STR="+cu128"
+        PLATFORM_TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+        PLATFORM_TORCH_PACKAGES=("torch" "torchvision" "torchaudio")
+        export UV_TORCH_BACKEND=cu128
+    fi
 }
 
 configure_amd() {
@@ -1151,7 +1158,7 @@ configure_metax() {
 
 
 # Envs that need a different torch than the project default (Isaac Sim /
-# OmniGibson need 2.5.1) declare it here, so configure_platform and
+# OmniGibson 3.9.3 need 2.7.0) declare it here, so configure_platform and
 # apply_torch_override re-point TORCH_VERSION, the wheel index and
 # UV_TORCH_BACKEND together instead of a mid-install `uv pip install torch==...`
 # that leaves a mixed torch tree. An explicit --torch always wins.
@@ -1159,7 +1166,7 @@ apply_env_default_torch() {
     [ -n "$TORCH_VERSION" ] && return 0
     local env_torch=""
     case "$ENV_NAME" in
-        behavior) env_torch="2.5.1" ;;
+        behavior) env_torch="2.7.0" ;;
         robolab) env_torch="2.7.1" ;;
         simple) env_torch="2.7.0" ;;
         robodojo) env_torch="2.7.0" ;;
@@ -1686,7 +1693,7 @@ apply_model_default_torch() {
     local model_torch="-"
     case "$MODEL" in
         openpi)
-            if [ "$ENV_NAME" = "yam" ]; then
+            if [ "$ENV_NAME" = "yam" ] || [ -z "$ENV_NAME" ]; then
                 # OpenPI 0.1.1 requires torch 2.7.1; sync its matching vision/codec stack.
                 model_torch="2.7.1"
             fi
@@ -2033,7 +2040,9 @@ EOF
     if [ "$MODEL" = "diffusion" ]; then
         sync_args+=(--inexact)
     fi
-    uv sync --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
+    if [ "${1:-}" != "--no-sync" ]; then
+        uv sync --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
+    fi
 }
 
 install_flash_attn() {
@@ -2404,7 +2413,9 @@ install_common_embodied_deps() {
     if [ "$MODEL" = "diffusion" ]; then
         sync_args+=(--inexact)
     fi
-    uv sync --extra embodied --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
+    if [ "${1:-}" != "--no-sync" ]; then
+        uv sync --extra embodied --active "${sync_args[@]}" "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
+    fi
     if [ -n "$PLATFORM_COMMON_REQ_EXCLUDE_RE" ]; then
         { grep -Ev "$PLATFORM_COMMON_REQ_EXCLUDE_RE" "$SCRIPT_DIR/embodied/envs/common.txt" || [ $? -eq 1 ]; } \
             | uv pip install -r -
@@ -2524,15 +2535,11 @@ install_openvla_oft_model() {
             install_flash_attn
             uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openvla-oft.git@RLinf/v0.1 --no-build-isolation
             ;;
-        behavior)
-            PYTHON_VERSION="3.10"
+        "")
             create_and_sync_venv
             install_common_embodied_deps
-            uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git  --no-build-isolation
-            install_behavior_env
-            pushd ~ >/dev/null
+            uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git --no-build-isolation
             install_flash_attn
-            popd >/dev/null
             ;;
         maniskill_libero|libero)
             create_and_sync_venv
@@ -2651,16 +2658,14 @@ EOF
             uv pip install "rlinf-openpi==0.1.1" "${yam_openpi_deps[@]}"
             install_flash_attn
             ;;
-        behavior)
-            PYTHON_VERSION="3.10"
+        "")
+            # The replacement step edits installed files; keep the cache immutable.
+            export UV_LINK_MODE=copy
             create_and_sync_venv
             install_common_embodied_deps
-            uv pip install "rlinf-openpi==0.1.1"
-            install_behavior_env
-            uv pip install "${RAY_COMPAT_DEPS[@]}"
-            pushd ~ >/dev/null
-            install_flash_attn
-            popd >/dev/null
+            uv pip uninstall transformers
+            # PEFT requires the stock distribution name; match the public fork's API.
+            uv pip install "rlinf-openpi==0.1.1" "transformers==4.53.2" peft
             ;;
         maniskill_libero|libero)
             create_and_sync_venv
@@ -3247,18 +3252,6 @@ install_dreamzero_deps() {
 
 install_dreamzero_model() {
     case "$ENV_NAME" in
-        behavior)
-            # BEHAVIOR/OmniGibson currently requires Python 3.10 and installs
-            # its own Torch 2.5.1 stack inside install_behavior_env.
-            PYTHON_VERSION="3.10"
-            create_and_sync_venv
-            install_common_embodied_deps
-            install_behavior_env
-            install_dreamzero_deps
-            pushd ~ >/dev/null
-            install_flash_attn
-            popd >/dev/null
-            ;;
         maniskill_libero|libero)
             create_and_sync_venv
             install_common_embodied_deps
@@ -3529,7 +3522,13 @@ install_env_only() {
     if [ "$ENV_NAME" = "d4rl" ] || [ "$ENV_NAME" = "simple" ]; then
         PYTHON_VERSION="3.10"
     fi
-    create_and_sync_venv
+    if [ "$ENV_NAME" = "behavior" ]; then
+        # Official setup uses pip to replace uv-installed packages.
+        export UV_LINK_MODE=copy
+        create_and_sync_venv --no-sync
+    else
+        create_and_sync_venv
+    fi
     SKIP_ROS=${SKIP_ROS:-0}
     # A robot host trains in its env venv, so it takes the same embodied extra,
     # training dependencies and system libraries as a model install.
@@ -3539,6 +3538,10 @@ install_env_only() {
             ;;
     esac
     case "$ENV_NAME" in
+        behavior)
+            install_common_embodied_deps --no-sync
+            install_behavior_env
+            ;;
         d4rl)
             install_d4rl_env
             ;;
@@ -3852,25 +3855,138 @@ install_liberoplus_env() {
     reset_libero_config
 }
 
-install_behavior_env() {
-    # Use BEHAVIOR_PATH as the checkout location if set (shared, cloned on first use);
-    # otherwise clone into the venv.
-    local behavior_dir
-    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_PATH "$VENV_DIR/BEHAVIOR-1K" https://github.com/RLinf/BEHAVIOR-1K.git -b RLinf/v3.7.2 --depth 1)
+# The SDK and the model need different versions of Torch, LeRobot and the HF
+# libraries. Keep the original combined CLI, with the SDK in a sibling venv.
+install_behavior_with_model() {
+    case "$MODEL" in
+        openpi|openvla-oft|dreamzero) ;;
+        *) echo "Unsupported BEHAVIOR model: $MODEL" >&2; return 1 ;;
+    esac
+    local common_args=() model_args=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --model|--env|--venv) shift 2 ;;
+            --torch) model_args+=("$1" "$2"); shift 2 ;;
+            *) common_args+=("$1"); shift ;;
+        esac
+    done
+    local model_dir sdk_dir sdk_python ray_version activate_line
+    model_dir=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$VENV_DIR")
+    sdk_dir="$model_dir-behavior"
+    sdk_python="$sdk_dir/bin/python"
+    bash "$SCRIPT_PATH" "${common_args[@]}" --venv "$sdk_dir" --env behavior --no-flash-attn
+    bash "$SCRIPT_PATH" "${common_args[@]}" "${model_args[@]}" --venv "$model_dir" --model "$MODEL"
+    if [ "$("$sdk_python" -V)" != "$("$model_dir/bin/python" -V)" ]; then
+        echo "The BEHAVIOR and model environments require the same Python patch version for Ray." >&2
+        return 1
+    fi
+    ray_version=$("$sdk_python" -c 'from importlib.metadata import version; print(version("ray"))')
+    (
+        export PATH="$model_dir/bin:$PATH"
+        install_uv
+        uv pip install --no-config --python "$model_dir/bin/python" "ray[default]==$ray_version"
+    )
+    printf -v activate_line 'export BEHAVIOR_ENV_PYTHON=%q' "$sdk_python"
+    grep -Fqx "$activate_line" "$model_dir/bin/activate" || printf '%s\n' "$activate_line" >> "$model_dir/bin/activate"
+}
 
-    pushd "$behavior_dir" >/dev/null
-    UV_LINK_MODE=hardlink ./setup.sh --omnigibson --bddl --joylo --confirm-no-conda --accept-nvidia-eula --use-uv
-    # OmniGibson's eval deps need another commit of lerobot, which is in conflict with which rlinf needs.
-    # We actually does not use OmniGibson's lerobot deps, so just install other deps in OmniGibson's eval deps. 
-    uv pip install "dm_tree>=0.1.9" "hydra-core>=1.3.2" "websockets>=15.0.1" "msgpack>=1.1.0" "gspread>=6.2.1" "open3d>=0.19.0" av "numpy<2"
-    popd >/dev/null
-    uv pip uninstall flash-attn || true
-    uv pip install ml_dtypes==0.5.3 protobuf==3.20.3
-    uv pip install click==8.2.1
-    uv pip install llvmlite==0.47.0 numba==0.65.1
-    # Re-assert the pin after OmniGibson's setup, which otherwise leaves a torch
-    # tree mixing two versions (inductor then fails in _pad_mm_init).
-    uv pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+validate_behavior_install() {
+    [ "$ENV_NAME" = "behavior" ] || return 0
+    if [ "$PLATFORM" != "nvidia" ] || [ "$(uname -s)" != "Linux" ]; then
+        echo "BEHAVIOR 3.9.3 requires Linux and an NVIDIA RTX GPU." >&2
+        return 1
+    fi
+    if [[ "$PYTHON_VERSION" != 3.11* ]]; then
+        echo "BEHAVIOR 3.9.3 requires --python 3.11.x." >&2
+        return 1
+    fi
+    local expected_torch="2.7.0"
+    if [ -n "$TORCH_VERSION" ] && [ "$TORCH_VERSION" != "$expected_torch" ]; then
+        echo "BEHAVIOR 3.9.3 requires torch ${expected_torch} for this install profile; omit --torch." >&2
+        return 1
+    fi
+}
+
+install_behavior_env() {
+    local behavior_dir
+    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_PATH "$VENV_DIR/BEHAVIOR-1K" https://github.com/StanfordVL/BEHAVIOR-1K.git -b v3.9.3-post2 --depth 1)
+    local expected_ref="a8247a8cc1633fe1ca0cc66aa07243d46c64f155"
+    if [ "$(git -C "$behavior_dir" rev-parse HEAD)" != "$expected_ref" ]; then
+        echo "BEHAVIOR_PATH must point to v3.9.3-post2 (${expected_ref})." >&2
+        return 1
+    fi
+    local source_dir="$behavior_dir"
+    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_BUILD_PATH "$VENV_DIR/BEHAVIOR-1K-install" "$source_dir" --no-local -b v3.9.3-post2 --depth 1)
+    if [ "$behavior_dir" -ef "$source_dir" ] || [ "$(git -C "$behavior_dir" rev-parse HEAD)" != "$expected_ref" ]; then
+        echo "BEHAVIOR_BUILD_PATH must be a separate v3.9.3-post2 checkout." >&2
+        return 1
+    fi
+    # release/b1k now requires Python 3.12. Pin its Python 3.11-compatible
+    # revision in an installation copy, leaving a supplied SDK checkout alone.
+    python - "$behavior_dir/OmniGibson/setup.py" <<'PIN'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+url = "git+https://github.com/wensi-ai/lerobot@"
+old = url + "release/b1k"
+new = url + "436812bd8ee39b768c645c248c91f1330834e687"
+if old not in source and new not in source:
+    raise RuntimeError("Unexpected LeRobot dependency in BEHAVIOR v3.9.3-post2")
+path.write_text(source.replace(old, new))
+PIN
+    uv pip install pip "setuptools>=71,<81" wheel
+    # This release has no --use-uv option. Reuse an existing 5.1 runtime;
+    # otherwise the official setup installs its simulator wheels.
+    if OMNI_KIT_ACCEPT_EULA=YES python -c 'import importlib.metadata as m; from pathlib import Path; assert m.version("isaacsim").startswith("5.1.0"); import isaacsim; assert (Path(isaacsim.__file__).parent / "apps").is_dir()' >/dev/null 2>&1; then
+        echo "Reusing installed Isaac Sim 5.1 runtime."
+    else
+        pushd "$behavior_dir" >/dev/null
+        env -u EXP_PATH -u CARB_APP_PATH -u ISAAC_PATH \
+            bash setup.sh --omnigibson --bddl --confirm-no-conda --accept-nvidia-eula
+        popd >/dev/null
+    fi
+    # A system-site runtime must remain complete. Installing only core/kernel
+    # in the child venv shadows its apps and other extension distributions.
+    local isaac_specs
+    isaac_specs=$(python - <<'SDK_DEPS'
+import importlib.metadata as metadata
+from pathlib import Path
+import sys
+
+core = metadata.distribution("isaacsim-core")
+if Path(core.locate_file("")).resolve().is_relative_to(Path(sys.prefix).resolve()):
+    print("isaacsim-core==5.1.0.0")
+else:
+    for name in ("isaacsim-core", "isaacsim-kernel"):
+        for requirement in metadata.requires(name) or []:
+            if not requirement.lower().replace("_", "-").startswith("isaacsim-"):
+                print(requirement)
+SDK_DEPS
+)
+    local isaac_requirements=()
+    mapfile -t isaac_requirements <<< "$isaac_specs"
+    # Resolve the worker requirements together with the SDK. OpenPI has its
+    # own environment: its Hub/Datasets versions cannot satisfy this SDK fork.
+    uv pip install --no-config --no-build-isolation --index https://pypi.nvidia.com \
+        --override "$SCRIPT_DIR/embodied/envs/behavior-overrides.txt" \
+        -r "$PYPROJECT_FILE" "${RAY_COMPAT_DEPS[@]}" "imageio[ffmpeg]" \
+        -e "$behavior_dir/OmniGibson" -e "$behavior_dir/bddl3" "${isaac_requirements[@]}" \
+        "lerobot[dataset] @ git+https://github.com/wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687"
+    if [ -z "$NO_INSTALL_RLINF_CMD" ]; then
+        uv pip install --no-deps -e "$(dirname "$PYPROJECT_FILE")"
+    fi
+    python - <<'CHECK'
+import importlib.metadata as metadata
+import sys
+
+assert sys.version_info[:2] == (3, 11), "BEHAVIOR 3.9.3 requires Python 3.11"
+for name, expected in (("omnigibson", "3.9.3"), ("isaacsim", "5.1.0"), ("torch", "2.7.0")):
+    version = metadata.version(name)
+    if not version.startswith(expected):
+        raise RuntimeError(f"{name} must be {expected}, found {version}")
+CHECK
 }
 
 install_geniesim_env() {
@@ -4770,6 +4886,11 @@ main() {
         echo "--paddle-gpu is only supported with 'embodied --model diffusion'." >&2
         exit 1
     fi
+    if [ "$TARGET" = embodied ] && [ "$ENV_NAME" = behavior ] && [ -n "$MODEL" ]; then
+        install_behavior_with_model "$@"
+        return
+    fi
+    validate_behavior_install
     validate_python_version
     validate_engine
     apply_model_default_torch
@@ -4794,7 +4915,7 @@ main() {
                     echo "Unknown environment: $ENV_NAME. Supported environments: ${SUPPORTED_ENVS[*]}" >&2
                     exit 1
                 fi
-            elif [[ "$MODEL" != "dreamzero" && "$MODEL" != "fastwam" && "$MODEL" != "diffusion" ]]; then
+            elif [[ "$MODEL" != "dreamzero" && "$MODEL" != "fastwam" && "$MODEL" != "diffusion" && "$MODEL" != "openpi" && "$MODEL" != "openvla-oft" ]]; then
                 echo "--env must be specified when target=embodied." >&2
                 exit 1
             fi

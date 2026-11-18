@@ -14,16 +14,16 @@
 
 import argparse
 import json
-import sys
+from functools import partial
 from pathlib import Path
+from runpy import run_path
+from types import SimpleNamespace
 
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.envs.sim.behavior.utils import setup_omni_cfg
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 DEFAULT_NUM_TRIALS = 50
@@ -138,15 +138,25 @@ def build_sampling_omni_cfg(
     Returns:
         The OmniGibson config used to create the sampling environment.
     """
+    from omnigibson.tasks.behavior_task import BehaviorTask
+    from omnigibson.utils.asset_utils import get_task_instance_path
+
     omni_cfg = setup_omni_cfg(env_cfg)
-    OmegaConf.update(omni_cfg, "env.automatic_reset", False)
-    OmegaConf.update(omni_cfg, "task.activity_instance_id", seed)
-    OmegaConf.update(omni_cfg, "task.activity_instance_dir", None, merge=False)
-    OmegaConf.update(omni_cfg, "task.instance_resample_mode", "disabled")
-    OmegaConf.update(omni_cfg, "task.online_object_sampling", True)
-    OmegaConf.update(omni_cfg, "task.use_presampled_robot_pose", False)
-    OmegaConf.update(omni_cfg, "scene.scene_instance", None, merge=False)
-    OmegaConf.update(omni_cfg, "scene.scene_file", None, merge=False)
+    task = omni_cfg.task
+    # Like the SDK's multiply_b1k_tasks.py, resample from the canonical
+    # template with its compiled BDDL object scope already bound.
+    scene = omni_cfg.scene.scene_model
+    template = BehaviorTask.get_cached_activity_scene_filename(
+        scene, task.activity_name, task.get("activity_definition_id", 0), 0
+    )
+    path = get_task_instance_path(scene, template, mode="train")
+    if path is None:
+        raise FileNotFoundError(f"Missing canonical 2026 task template: {template}")
+    omni_cfg.scene.scene_file = path
+    omni_cfg.scene.scene_instance = None
+    task.activity_instance_id = seed
+    task.online_object_sampling = False
+    task.use_presampled_robot_pose = False
     for idx, _ in enumerate(OmegaConf.select(omni_cfg, "robots", default=[])):
         OmegaConf.update(
             omni_cfg,
@@ -166,9 +176,6 @@ def resolve_output_dir(omni_cfg: DictConfig, explicit_output_dir: str | None) ->
 
     Returns:
         The directory where cached instances should be written.
-
-    Raises:
-        ValueError: If no output directory can be resolved.
     """
     if explicit_output_dir is not None:
         return Path(explicit_output_dir)
@@ -177,20 +184,15 @@ def resolve_output_dir(omni_cfg: DictConfig, explicit_output_dir: str | None) ->
     if activity_instance_dir is not None:
         return Path(activity_instance_dir)
 
-    from omnigibson.utils.asset_utils import get_task_instance_path
+    from omnigibson.utils.asset_utils import get_dataset_path
 
-    scene_model = OmegaConf.select(omni_cfg, "scene.scene_model")
-    activity_name = OmegaConf.select(omni_cfg, "task.activity_name")
-    task_instance_root = get_task_instance_path(scene_model)
-    if task_instance_root is None:
-        raise ValueError(
-            "Could not resolve a default cached-instance directory for "
-            f"scene_model={scene_model!r}. Pass --output-dir explicitly."
-        )
+    scene_model = omni_cfg.scene.scene_model
     return (
-        Path(task_instance_root)
+        Path(get_dataset_path("2026-challenge-task-instances"))
+        / "scenes"
+        / scene_model
         / "json"
-        / f"{scene_model}_task_{activity_name}_instances"
+        / f"{scene_model}_task_{omni_cfg.task.activity_name}_instances"
     )
 
 
@@ -246,7 +248,7 @@ def dump_tro_state(
         output_path: Target ``*_template-tro_state.json`` file.
         overwrite: Whether existing files may be overwritten.
         capture_current_robot_pose: When True, record the robot's *current*
-            base pose (so a subsequent ``load_activity_instance_tro_state``
+            base pose (so a subsequent ``ActivityInstanceLoader.load_tro_batch``
             restores where the robot is right now). When False (default),
             preserve the presampled ``robot_poses`` metadata used to bootstrap
             future resets. Offline sampling (``instance_generator.main``)
@@ -265,10 +267,11 @@ def dump_tro_state(
     # ``dump_state`` returns root_link poses in world frame, but the loader
     # interprets them as scene-relative when ``env.scene.idx != 0``. Rebase to
     # scene frame here so dump/load are symmetric across scene indices.
-    rebase_to_scene = getattr(env.scene, "idx", 0) != 0
+    scene = env.scenes[0]
+    rebase_to_scene = scene.idx != 0
     tro_state = {}
-    for bddl_name, bddl_inst in env.task.object_scope.items():
-        if not bddl_inst.exists or getattr(bddl_inst, "synset", None) == "agent":
+    for bddl_name, bddl_inst in env.task.object_scopes[0].items():
+        if bddl_inst is None or bddl_name.startswith("agent."):
             continue
         state = bddl_inst.dump_state(serialized=False)
         if (
@@ -279,7 +282,7 @@ def dump_tro_state(
             and "ori" in state["root_link"]
         ):
             rebased_root_link = dict(state["root_link"])
-            rebased_pos, rebased_ori = env.scene.convert_world_pose_to_scene_relative(
+            rebased_pos, rebased_ori = scene.convert_world_pose_to_scene_relative(
                 rebased_root_link["pos"],
                 rebased_root_link["ori"],
             )
@@ -288,26 +291,13 @@ def dump_tro_state(
             state = dict(state)
             state["root_link"] = rebased_root_link
         tro_state[bddl_name] = state
-    robot_poses = env.scene.get_task_metadata(key="robot_poses")
+    robot_poses = scene.get_task_metadata(key="robot_poses")
     if capture_current_robot_pose:
-        # Mid-rollout dump: overwrite the presampled pose entry with the
-        # robot's actual current scene-frame base pose, so a subsequent load
-        # restores where the robot is right now (otherwise the loader would
-        # teleport it back to the reset-time presampled pose).
-        try:
-            robot = env.task.get_agent(env)
-        except Exception:
-            robot = None
-        if robot is not None:
-            robot_name = getattr(robot, "model_name", getattr(robot, "model", None))
-            if robot_name is not None:
-                cur_pos, cur_ori = robot.get_position_orientation(frame="scene")
-                if robot_poses is None:
-                    robot_poses = {}
-                robot_poses = dict(robot_poses)
-                robot_poses[robot_name] = [
-                    {"position": cur_pos, "orientation": cur_ori}
-                ]
+        robot = env.task.get_agent(env, env_idx=0)
+        cur_pos, cur_ori = robot.get_position_orientation(frame="scene")
+        # The SDK selects the generic "robot" entry before a model-specific one.
+        robot_poses = dict(robot_poses or {})
+        robot_poses["robot"] = [{"position": cur_pos, "orientation": cur_ori}]
     if robot_poses is not None:
         tro_state["robot_poses"] = robot_poses
 
@@ -354,6 +344,32 @@ def save_activity_instance(
     return output_path
 
 
+def _validate_sample(env, scene_state, stable_scene, validate_task) -> None:
+    """Validate the sampled scene with the SDK's single-scene sampling script."""
+    from omnigibson.macros import gm
+
+    # The v3.9.3-post2 validation script expects a callback accepting
+    # (predicate, *entities). The batched task also requires the scene index.
+    # Bind the single generator scene without changing the live task callback.
+    validation_task = SimpleNamespace(
+        _base_conditions=env.task._base_conditions,
+        activity_initial_conditions=env.task.activity_initial_conditions,
+        _evaluate_predicate=partial(env.task._evaluate_predicate, 0),
+    )
+    transition_rules = gm.ENABLE_TRANSITION_RULES
+    try:
+        validate_task(
+            validation_task,
+            {"state": scene_state},
+            stable_scene,
+            active_room_instances=env.scenes[0].load_room_instances,
+        )
+    finally:
+        # The SDK restores this flag only when validation succeeds.
+        with gm.unlocked():
+            gm.ENABLE_TRANSITION_RULES = transition_rules
+
+
 def generate_activity_instances(
     env,
     output_dir: Path,
@@ -387,15 +403,21 @@ def generate_activity_instances(
 
     import omnigibson as og
     from omnigibson.objects import DatasetObject
-    from omnigibson.sampling.utils import validate_task
     from omnigibson.utils.asset_utils import get_dataset_path
 
+    # The official validator ships in the SDK source checkout, alongside the
+    # sampling CLI. Load it from the same checkout as the running simulator.
+    sampling_utils = (
+        Path(og.__file__).resolve().parents[1] / "scripts/sampling/utils.py"
+    )
+    validate_task = run_path(str(sampling_utils))["validate_task"]
+    scene = env.scenes[0]
     default_scene_path = (
-        Path(get_dataset_path("behavior-1k-assets"))
+        Path(get_dataset_path("2026-challenge-task-instances"))
         / "scenes"
         / env.task.scene_name
         / "json"
-        / f"{env.task.scene_name}_best.json"
+        / f"{env.task.scene_name}_stable.json"
     )
     if not default_scene_path.is_file():
         raise ValueError(f"Stable scene json does not exist: {default_scene_path}")
@@ -403,10 +425,11 @@ def generate_activity_instances(
     with default_scene_path.open("r", encoding="utf-8") as f:
         default_scene_dict = json.load(f)
 
+    env.task.sampler._compiled_task = env.task.compiled_task
     env.task.sampler._parse_inroom_object_room_assignment()
     env.task.sampler._build_sampling_order()
 
-    for system in env.scene.active_systems.values():
+    for system in scene.active_systems.values():
         system.remove_all_particles()
     og.sim.step()
     initial_state = og.sim.dump_state()
@@ -439,28 +462,24 @@ def generate_activity_instances(
             for _ in range(DEFAULT_SETTLE_STEPS):
                 og.sim.step()
 
-            for entity in env.task.object_scope.values():
+            for entity in env.task.object_scopes[0].values():
                 if isinstance(entity, DatasetObject):
                     entity.keep_still()
 
             for _ in range(DEFAULT_SETTLE_STEPS):
                 og.sim.step()
 
-            task_final_state = env.scene.dump_state()
-            validated, error_msg = validate_task(
-                env.task,
-                {"state": task_final_state},
-                default_scene_dict,
-            )
-            if not validated:
-                print(
-                    f"  trial {trial_idx}: validation failed: {error_msg}",
-                    flush=True,
+            task_final_state = scene.dump_state()
+            try:
+                _validate_sample(
+                    env, task_final_state, default_scene_dict, validate_task
                 )
+            except ValueError as error:
+                print(f"  trial {trial_idx}: validation failed: {error}", flush=True)
                 continue
 
-            env.scene.load_state(task_final_state)
-            env.scene.update_initial_file()
+            scene.load_state(task_final_state)
+            scene.update_initial_file()
             saved_path = save_activity_instance(
                 env,
                 output_dir=output_dir,
@@ -521,12 +540,11 @@ def main() -> None:
             num_trials=args.num_trials,
             overwrite=args.overwrite,
         )
-    except Exception as e:
-        print(f"Error during instance generation: {e}", flush=True)
     finally:
         if env is not None:
             env.close()
-        og.shutdown()
+    # Kit shutdown can terminate Python. Let sampling exceptions propagate.
+    og.shutdown()
 
 
 if __name__ == "__main__":

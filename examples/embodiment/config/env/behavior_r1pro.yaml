@@ -1,4 +1,6 @@
 env_type: behavior
+simulator_version: "3.9.3"
+torch_num_threads: 4
 total_num_envs: null
 auto_reset: False
 ignore_terminations: False
@@ -8,10 +10,11 @@ group_size: 1
 use_fixed_reset_state_ids: False
 max_steps_per_rollout_epoch: 2000
 max_episode_steps: 2000 # max episode steps for truncation
-# pass the render process except the last frame in cache chunk in behavior env. set to False to save full video, but slower
+# Render the final observation of each action chunk.
 skip_intermediate_renders: True
-# parallel env running in env workers to speed up env.step
-num_env_subprocess: 1
+# One simulator process per environment allows independent resets. A positive
+# count groups scenes for synchronous stepping when auto_reset is disabled.
+num_env_subprocess: null
 
 video_cfg:
   save_video: False
@@ -19,10 +22,6 @@ video_cfg:
   video_base_dir: ${runner.logger.log_path}/video/train
 
 base_config_name: r1pro_behavior
-use_eval_utils_cfg: False
-
-policy_wrapper: null
-
 
 omni_config:
   env:
@@ -48,7 +47,6 @@ omni_config:
   macro:
     use_gpu_dynamics: False
     headless: True
-    enable_flatcache: True
     enable_object_states: True
     enable_transition_rules: True
     render_viewer_camera: False
@@ -113,9 +111,10 @@ omni_config:
     type: BehaviorTask
     activity_name: turning_on_radio
     activity_definition_id: 0
+    # A custom activity_instance_dir takes precedence over the official split.
+    instance_split: train
     # activity_instance_id is only used when online object sampling is False.
     activity_instance_id: 0
-    predefined_problem: null
     # activity_instance_dir should point to a directory of cached task instance JSON files.
     # RLinf scans filenames directly and supports official *_template.json and
     # *_template-tro_state.json instances.
@@ -134,7 +133,6 @@ omni_config:
     # online: use BDDL online object sampling during reset.
     instance_resample_mode: disabled
     online_object_sampling: False
-    debug_object_sampling: null
     highlight_task_relevant_objects: False
     use_presampled_robot_pose: True
     termination_config:

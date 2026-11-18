@@ -1,10 +1,12 @@
 defaults:
+  - cluster/behavior
   - env/behavior_r1pro@env.train
   - env/behavior_r1pro@env.eval
   - model/openvla_oft@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
+  - _self_
 
 hydra:
   run:
@@ -17,7 +19,8 @@ cluster:
   num_nodes: 1
   component_placement:
     rollout: 0-1
-    env: 2-3
+    env:
+      placement: 2-3
     actor: all
 
 runner:

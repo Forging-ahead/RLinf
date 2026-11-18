@@ -11,3 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""BEHAVIOR simulator integrations."""
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .simulator import BehaviorSimulator
+
+__all__ = ["BehaviorSimulator"]
+
+
+def __getattr__(name: str) -> Any:
+    """Load the in-process 3.9.3 adapter only when it is requested."""
+    if name == "BehaviorSimulator":
+        from .simulator import BehaviorSimulator
+
+        return BehaviorSimulator
+    raise AttributeError(name)

@@ -20,9 +20,11 @@ import logging
 import os
 import random
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import closing
 from pathlib import Path
 
+import av
 import numpy as np
 import torch as th
 import torch.distributed as dist
@@ -54,9 +56,10 @@ except ModuleNotFoundError:  # lerobot < 0.2
 # ships per-episode annotations LeRobot has no schema for. Dataset format v3.0
 # (lerobot >= 0.4) replaced those files with parquet and deleted the helpers
 # that read them, so there is nothing to fall back to; say so plainly instead
-# of surfacing an ImportError on a name nobody recognises. The BEHAVIOR install
-# pins lerobot to the v2.1 commit (see requirements/install.sh).
+# of surfacing an ImportError on a name nobody recognises. The OpenPI model environment
+# installs a v2.1-compatible LeRobot.
 try:
+    from lerobot.datasets.compute_stats import aggregate_stats
     from lerobot.datasets.utils import (  # lerobot 0.2 - 0.3
         EPISODES_PATH,
         EPISODES_STATS_PATH,
@@ -70,12 +73,14 @@ try:
         get_delta_indices,
         get_episode_data_index,
         get_safe_version,
+        hf_transform_to_torch,
         is_valid_version,
         load_info,
         load_json,
         load_jsonlines,
     )
 except ModuleNotFoundError:  # lerobot < 0.2
+    from lerobot.common.datasets.compute_stats import aggregate_stats
     from lerobot.common.datasets.utils import (
         EPISODES_PATH,
         EPISODES_STATS_PATH,
@@ -89,6 +94,7 @@ except ModuleNotFoundError:  # lerobot < 0.2
         get_delta_indices,
         get_episode_data_index,
         get_safe_version,
+        hf_transform_to_torch,
         is_valid_version,
         load_info,
         load_json,
@@ -100,15 +106,18 @@ except ImportError as exc:  # lerobot >= 0.4: dataset format v3.0
     raise ImportError(
         "BehaviorSftDataset needs the v2.1 LeRobot dataset format, but lerobot "
         f"{getattr(_lerobot, '__version__', '?')} is installed and uses v3.0. "
-        "Install the pinned revision with "
-        "`bash requirements/install.sh embodied --model openpi --env behavior`, "
+        "Use the OpenPI model environment installed with "
+        "`bash requirements/install.sh embodied --model openpi`, "
         "or convert the dataset with lerobot's "
         "`datasets/v30/convert_dataset_v21_to_v30.py` and port this module."
     ) from exc
 try:  # lerobot >= 0.2 layout
-    from lerobot.datasets.video_utils import get_safe_default_codec
+    from lerobot.datasets.video_utils import decode_video_frames, get_safe_default_codec
 except ModuleNotFoundError:  # lerobot < 0.2
-    from lerobot.common.datasets.video_utils import get_safe_default_codec
+    from lerobot.common.datasets.video_utils import (
+        decode_video_frames,
+        get_safe_default_codec,
+    )
 
 from torch.utils.data import Dataset, get_worker_info
 
@@ -191,67 +200,79 @@ ANNOTATIONS_PATH = "annotations"
 ORCHESTRATORS_PATH = "orchestrators"
 
 
-# ---------------------------------------------------------------------------
-# Lazy OmniGibson utility access
-# ---------------------------------------------------------------------------
+def _frame_tensors(batch: dict) -> dict:
+    """Keep double-precision recorded timestamps during the LeRobot conversion."""
+    timestamps = batch.pop("timestamp", None)
+    tensors = hf_transform_to_torch(batch)
+    if timestamps is not None:
+        tensors["timestamp"] = [
+            t if isinstance(t, str) else th.tensor(t, dtype=th.float64)
+            for t in timestamps
+        ]
+    return tensors
 
 
-def _install_lerobot_compat_shim():
-    """Alias ``lerobot.datasets.compute_stats`` to the pinned LeRobot's
-    ``lerobot.common.datasets.compute_stats`` so OmniGibson's ``lerobot_utils`` (which
-    imports ``_assert_type_and_shape`` from the new LeRobot layout) loads unchanged.
-
-    This imports only LeRobot — never OmniGibson — so running it at module import does
-    not regress the lazy-OmniGibson contract. It must be installed at import time
-    (below) because spawned (``num_workers>0``) DataLoader workers unpickle this
-    dataset's cached OmniGibson helper references, which re-imports
-    ``omnigibson.learning.utils.lerobot_utils`` before any method runs; without the
-    shim already in place that import raises ``ModuleNotFoundError: lerobot.datasets``.
-    """
-    import sys
-
-    if "lerobot.datasets.compute_stats" in sys.modules:
-        return
-    try:
-        import lerobot.datasets.compute_stats  # noqa: F401
-    except ModuleNotFoundError:
-        import types
-
-        try:  # lerobot >= 0.2 layout
-            from lerobot.datasets.compute_stats import _assert_type_and_shape
-        except ModuleNotFoundError:  # lerobot < 0.2
-            from lerobot.common.datasets.compute_stats import _assert_type_and_shape
-
-        pkg = sys.modules.setdefault(
-            "lerobot.datasets", types.ModuleType("lerobot.datasets")
-        )
-        shim = types.ModuleType("lerobot.datasets.compute_stats")
-        shim._assert_type_and_shape = _assert_type_and_shape
-        sys.modules["lerobot.datasets.compute_stats"] = shim
-        pkg.compute_stats = shim
+def _episode_stats(episodes: list[dict]) -> dict:
+    """Include the 2025 dataset's quantiles in LeRobot's pooled feature stats."""
+    result = aggregate_stats(episodes)
+    for key, stats in result.items():
+        samples = [episode[key] for episode in episodes if key in episode]
+        for quantile, percentile in (("q01", 1), ("q99", 99)):
+            if quantile in samples[0]:
+                stats[quantile] = np.percentile(
+                    [sample[quantile] for sample in samples], percentile, axis=0
+                )
+    return result
 
 
-# Install the LeRobot compat shim at import time (LeRobot-only, no OmniGibson) so
-# spawned DataLoader workers can unpickle this dataset's OmniGibson helper references.
-_install_lerobot_compat_shim()
+def _video_frames(
+    path: Path,
+    modality: str,
+    start: int,
+    fps: int,
+    instance_ids: list[int] | None = None,
+) -> Iterator[th.Tensor]:
+    """Stream a 2025 demo from a frame index, seeking to the preceding keyframe."""
+    if modality == "seg_instance_id":
+        if not instance_ids:
+            raise ValueError(f"Missing instance IDs for segmentation video {path}")
+        ids = th.tensor(instance_ids, dtype=th.long)
+        bins = int(np.ceil(len(ids) ** (1 / 3)))
+        # The 2025 encoder assigns one color per instance in this order.
+        axes = [np.linspace(16, end, bins) for end in (235, 240, 240)]
+        colors = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        palette = th.from_numpy(colors[: len(ids)].astype(np.uint8)).float()
 
-
-def _omnigibson_utils():
-    """Lazily import the OmniGibson video/stat utilities used by this dataset.
-
-    Imported on first call (never at module import) so that loading this module
-    — e.g. during config validation — does not pull OmniGibson or trigger any
-    scene/asset load. Returns ``(hf_transform_to_torch, aggregate_stats,
-    decode_video_frames, OBS_LOADER_MAP)``.
-    """
-    from omnigibson.learning.utils.lerobot_utils import (
-        aggregate_stats,
-        decode_video_frames,
-        hf_transform_to_torch,
-    )
-    from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
-
-    return hf_transform_to_torch, aggregate_stats, decode_video_frames, OBS_LOADER_MAP
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        origin = stream.start_time or 0
+        container.seek(origin + int(start / (fps * stream.time_base)), stream=stream)
+        expected = start
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+            index = round((frame.pts - origin) * stream.time_base * fps)
+            if index < start:
+                continue
+            if index != expected:
+                raise ValueError(
+                    f"Missing frame {expected} in {path} (decoded {index})."
+                )
+            expected += 1
+            if modality == "depth":
+                # 2025 demos use 14-bit logarithmic depth in [0, 10] meters.
+                levels = frame.to_ndarray(format="gray16le").astype(np.float64)
+                depth = 3.5 * np.expm1(levels / 16383 * np.log(13.5 / 3.5))
+                yield th.from_numpy(depth.clip(0, 10)).float()
+            elif modality == "seg_instance_id":
+                rgb = th.from_numpy(frame.to_ndarray(format="rgb24"))
+                nearest = [
+                    th.cdist(pixels.float(), palette).argmin(1)
+                    for pixels in rgb.reshape(-1, 3).split(4096)
+                ]
+                yield ids[th.cat(nearest)].reshape(rgb.shape[:2])
+            else:
+                yield th.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +448,7 @@ class BehaviorSftDatasetMetadata(LeRobotDatasetMetadata):
             )
         else:
             self.episodes_stats = self.load_episodes_stats(self.root)
-            _, aggregate_stats, _, _ = _omnigibson_utils()
-            self.stats = aggregate_stats(list(self.episodes_stats.values()))
+            self.stats = _episode_stats(list(self.episodes_stats.values()))
 
     def load_tasks(self, local_dir: Path):
         """Load the ``tasks.jsonl`` mapping (index -> task text / task name)."""
@@ -670,16 +690,6 @@ class BehaviorSftDataset(LeRobotDataset):
         # back to ``torch.distributed`` only when these are not provided.
         self._dist_rank = dist_rank
         self._dist_world_size = dist_world_size
-        # Real OmniGibson video/stat utilities, imported lazily here (never at module
-        # import) and cached so the streaming hot path and `load_hf_dataset` can reuse
-        # them without re-importing. See `_omnigibson_utils`.
-        (
-            self._hf_transform_to_torch,
-            self._aggregate_stats,
-            self._decode_video_frames,
-            self._obs_loader_map,
-        ) = _omnigibson_utils()
-
         self.image_writer = None
         self.episode_buffer = None
 
@@ -745,7 +755,7 @@ class BehaviorSftDataset(LeRobotDataset):
             episodes_stats = [
                 self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes
             ]
-            self.stats = self._aggregate_stats(episodes_stats)
+            self.stats = _episode_stats(episodes_stats)
 
         try:
             if force_cache_sync:
@@ -969,7 +979,7 @@ class BehaviorSftDataset(LeRobotDataset):
                 for ep_idx in self.episodes
             ]
             hf_dataset = load_dataset("parquet", data_files=files, split="train")
-        hf_dataset.set_transform(self._hf_transform_to_torch)
+        hf_dataset.set_transform(_frame_tensors)
         return hf_dataset
 
     def _select_streaming_chunk(self) -> None:
@@ -1068,27 +1078,21 @@ class BehaviorSftDataset(LeRobotDataset):
             self.obs_loaders = {}
             self.current_streaming_episode_idx = ep_idx
             for vid_key in self.meta.video_keys:
-                kwargs = {}
-                task_id = item["task_index"].item()
-                if "rgb" in vid_key:
-                    kwargs["train_rgb_type"] = self.train_rgb_type
-                loader_cls = self._obs_loader_map.get(vid_key.split(".")[2])
-                if loader_cls is None:
-                    continue
-                self.obs_loaders[vid_key] = iter(
-                    loader_cls(
-                        data_path=self.root,
-                        task_id=task_id,
-                        camera_id=vid_key.split(".")[-1],
-                        demo_id=f"{ep_idx:08d}",
-                        start_idx=self._active_chunks[self.current_streaming_chunk_idx][
-                            2
-                        ],
-                        start_idx_is_keyframe=False,
-                        batch_size=1,
-                        stride=1,
-                        **kwargs,
+                modality, camera = vid_key.split(".")[-2:]
+                ids = None
+                if modality == "seg_instance_id":
+                    metadata = load_json(
+                        self.root / self.meta.get_metainfo_path(ep_idx)
                     )
+                    ids = metadata[
+                        f"{ROBOT_CAMERA_NAMES['R1Pro'][camera]}::unique_ins_ids"
+                    ]
+                self.obs_loaders[vid_key] = _video_frames(
+                    self.root / self.meta.get_video_file_path(ep_idx, vid_key),
+                    modality,
+                    self._active_chunks[self.current_streaming_chunk_idx][2],
+                    self.fps,
+                    ids,
                 )
             self._should_obs_loaders_reload = False
 
@@ -1107,7 +1111,7 @@ class BehaviorSftDataset(LeRobotDataset):
         if not random.choices([True, False], weights=[weight, 1 - weight])[0]:
             self.current_streaming_frame_idx += 1
             for key in self.obs_loaders:
-                next(self.obs_loaders[key])[0]
+                next(self.obs_loaders[key])
             return self.__getitem__(idx)
 
         # Skip frames that fall in gaps between skill ranges.
@@ -1117,11 +1121,11 @@ class BehaviorSftDataset(LeRobotDataset):
             if self._is_gap_frame(ep_idx_val, frame_index_val):
                 self.current_streaming_frame_idx += 1
                 for key in self.obs_loaders:
-                    next(self.obs_loaders[key])[0]
+                    next(self.obs_loaders[key])
                 return self.__getitem__(idx)
 
         for key in self.obs_loaders:
-            item[key] = next(self.obs_loaders[key])[0]
+            item[key] = next(self.obs_loaders[key])
 
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys
@@ -1204,9 +1208,31 @@ class BehaviorSftDataset(LeRobotDataset):
         item = {}
         for vid_key, query_ts in query_timestamps.items():
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = self._decode_video_frames(
-                video_path, query_ts, self.tolerance_s, self.video_backend
-            )
+            if vid_key.split(".")[-2] == "depth":
+                indices = [round(t * self.fps) for t in query_ts]
+                if any(
+                    abs(i / self.fps - t) >= self.tolerance_s
+                    for i, t in zip(indices, query_ts)
+                ):
+                    raise ValueError(
+                        f"Depth timestamps do not match frames in {video_path}"
+                    )
+                requested = set(indices)
+                decoded = {}
+                start = min(requested)
+                with closing(
+                    _video_frames(video_path, "depth", start, self.fps)
+                ) as stream:
+                    for i, frame in enumerate(stream, start):
+                        if i in requested:
+                            decoded[i] = frame
+                        if len(decoded) == len(requested):
+                            break
+                frames = th.stack([decoded[i] for i in indices])
+            else:
+                frames = decode_video_frames(
+                    video_path, query_ts, self.tolerance_s, self.video_backend
+                )
             item[vid_key] = frames.squeeze(0)
         return item
 

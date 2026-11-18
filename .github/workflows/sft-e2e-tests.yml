@@ -155,12 +155,10 @@ jobs:
         run: |
           unset UV_DEFAULT_INDEX
           export UV_PATH=/workspace/dataset/.uv
-          export UV_LINK_MODE=symlink
+          export UV_LINK_MODE=copy
           export UV_CACHE_DIR=/workspace/dataset/.uv_cache
           export UV_PYTHON_INSTALL_DIR=/workspace/dataset/.uv_python
-          export BEHAVIOR_PATH=/workspace/dataset/BEHAVIOR-1K
-          export ISAAC_SIM_WHEEL_PATH=/workspace/dataset/isaac_sim_wheels
-          bash requirements/install.sh embodied --model openpi --env behavior
+          bash requirements/install.sh embodied --model openpi
 
       - name: SFT BEHAVIOR OpenPI test
         timeout-minutes: 30
@@ -168,8 +166,6 @@ jobs:
           unset PYTHONPATH
           export REPO_PATH=$(pwd)
           source .venv/bin/activate
-          export OMNIGIBSON_DATA_PATH=/workspace/dataset/behavior-datasets
-          export ISAAC_PATH=/workspace/dataset/isaac-sim
           bash tests/e2e_tests/sft/run_vla_sft.sh behavior_openpi_sft
 
       - name: Clean up
