@@ -149,7 +149,7 @@ Tokenizer 由 OpenPI 的 ``ModelTransformFactory`` 按基础模型加载，YAML 
    * - ``pi0_aloha_robotwin``
      - RoboTwin（ALOHA）
    * - ``pi05_behavior``
-     - BEHAVIOR-1K（2026 挑战示范数据）
+     - BEHAVIOR-1K（2025 和 2026 挑战示范数据）
    * - ``pi0_maniskill`` · ``pi05_maniskill``
      - ManiSkill
    * - ``pi05_metaworld``
@@ -214,7 +214,7 @@ Tokenizer 由 OpenPI 的 ``ModelTransformFactory`` 按基础模型加载，YAML 
 
 若标准差过小或 q99–q01 过窄，适当放大通常更稳，尤其是 SFT 之后还要做在线训练时。
 
-BEHAVIOR 需要与 2026 训练数据和 ``pi05_behavior`` 状态、动作向量一致的 OpenPI ``norm_stats.json``。将 ``actor.model.openpi_data.norm_stats_path`` 指向该文件，评估时使用同一份统计。
+BEHAVIOR 需要与所选训练数据和 ``pi05_behavior`` 状态、动作向量一致的 OpenPI ``norm_stats.json``。将 ``actor.model.openpi_data.norm_stats_path`` 指向该文件，评估时使用同一份统计。
 
 安装
 ----------------------------------------
@@ -339,7 +339,7 @@ Pi0.5 + BEHAVIOR-1K
      - model/pi0_5@actor.model
      - hybrid_engines/openpi_fsdp@actor.fsdp_config
 
-此配置仅支持 `2026 挑战示范数据 <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_ 的 LeRobot v3.0 格式。两个数据路径都填本地数据集根目录。按任务下载时，请保留元数据。对 ``tasks`` 中指定的任务，每个示范回合都要下载逐帧数据，以及头部、左腕和右腕三路 RGB 视频。
+此配置支持 LeRobot v2.1 格式的 `2025 挑战示范数据 <https://huggingface.co/datasets/behavior-1k/2025-challenge-demos>`_ 和 v3.0 格式的 `2026 挑战示范数据 <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_。两个数据路径都填本地数据集根目录，``repo_id`` 填同一版数据在 Hugging Face 上的仓库名。读取器从 ``meta/info.json`` 确定格式。按任务下载时，请保留元数据。对 ``tasks`` 中指定的任务，每个示范回合都要下载逐帧数据，以及头部、左腕和右腕三路 RGB 视频。
 
 .. code:: yaml
 
@@ -361,11 +361,11 @@ Pi0.5 + BEHAVIOR-1K
        openpi_data:
          norm_stats_path: /path/to/norm_stats.json
 
-默认 ``use_skill: false``，同一段收音机示范的每一帧都使用 ``meta/tasks.jsonl`` 中的主任务指令。要按阶段训练，设置 ``data.use_skill=true``，选择一个任务，并下载该任务各段示范的 ``annotation_path`` 指向的标注文件。读取器用标注里的帧区间确定阶段，再按阶段编号取 ``data.task_subtasks`` 里的指令。例如，收音机配置给第三阶段的指令是 ``press radio``。两种模式都读取头部和左右手腕三路 RGB。
+默认 ``use_skill: false``，同一段收音机示范的每一帧都使用 ``meta/tasks.jsonl`` 中的主任务指令。要按阶段训练，设置 ``data.use_skill=true``，选择一个任务，并从数据集的 ``annotations/`` 目录下载这些示范的技能标注。读取器用标注里的帧区间确定阶段，再按阶段编号取 ``data.task_subtasks`` 里的指令。例如，收音机配置给第三阶段的指令是 ``press radio``。两种模式都读取头部和左右手腕三路 RGB。
 
-评估这次训练的策略时，按 SDK 中 ``PROPRIOCEPTION_INDICES["R1Pro"]`` 的字段顺序设置 ``omni_config.robots[0].proprio_obs``，使 61 维状态中的底盘速度与训练数据一样采用机器人自身坐标系。
+评估用 2026 年示范训练的 policy 时，按 SDK 中 ``PROPRIOCEPTION_INDICES["R1Pro"]`` 的字段顺序设置 ``omni_config.robots[0].proprio_obs``，使 61 维状态中的底盘速度与训练数据一样采用机器人自身坐标系。
 
-先激活“安装”一节的 OpenPI 模型环境，再安装可读取 v3 数据的 Hugging Face LeRobot 版本并启动训练。
+激活“安装”一节的 OpenPI 模型环境，安装下面指定的 LeRobot 版本，然后启动训练。两个年份的数据使用同一版本。
 
 .. code:: bash
 

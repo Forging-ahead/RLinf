@@ -62,15 +62,27 @@ class _Repack(DataTransformFn):
     The two wrist views are stacked into a single ``observation/wrist_image``
     ``[2, C, H, W]`` array in ``(left, right)`` order — the layout openpi's
     ``BehaviorInputs`` consumes (it splits index ``0``/``1`` into the left/right
-    wrist). Images stay ``(C, H, W)`` float; ``BehaviorInputs._parse_image`` does
-    the channel reorder and the float→uint8 conversion.
+    wrist). Images keep their channel-first layout until the OpenPI transform applies
+    its channel and dtype conversion.
     """
 
     def __call__(self, frame: dict) -> dict:
-        left_wrist = np.asarray(frame[_LEROBOT_LEFT_WRIST_KEY])
-        right_wrist = np.asarray(frame[_LEROBOT_RIGHT_WRIST_KEY])
+        if _LEROBOT_IMAGE_KEY in frame:  # 2026 uses the native camera names.
+            head, left, right = (
+                _LEROBOT_IMAGE_KEY,
+                _LEROBOT_LEFT_WRIST_KEY,
+                _LEROBOT_RIGHT_WRIST_KEY,
+            )
+        else:
+            head, left, right = (
+                "observation.images.rgb.head",
+                "observation.images.rgb.left_wrist",
+                "observation.images.rgb.right_wrist",
+            )
+        left_wrist = np.asarray(frame[left])
+        right_wrist = np.asarray(frame[right])
         data: dict = {
-            "observation/image": np.asarray(frame[_LEROBOT_IMAGE_KEY]),
+            "observation/image": np.asarray(frame[head]),
             "observation/wrist_image": np.stack([left_wrist, right_wrist], axis=0),
             "observation/state": np.asarray(frame[_LEROBOT_STATE_KEY]),
         }
@@ -190,6 +202,7 @@ def create_behavior_sft_data_loader(
     dist_rank: int,
     dist_world_size: int,
     modalities: list[str] | None = None,
+    fine_grained_level: int = 0,
     skill_labels: dict[int, str] | None = None,
     use_skill: bool = False,
     enable_gap: bool = True,
@@ -206,6 +219,7 @@ def create_behavior_sft_data_loader(
         config_name: openpi TrainConfig key (e.g. ``pi05_behavior``).
         repo_id: LeRobot dataset repo id (used for metadata bookkeeping).
         tasks: BEHAVIOR task names to include.
+        fine_grained_level: Orchestrator level for the prompt task text.
         modalities: Visual modalities to read. OpenPI requires RGB.
         skill_labels: Per-task text keyed by the annotation's skill index.
         use_skill: Train on skill instructions for annotated frames.
@@ -235,6 +249,7 @@ def create_behavior_sft_data_loader(
         tolerance_s=tolerance_s,
         tasks=tasks or None,
         modalities=modalities,
+        fine_grained_level=fine_grained_level,
         action_horizon=action_horizon,
         skill_labels=skill_labels,
         use_skill=use_skill,
@@ -380,6 +395,7 @@ def build_behavior_sft_dataloader(
         repo_id=str(data_cfg.repo_id),
         tasks=tasks,
         modalities=list(data_cfg.get("modalities", ["rgb"])),
+        fine_grained_level=int(data_cfg.get("fine_grained_level", 0)),
         action_dim=int(model_cfg.openpi.model_action_dim),
         action_horizon=int(model_cfg.num_action_chunks),
         max_token_len=int(model_cfg.openpi.max_token_len),

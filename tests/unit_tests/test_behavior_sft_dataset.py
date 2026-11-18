@@ -28,13 +28,23 @@ from rlinf.models.embodiment.openpi.policies.behavior_policy import (
 )
 
 
-def test_behavior_sft_repack_preserves_camera_order_state_and_task():
+@pytest.mark.parametrize(
+    "keys",
+    [
+        (
+            "observation.images.rgb.head",
+            "observation.images.rgb.left_wrist",
+            "observation.images.rgb.right_wrist",
+        ),
+        (
+            "observation.rgb.zed_link_camera_0",
+            "observation.rgb.left_realsense_link_camera_0",
+            "observation.rgb.right_realsense_link_camera_0",
+        ),
+    ],
+)
+def test_behavior_sft_repack_preserves_camera_order_state_and_task(keys):
     prompt = "Turn on the radio receiver that's on the table in the living room."
-    keys = (
-        "observation.rgb.zed_link_camera_0",
-        "observation.rgb.left_realsense_link_camera_0",
-        "observation.rgb.right_realsense_link_camera_0",
-    )
     state = np.arange(61, dtype=np.float32)
     frame = {"task": prompt}
     repack = _Repack()
@@ -249,8 +259,98 @@ def test_behavior_rejects_unsynchronized_recorded_timestamps(shared_shard):
     assert len(dataset) == 2
 
 
-def test_behavior_sft_rejects_v21(tmp_path):
+def test_behavior_sft_rejects_unknown_format(tmp_path):
     (tmp_path / "meta").mkdir()
-    (tmp_path / "meta/info.json").write_text('{"codebase_version":"v2.1"}')
-    with pytest.raises(ValueError, match=r"2026 demonstrations .*v2\.1"):
+    (tmp_path / "meta/info.json").write_text('{"codebase_version":"v9.0"}')
+    with pytest.raises(ValueError, match=r"v9\.0"):
         BehaviorSftDataset("local/test", tmp_path)
+
+
+def test_behavior_sft_reads_v21_episode_and_skill_windows(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    ep_id = 10
+    task = "Turn on the radio."
+    info = {
+        "codebase_version": "v2.1",
+        "robot_type": "R1Pro",
+        "fps": 30,
+        "total_episodes": 1,
+        "total_frames": 2,
+        "total_tasks": 1,
+        "chunks_size": 10000,
+        "features": {"action": {"dtype": "float32", "shape": [1], "names": None}},
+        "data_path": "data/task-{episode_chunk:04d}/episode_{episode_index:08d}.parquet",
+        "annotation_path": "annotations/task-{episode_chunk:04d}/episode_{episode_index:08d}.json",
+        "metainfo_path": "meta/episodes/task-{episode_chunk:04d}/episode_{episode_index:08d}.json",
+    }
+    (meta / "info.json").write_text(json.dumps(info))
+    (meta / "tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task_name": "turning_on_radio", "task": task})
+    )
+    (meta / "episodes.jsonl").write_text(
+        json.dumps({"episode_index": ep_id, "tasks": [task], "length": 2})
+    )
+    stats = {
+        "min": [0],
+        "max": [1],
+        "mean": [0.5],
+        "std": [0.5],
+        "q01": [0],
+        "q99": [1],
+        "count": [2],
+    }
+    (meta / "episodes_stats.jsonl").write_text(
+        json.dumps({"episode_index": ep_id, "stats": {"action": stats}})
+    )
+    files = {
+        key: tmp_path / info[key].format(episode_chunk=0, episode_index=ep_id)
+        for key in ("data_path", "annotation_path", "metainfo_path")
+    }
+    for path in files.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    files["metainfo_path"].write_text("{}")
+    files["annotation_path"].write_text(
+        json.dumps(
+            {
+                "meta_data": {"valid_duration": [0, 2]},
+                "skill_annotation": [
+                    {"skill_idx": 0, "frame_duration": [0, 1]},
+                    {"skill_idx": 1, "frame_duration": [1, 2]},
+                ],
+            }
+        )
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "index": [600, 601],
+                "timestamp": [0.0, 1 / 30],
+                "episode_index": [ep_id] * 2,
+                "task_index": [0, 0],
+                "action": [[0.0], [1.0]],
+            }
+        ),
+        files["data_path"],
+    )
+    for streaming in (True, False):
+        dataset = BehaviorSftDataset(
+            "local/test",
+            tmp_path,
+            tasks=["turning_on_radio"],
+            local_only=True,
+            shuffle=False,
+            chunk_streaming_using_keyframe=streaming,
+            action_horizon=3,
+            use_skill=True,
+            skill_labels={0: "approach", 1: "press"},
+        )
+        assert len(dataset) == 2
+        first, last = dataset[0], dataset[1]
+        assert first["task"] == last["task"] == task
+        assert first["prompt"] == "approach" and last["prompt"] == "press"
+        np.testing.assert_array_equal(first["action"], [[0], [1], [1]])
+        np.testing.assert_array_equal(last["action_is_pad"], [False, True, True])

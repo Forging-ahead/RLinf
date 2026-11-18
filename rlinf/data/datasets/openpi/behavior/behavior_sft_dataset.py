@@ -195,7 +195,7 @@ def skill_weight(cur_skill, skill_list: list[str]) -> float:
 
 
 class BehaviorSftDatasetMetadata(LeRobotDatasetMetadata):
-    """LeRobot v3 metadata extended with BEHAVIOR task and camera selection."""
+    """LeRobot metadata extended with BEHAVIOR task filtering and orchestrators."""
 
     def __init__(
         self,
@@ -209,42 +209,65 @@ class BehaviorSftDatasetMetadata(LeRobotDatasetMetadata):
         local_only: bool = False,
     ):
         self.task_name_candidates = None if tasks is None else set(tasks)
-        self.modalities = {
-            "depth_linear" if mod == "depth" else mod for mod in modalities or ["rgb"]
-        }
-        camera_names = ROBOT_CAMERA_NAMES["R1Pro"]
-        self.camera_names = {
-            camera_names.get(name, name) for name in cameras or camera_names
-        }
-        if not self.modalities <= {"rgb", "depth_linear"}:
-            raise ValueError(
-                f"Unsupported BEHAVIOR 2026 video modalities: {sorted(self.modalities - {'rgb', 'depth_linear'})}. "
-                "The demonstrations publish RGB and depth_linear videos."
+        self.modalities = set(modalities or ["rgb"])
+        self.camera_names = set(cameras or ROBOT_CAMERA_NAMES["R1Pro"])
+        self.repo_id = repo_id
+        self.revision = revision or "main"
+        self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        if local_only and force_cache_sync:
+            raise ValueError("force_cache_sync requires local_only=False.")
+        try:
+            if force_cache_sync:
+                raise FileNotFoundError
+            self.load_metadata()
+        except (FileNotFoundError, NotADirectoryError):
+            if local_only:
+                raise
+            # In v2, meta/episodes/ contains per-demo sidecars, while v3 stores
+            # its episode index there. Only the index is needed for selection.
+            self.pull_from_repo(
+                allow_patterns=[
+                    "meta/info.json",
+                    "meta/stats.json",
+                    "meta/tasks.jsonl",
+                    "meta/tasks.parquet",
+                    "meta/episodes.jsonl",
+                    "meta/episodes_stats.jsonl",
+                    "meta/episodes/*/*.parquet",
+                ]
             )
+            self.load_metadata()
+
+    def load_metadata(self):
+        """Load info, filtered tasks/episodes, annotations, orchestrators and stats."""
+        self.info = load_json(self.root / "meta/info.json")
+        version = self.info["codebase_version"]
+        if version not in ("v2.1", "v3.0"):
+            raise ValueError(
+                f"BEHAVIOR SFT requires v2.1 or v3.0 demonstrations, found {version!r}."
+            )
+        if version == "v2.1":
+            self.modalities = {
+                "depth" if mod == "depth_linear" else mod for mod in self.modalities
+            }
+            prefix = "observation.images"
+            for feature in self.info["features"].values():
+                feature["shape"] = tuple(feature["shape"])
+            self.stats = self.load_stats(self.root)
+        else:
+            self.modalities = {
+                "depth_linear" if mod == "depth" else mod for mod in self.modalities
+            }
+            self.camera_names = {
+                ROBOT_CAMERA_NAMES["R1Pro"].get(cam, cam) for cam in self.camera_names
+            }
+            prefix = "observation"
+            super().load_metadata()
         self._selected_video_keys = {
-            f"observation.{mod}.{cam}"
+            f"{prefix}.{mod}.{cam}"
             for mod in self.modalities
             for cam in self.camera_names
         }
-        if local_only:
-            if force_cache_sync:
-                raise ValueError("force_cache_sync requires local_only=False.")
-            self.repo_id = repo_id
-            self.revision = revision or CODEBASE_VERSION
-            self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
-            self.load_metadata()
-        else:
-            super().__init__(repo_id, root, revision, force_cache_sync)
-
-    def load_metadata(self):
-        """Load standard v3 tables, then select the BEHAVIOR tasks to read."""
-        with (self.root / "meta/info.json").open() as file:
-            version = json.load(file)["codebase_version"]
-        if version != "v3.0":
-            raise ValueError(
-                f"BEHAVIOR SFT requires 2026 demonstrations (v3.0), found {version!r}."
-            )
-        super().load_metadata()
         self.__dict__.pop("annotations", None)
         self.__dict__.pop("orchestrators", None)
         descriptions, self.task_to_task_index, names = self.load_tasks(self.root)
@@ -252,10 +275,24 @@ class BehaviorSftDatasetMetadata(LeRobotDatasetMetadata):
         self.task_names = set(names.values())
         if self.task_name_candidates is not None:
             self.task_names &= self.task_name_candidates
+        if version == "v2.1":
+            # v2 stores task metadata in JSONL; expose the same indexed task table
+            # used by the LeRobot reader when it attaches the task to each frame.
+            self.tasks = (
+                pd.Series(names, name="task")
+                .reindex(range(max(names) + 1))
+                .rename_axis("task_index")
+                .reset_index()
+                .set_index("task")
+            )
         self.selected_episodes = self.load_episodes(self.root)
+        if version == "v2.1":
+            self.episodes = self.selected_episodes
         self.episodes_stats = self.load_episodes_stats(self.root)
         if self.episodes_stats:
-            self.stats = aggregate_stats(list(self.episodes_stats.values()))
+            self.stats = self.aggregate_episode_stats(
+                list(self.episodes_stats.values())
+            )
 
         videos = {
             key
@@ -283,6 +320,22 @@ class BehaviorSftDatasetMetadata(LeRobotDatasetMetadata):
 
     def load_episodes(self, local_dir: Path):
         """Select episodes without renumbering the v3 table LeRobot uses for videos."""
+        if self.info["codebase_version"] == "v2.1":
+            ids_to_names = {idx: name for name, idx in self.tasks["task_index"].items()}
+            selected = {}
+            with (local_dir / "meta/episodes.jsonl").open() as file:
+                for row in map(json.loads, file):
+                    ep_id = row["episode_index"]
+                    name = ids_to_names[ep_id // self.chunks_size]
+                    if name in self.task_names:
+                        row["tasks"] = [name]
+                        for field in ("annotation_path", "metainfo_path"):
+                            if self.info.get(field):
+                                row[field] = str(
+                                    self._legacy_path(self.info[field], ep_id)
+                                )
+                        selected[ep_id] = row
+            return dict(sorted(selected.items()))
         columns = [
             "episode_index",
             "tasks",
@@ -310,6 +363,16 @@ class BehaviorSftDatasetMetadata(LeRobotDatasetMetadata):
 
     def load_episodes_stats(self, local_dir: Path):
         """Read selected episode statistics when the v3 Parquet includes stats columns."""
+        if self.info["codebase_version"] == "v2.1":
+            with (local_dir / "meta/episodes_stats.jsonl").open() as file:
+                return {
+                    row["episode_index"]: {
+                        name: {k: np.asarray(v) for k, v in values.items()}
+                        for name, values in row["stats"].items()
+                    }
+                    for row in map(json.loads, file)
+                    if row["episode_index"] in self.selected_episodes
+                }
         import pyarrow.dataset as ds
 
         source = ds.dataset(local_dir / "meta/episodes", format="parquet")
@@ -326,6 +389,40 @@ class BehaviorSftDatasetMetadata(LeRobotDatasetMetadata):
             )
             for row in rows.to_pylist()
         }
+
+    def aggregate_episode_stats(self, episodes_stats):
+        combined = aggregate_stats(episodes_stats)
+        if self.info["codebase_version"] == "v2.1":
+            # The 2025 OmniGibson aggregator also pools the per-episode quantiles.
+            for key, result in combined.items():
+                for field, pct in (("q01", 1), ("q99", 99)):
+                    values = [
+                        ep[key][field]
+                        for ep in episodes_stats
+                        if field in ep.get(key, {})
+                    ]
+                    if values:
+                        result[field] = np.percentile(values, pct, axis=0)
+        return combined
+
+    def _legacy_path(self, template, ep_index, **fields):
+        return Path(
+            template.format(
+                episode_chunk=ep_index // self.chunks_size,
+                episode_index=ep_index,
+                **fields,
+            )
+        )
+
+    def get_data_file_path(self, ep_index: int) -> Path:
+        if self.info["codebase_version"] == "v2.1":
+            return self._legacy_path(self.data_path, ep_index)
+        return super().get_data_file_path(ep_index)
+
+    def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
+        if self.info["codebase_version"] == "v2.1":
+            return self._legacy_path(self.video_path, ep_index, video_key=vid_key)
+        return super().get_video_file_path(ep_index, vid_key)
 
     def load_annotations(self, local_dir: Path, episodes=None):
         """Load available skill annotations using the v3 episode-to-source mapping."""
@@ -523,32 +620,35 @@ class BehaviorSftDataset(LeRobotDataset):
             modalities = ["rgb"]
         if cameras is None:
             cameras = ["head", "left_wrist", "right_wrist"]
-        if train_rgb_type != "regular":
-            raise ValueError(
-                "The 2026 demonstrations publish only regular RGB camera streams."
-            )
-        if return_seg_instance:
-            raise ValueError(
-                "The 2026 demonstrations publish RGB and depth, without instance masks."
-            )
         self.fine_grained_level = fine_grained_level
         self.task_names = set(tasks) if tasks is not None else set()
 
         self.meta = BehaviorSftDatasetMetadata(
             repo_id=self.repo_id,
             root=self.root,
-            revision=self.revision,
+            revision=revision,
             force_cache_sync=force_cache_sync,
             tasks=self.task_names or None,
             modalities=modalities,
             cameras=cameras,
             local_only=local_only,
         )
+        self._v21 = self.meta.info["codebase_version"] == "v2.1"
+        if not self._v21:
+            if train_rgb_type != "regular":
+                raise ValueError(
+                    "The 2026 demonstrations publish only regular RGB camera streams."
+                )
+            if return_seg_instance:
+                raise ValueError(
+                    "The 2026 demonstrations publish RGB and depth, without instance masks."
+                )
         self.revision = self.meta.revision
         self.task_prompts = self.meta.task_prompts
-        # v3 stores all episodes of a task in shared Parquet and video files.
         # Keep the published row order while selecting positions within each task.
         rows = pd.DataFrame.from_records(list(self.meta.selected_episodes.values()))
+        if self._v21 and not rows.empty:
+            rows = rows.sort_values("episode_index")
         if episodes is not None and not rows.empty:
             by_task = rows[["episode_index", "tasks"]].explode("tasks")
             if self.task_names:
@@ -557,16 +657,19 @@ class BehaviorSftDataset(LeRobotDataset):
             by_task = by_task.groupby("tasks", sort=False).nth(episodes)
             rows = rows[rows.episode_index.isin(by_task.episode_index)]
         if rows.empty:
-            raise ValueError(
-                f"No BEHAVIOR 2026 episodes match {sorted(self.task_names)}."
-            )
+            raise ValueError(f"No BEHAVIOR episodes match {sorted(self.task_names)}.")
         self.task_names = self.meta.task_names
         self.task_indices = sorted(
             int(self.meta.tasks.loc[name, "task_index"]) for name in self.task_names
         )
         self._episode_rows = rows
         self.episodes = rows.episode_index.tolist()
-        shards = rows.drop_duplicates(["data/chunk_index", "data/file_index"])
+        # Only v3 packs multiple episodes into each data file.
+        shards = (
+            rows
+            if self._v21
+            else rows.drop_duplicates(["data/chunk_index", "data/file_index"])
+        )
         self._data_file_paths = [
             self.meta.get_data_file_path(i) for i in shards.episode_index
         ]
@@ -578,7 +681,7 @@ class BehaviorSftDataset(LeRobotDataset):
         if self.meta.episodes_stats and len(self.episodes) != len(
             self.meta.selected_episodes
         ):
-            self.stats = aggregate_stats(
+            self.stats = self.meta.aggregate_episode_stats(
                 [self.meta.episodes_stats[i] for i in self.episodes]
             )
 
@@ -795,7 +898,7 @@ class BehaviorSftDataset(LeRobotDataset):
             fpaths.extend(
                 str(self.meta.get_annotation_path(ep_idx)) for ep_idx in self.episodes
             )
-        if self.fine_grained_level or self.skill_list != ["all"]:
+        if self._v21 or self.fine_grained_level or self.skill_list != ["all"]:
             fpaths.extend(
                 str(self.meta.get_metainfo_path(ep_idx))
                 for ep_idx in self.episodes
@@ -803,8 +906,12 @@ class BehaviorSftDataset(LeRobotDataset):
             )
         for vid_key in self.meta.video_keys:
             # Several episodes share a video file in v3; only resolve it once.
-            files = self._episode_rows.drop_duplicates(
-                [f"videos/{vid_key}/chunk_index", f"videos/{vid_key}/file_index"]
+            files = (
+                self._episode_rows
+                if self._v21
+                else self._episode_rows.drop_duplicates(
+                    [f"videos/{vid_key}/chunk_index", f"videos/{vid_key}/file_index"]
+                )
             )
             fpaths.extend(
                 str(self.meta.get_video_file_path(ep_idx, vid_key))
@@ -815,6 +922,12 @@ class BehaviorSftDataset(LeRobotDataset):
     def download_episodes(self, download_videos: bool = True) -> None:
         """Download only the selected tasks' data (and videos) from the hub."""
         files = self.get_episodes_file_paths()
+        if self._v21 and (self.fine_grained_level or self.skill_list != ["all"]):
+            for ep_idx in self.episodes:
+                annotation = self.meta.get_annotation_path(ep_idx)
+                files.append(
+                    f"{ORCHESTRATORS_PATH}/{annotation.parent.name}/{annotation.stem}/*"
+                )
         if not download_videos:
             files = [path for path in files if not path.startswith("videos/")]
         self.pull_from_repo(allow_patterns=files)
@@ -833,13 +946,22 @@ class BehaviorSftDataset(LeRobotDataset):
 
     def load_hf_dataset(self):
         """Load the parquet frames for the selected episodes as a HF dataset."""
+        # In v2 task_index exists on disk but is absent from info.json; infer the original schema.
         data = Dataset.from_parquet(
             [str(self.root / path) for path in self._data_file_paths],
-            features=get_hf_features_from_features(self.features),
+            features=None
+            if self._v21
+            else get_hf_features_from_features(self.features),
             filters=[("episode_index", "in", self.episodes)],
         )
-        data.set_transform(hf_transform_to_torch)
+        data.set_transform(self._v21_transform if self._v21 else hf_transform_to_torch)
         return data
+
+    @staticmethod
+    def _v21_transform(batch):
+        # Keep double timestamps like the 2025 OmniGibson transform.
+        batch["timestamp"] = [np.float64(value) for value in batch["timestamp"]]
+        return hf_transform_to_torch(batch)
 
     def _select_streaming_chunk(self) -> None:
         """Pick this ``(rank, worker)``'s active chunk set and starting frame.
@@ -969,6 +1091,8 @@ class BehaviorSftDataset(LeRobotDataset):
                 )
 
         item = super().__getitem__(idx)
+        if self._v21:
+            item.pop("observation.task_info", None)
         self._set_prompt(item)
         return item
 
@@ -1047,7 +1171,7 @@ class BehaviorSftDataset(LeRobotDataset):
 
     def _query_videos(self, query_timestamps, ep_idx):
         """Decode timestamps relative to an episode's start in its shared video files."""
-        if self.video_backend != "pyav":
+        if self.video_backend != "pyav" and not self._v21:
             if "depth_linear" in self.meta.modalities:
                 raise ValueError(
                     "BEHAVIOR 12-bit depth videos require the pyav backend."
@@ -1058,7 +1182,19 @@ class BehaviorSftDataset(LeRobotDataset):
         episode = self.meta.episodes[ep_idx]
         for vid_key, query_ts in query_timestamps.items():
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            offset = episode[f"videos/{vid_key}/from_timestamp"]
+            offset = 0 if self._v21 else episode[f"videos/{vid_key}/from_timestamp"]
+            if (
+                self._v21
+                and self.video_backend != "pyav"
+                and not self._chunk_streaming_using_keyframe
+                and ".depth." not in vid_key
+            ):
+                from lerobot.datasets.video_utils import decode_video_frames
+
+                item[vid_key] = decode_video_frames(
+                    video_path, query_ts, self.tolerance_s, self.video_backend
+                ).squeeze(0)
+                continue
             times = [offset + ts for ts in query_ts]
             stream = self._chunk_streaming_using_keyframe and vid_key not in (
                 self.delta_indices or {}
@@ -1085,16 +1221,67 @@ class BehaviorSftDataset(LeRobotDataset):
                         decoded[ts] = _depth_in_meters(
                             frame, self.meta.features[vid_key]["info"]
                         )
+                    elif self._v21 and ".depth." in vid_key:
+                        # 2025 stores log depth in 14 bits, with the SDK's fixed [0, 10] metre range.
+                        gray = frame.to_ndarray(format="gray16le")
+                        depth = np.clip(
+                            3.5 * np.expm1(gray / 16383 * np.log(13.5 / 3.5)), 0, 10
+                        )
+                        decoded[ts] = th.from_numpy(depth).float()
                     else:
                         rgb = frame.to_ndarray(format="rgb24")
-                        decoded[ts] = (
-                            th.from_numpy(rgb).permute(2, 0, 1).float().div_(255)
-                        )
+                        if self._v21 and ".seg_instance_id." in vid_key and stream:
+                            decoded[ts] = self._v21_instance_ids(rgb, ep_idx, vid_key)
+                        else:
+                            value = th.from_numpy(rgb).permute(2, 0, 1)
+                            decoded[ts] = (
+                                value
+                                if self._v21 and stream
+                                else value.float().div_(255)
+                            )
                 item[vid_key] = th.stack([decoded[ts] for ts in times]).squeeze(0)
             finally:
                 if not stream:
                     frames.close()
         return item
+
+    def _v21_instance_ids(self, rgb, ep_idx, vid_key):
+        # The 2025 renderer assigns a palette per episode and camera.
+        from scipy.spatial.distance import cdist
+
+        if getattr(self, "_palette_episode", None) != ep_idx:
+            self._palette_episode = ep_idx
+            self._instance_palettes = {}
+        if vid_key not in self._instance_palettes:
+            camera = vid_key.rsplit(".", 1)[-1]
+            link = {
+                "head": "zed_link",
+                "left_wrist": "left_realsense_link",
+                "right_wrist": "right_realsense_link",
+            }[camera]
+            metainfo = load_json(self.root / self.meta.get_metainfo_path(ep_idx))
+            ids = np.asarray(
+                metainfo[f"robot_r1::robot_r1:{link}:Camera:0::unique_ins_ids"],
+                dtype=np.int64,
+            )
+            steps = int(np.ceil(len(ids) ** (1 / 3)))
+            y = np.linspace(16, 235, steps)
+            uv = np.linspace(16, 240, steps)
+            palette = (
+                np.stack(np.meshgrid(y, uv, uv, indexing="ij"), axis=-1)
+                .reshape(-1, 3)[: len(ids)]
+                .astype(np.uint8)
+            )
+            self._instance_palettes[vid_key] = ids, palette
+        ids, palette = self._instance_palettes[vid_key]
+        pixels = rgb.reshape(-1, 3)
+        result = np.empty(len(pixels), dtype=np.int64)
+        for start in range(0, len(pixels), 4096):
+            block = pixels[start : start + 4096]
+            result[start : start + len(block)] = ids[
+                cdist(block, palette, "sqeuclidean").argmin(axis=1)
+            ]
+        return th.from_numpy(result.reshape(rgb.shape[:2]))
 
     def _get_keyframe_chunk_indices(self, chunk_size=250):
         """Split each episode into contiguous ``chunk_size``-frame keyframe chunks.

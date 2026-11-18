@@ -172,7 +172,7 @@ Select the data format with ``actor.model.openpi.config_name``:
    * - ``pi0_aloha_robotwin``
      - RoboTwin (ALOHA)
    * - ``pi05_behavior``
-     - BEHAVIOR-1K (2026 challenge demonstrations)
+     - BEHAVIOR-1K (2025 and 2026 challenge demonstrations)
    * - ``pi0_maniskill`` · ``pi05_maniskill``
      - ManiSkill
    * - ``pi05_metaworld``
@@ -252,7 +252,7 @@ and ``actions`` before SFT (especially important for real-robot data):
 If standard deviations are tiny or the q99–q01 range is very narrow, widening
 them often stabilizes training, especially when SFT is followed by online RL.
 
-For BEHAVIOR, supply an OpenPI ``norm_stats.json`` for the 2026 training data
+For BEHAVIOR, supply an OpenPI ``norm_stats.json`` for the selected training data
 and the state and action vectors used by ``pi05_behavior``. Set
 ``actor.model.openpi_data.norm_stats_path`` to that file and use it for evaluation.
 
@@ -392,7 +392,7 @@ Filesystem paths live in the experiment config; the model shape comes from
      - model/pi0_5@actor.model
      - hybrid_engines/openpi_fsdp@actor.fsdp_config
 
-This recipe requires the `2026 challenge demonstrations <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_ (LeRobot v3.0). Set both dataset paths to the local dataset root. To train on a subset, keep the metadata and download the frame data and three RGB camera streams (head and both wrists) for every episode of each task in ``tasks``.
+Use the `2025 challenge demonstrations <https://huggingface.co/datasets/behavior-1k/2025-challenge-demos>`_ (LeRobot v2.1) or the `2026 challenge demonstrations <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_ (v3.0). Set both dataset paths to its local root and ``repo_id`` to the matching Hugging Face repository ID. The loader reads the format from ``meta/info.json``. To train on a subset, keep the metadata and download the frame data and three RGB camera streams (head and both wrists) for every episode of each task in ``tasks``.
 
 .. code:: yaml
 
@@ -416,18 +416,18 @@ This recipe requires the `2026 challenge demonstrations <https://huggingface.co/
 
 With ``use_skill: false``, every radio frame uses the main instruction from ``meta/tasks.jsonl``.
 To train on individual stages, set ``data.use_skill=true`` and select one task.
-Download the annotation files referenced by its episodes' ``annotation_path``. The loader
+Download the selected demonstrations' skill annotations from the dataset's ``annotations/`` directory. The loader
 uses the frame intervals in those files and the ordered labels in ``data.task_subtasks``.
 For example, the radio configuration supplies ``press radio`` for the third stage.
 Both modes use the head and two wrist RGB cameras.
 
-When evaluating the resulting policy, set
+When evaluating a policy trained on the 2026 demonstrations, set
 ``omni_config.robots[0].proprio_obs`` to the SDK field order in
 ``PROPRIOCEPTION_INDICES["R1Pro"]`` so that the 61-value state includes
 base velocity in the robot frame, as it does in the training data.
 
 In the OpenPI model environment from the Installation section, install the
-Hugging Face LeRobot revision that reads the v3 data and run SFT.
+following Hugging Face LeRobot revision for both releases and run SFT.
 
 .. code:: bash
 
