@@ -20,10 +20,8 @@ import json
 import shlex
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
-from threading import get_ident
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,19 +29,9 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.envs.sim.behavior import BehaviorSimulator, behavior_env
+from rlinf.envs.sim.behavior import behavior_env
 from rlinf.envs.sim.behavior.instance_loader import ActivityInstanceLoader
-from rlinf.envs.sim.behavior.utils import R1PRO_PROPRIO_KEYS, make_environment_config
-
-
-def backend_without_simulator():
-    """Initialize lifecycle fields for focused SDK-boundary tests."""
-    backend = BehaviorSimulator.__new__(BehaviorSimulator)
-    backend._owner_thread = get_ident()
-    backend._closed = False
-    backend._owns_simulator = False
-    backend._reset_required = False
-    return backend
+from rlinf.envs.sim.behavior.utils import R1PRO_PROPRIO_KEYS, setup_omni_cfg
 
 
 class FakeBehaviorPool:
@@ -659,21 +647,6 @@ def test_public_worker_uses_native_simulator_without_starting_sdk(version, monke
         env.close()
 
 
-def test_public_simulator_import_needs_no_worker_or_sdk():
-    script = """
-import sys
-for dependency in ("ray", "omnigibson", "isaacsim"):
-    sys.modules[dependency] = None
-from rlinf.envs.sim.behavior import BehaviorSimulator
-assert callable(BehaviorSimulator)
-"""
-    subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).resolve().parents[2],
-        check=True,
-    )
-
-
 def test_behavior_pool_preserves_shard_and_action_row_order(inline_behavior_actors):
     processes, killed = inline_behavior_actors
     cfg = OmegaConf.create({"num_env_subprocess": 2, "auto_reset": False})
@@ -809,17 +782,27 @@ def test_directory_overrides_preset_split_without_mutating_config(tmp_path):
             }
         }
     )
-    loader = ActivityInstanceLoader(cfg, num_envs=1, seed=3)
+    loader = ActivityInstanceLoader.from_omni_cfg(cfg.omni_config, num_envs=1, seed=3)
     assert loader.split is None
     assert loader.select([0])[0].instance_id == 7
     assert cfg.omni_config.task.instance_split == "train"
 
 
+@pytest.fixture
+def fake_og_config_dir(tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "omnigibson", SimpleNamespace(example_config_path=str(tmp_path))
+    )
+    monkeypatch.setitem(
+        sys.modules, "omnigibson.macros", SimpleNamespace(gm=SimpleNamespace())
+    )
+    return tmp_path
+
+
 @pytest.mark.parametrize("explicit_null_proprio", [False, True])
 def test_config_preserves_rlinf_rates_controllers_and_legacy_state(
-    tmp_path, explicit_null_proprio
+    fake_og_config_dir, explicit_null_proprio
 ):
-    (tmp_path / "configs").mkdir()
     OmegaConf.save(
         OmegaConf.create(
             {
@@ -834,7 +817,7 @@ def test_config_preserves_rlinf_rates_controllers_and_legacy_state(
                 ],
             }
         ),
-        tmp_path / "configs" / "r1pro_behavior.yaml",
+        fake_og_config_dir / "r1pro_behavior.yaml",
     )
     cfg = OmegaConf.create(
         {
@@ -868,7 +851,7 @@ def test_config_preserves_rlinf_rates_controllers_and_legacy_state(
     )
     if explicit_null_proprio:
         cfg.omni_config.robots[0].proprio_obs = None
-    actual = make_environment_config(cfg, 2, str(tmp_path))
+    actual = setup_omni_cfg(cfg, 2)
     assert actual["env"]["action_frequency"] == 60
     assert actual["env"]["physics_frequency"] == 120
     assert actual["env"]["num_envs"] == 2
@@ -887,7 +870,7 @@ def test_config_preserves_rlinf_rates_controllers_and_legacy_state(
 
 
 def test_legacy_velocity_is_raw_joint_velocity_not_rotated_proprio():
-    backend = backend_without_simulator()
+    backend = behavior_env.BehaviorProcess.__new__(behavior_env.BehaviorProcess)
     robot = SimpleNamespace(name="robot_r1", base_control_idx=torch.tensor([0, 1, 5]))
     robot.get_joint_velocities = lambda: torch.tensor([1.0, 2.0, 0.0, 0.0, 0.0, 3.0])
     backend.env = SimpleNamespace(scenes=[SimpleNamespace(robots=[robot])])
@@ -900,7 +883,7 @@ def test_legacy_velocity_is_raw_joint_velocity_not_rotated_proprio():
 
 
 def test_official_proprio_keeps_robot_frame_base_velocity():
-    backend = backend_without_simulator()
+    backend = behavior_env.BehaviorProcess.__new__(behavior_env.BehaviorProcess)
     backend.env = SimpleNamespace(
         scenes=[SimpleNamespace(robots=[SimpleNamespace(name="robot_r1")])]
     )
@@ -940,27 +923,28 @@ def test_behavior_process_accepts_both_render_options(
             self.position = torch.zeros(num_envs)
             self.image = self.position.clone()
 
-        def step(self, actions, *, render, get_obs):
+        def step(self, actions, need_obs):
             self.position += actions[:, 0]
-            if render:
+            if need_obs:
                 self.image = self.position.clone()
             return (
-                [{"image": self.image.clone()}] if get_obs else None,
+                [{"image": self.image.clone()}] if need_obs else None,
                 self.position.clone(),
                 torch.zeros(1, dtype=torch.bool),
                 torch.zeros(1, dtype=torch.bool),
                 [{}],
             )
 
-    monkeypatch.setattr(behavior_env, "BehaviorSimulator", Simulator)
-    process = behavior_env.BehaviorProcess(OmegaConf.create(options), 1, 0)
+    process = behavior_env.BehaviorProcess.__new__(behavior_env.BehaviorProcess)
+    process.cfg = OmegaConf.create(options)
+    monkeypatch.setattr(process, "_step_shard", Simulator(None, 1, 0).step)
     actions = torch.zeros((1, 3, 23))
     actions[0, :, 0] = torch.tensor([1.0, 2.0, 3.0])
     observations, rewards, _, _, _ = process.chunk_step(actions)
     assert torch.equal(torch.stack(rewards), torch.tensor([[1.0], [3.0], [6.0]]))
     assert observations[-1][0]["image"].item() == 6
     if skip_frames:
-        assert observations[:-1] == [None, None]
+        assert all(obs is None for obs in observations[:-1])
     else:
         assert [row[0]["image"].item() for row in observations] == [1, 3, 6]
 
@@ -980,14 +964,18 @@ def test_behavior_process_accepts_both_render_options(
     ],
 )
 def test_behavior_config_preserves_existing_observation_wrappers(
-    tmp_path, wrapper, extra_modalities, head_height, wrist_height, task_obs
+    fake_og_config_dir, wrapper, extra_modalities, head_height, wrist_height, task_obs
 ):
-    (tmp_path / "configs").mkdir()
     OmegaConf.save(
         OmegaConf.create(
-            {"env": {}, "scene": {}, "task": {}, "robots": [{"type": "R1Pro"}]}
+            {
+                "env": {},
+                "scene": {},
+                "task": {},
+                "robots": [{"type": "R1Pro"}],
+            }
         ),
-        tmp_path / "configs" / "r1pro_behavior.yaml",
+        fake_og_config_dir / "r1pro_behavior.yaml",
     )
     cfg = OmegaConf.create(
         {
@@ -1003,7 +991,7 @@ def test_behavior_config_preserves_existing_observation_wrappers(
             },
         }
     )
-    actual = make_environment_config(cfg, 1, str(tmp_path))
+    actual = setup_omni_cfg(cfg, 1)
     robot = actual["robots"][0]
     assert set(robot["obs_modalities"]) == {"rgb", "proprio"} | extra_modalities
     assert robot["proprio_obs"] == R1PRO_PROPRIO_KEYS
@@ -1019,7 +1007,7 @@ def test_behavior_config_preserves_existing_observation_wrappers(
 def test_chunk_terminal_frame_is_refreshed_and_episode_stops(
     ignore_terminations, terminal, with_lights
 ):
-    backend = backend_without_simulator()
+    backend = behavior_env.BehaviorProcess.__new__(behavior_env.BehaviorProcess)
     backend.num_envs = 1
     backend._has_reset = True
     backend.ignore_terminations = ignore_terminations
@@ -1061,8 +1049,8 @@ def test_chunk_terminal_frame_is_refreshed_and_episode_stops(
 
     metric.step = step_metric
     backend.metrics = [metric]
-    first = backend.step(torch.zeros((1, 23)), render=False, get_obs=False)
-    second = backend.step(torch.ones((1, 23)), render=False)
+    first = backend._step_shard(torch.zeros((1, 23)), need_obs=False)
+    second = backend._step_shard(torch.ones((1, 23)), need_obs=True)
     assert first[0] is None
     if terminal:
         assert calls == {"steps": 1, "renders": 3}
@@ -1071,12 +1059,12 @@ def test_chunk_terminal_frame_is_refreshed_and_episode_stops(
         assert second[4][0]["q_score"] == 0.8
         assert first[4][0]["episode_length"] == second[4][0]["episode_length"] == 1
     else:
-        assert calls == {"steps": 2, "renders": 0}
+        assert calls == {"steps": 2, "renders": 3 if with_lights else 0}
         assert not backend._frozen.any()
 
 
 def test_native_batch_partial_reset_fails_before_simulator_changes():
-    backend = backend_without_simulator()
+    backend = behavior_env.BehaviorProcess.__new__(behavior_env.BehaviorProcess)
     backend.num_envs = 2
     with pytest.raises(ValueError, match="share physics"):
         backend.reset([1])
@@ -1130,7 +1118,8 @@ def test_behavior_backend_validates_native_action_and_state_layout(
         gripper_control_idx=gripper_indices,
         trunk_control_idx=trunk_indices,
     )
-    backend = backend_without_simulator()
+    monkeypatch.setattr(behavior_env, "apply_runtime_renderer_settings", lambda: None)
+    backend = behavior_env.BehaviorProcess.__new__(behavior_env.BehaviorProcess)
     backend.cfg = OmegaConf.create({"omni_config": {"env": {"env_wrapper": None}}})
     backend.env = SimpleNamespace(scenes=[SimpleNamespace(robots=[robot])])
     backend.num_envs = 1
@@ -1141,432 +1130,6 @@ def test_behavior_backend_validates_native_action_and_state_layout(
     else:
         backend._configure_loaded_environment()
         assert len(backend.metrics) == 1
-
-
-@pytest.fixture
-def local_behavior_simulator():
-    """Exercise the public local interface against mutable native SDK buffers."""
-
-    class Sensor:
-        def __init__(self, offset):
-            self.intrinsic_matrix = torch.tensor(
-                [[120.0 + offset, 0.0, 16.0], [0.0, 110.0 + offset, 12.0], [0, 0, 1]]
-            )
-            self.image_height, self.image_width = 24, 32
-            self.position = torch.tensor([float(offset), 2.0, 3.0])
-            self.orientation = torch.tensor([0.0, 0.0, 0.0, 1.0])
-
-        def get_position_orientation(self):
-            return self.position, self.orientation
-
-    class Robot:
-        name = "robot_r1"
-        base_idx = torch.arange(6)
-        base_control_idx = torch.tensor([0, 1, 5])
-
-        def __init__(self):
-            self.joints = {f"joint_{index}": None for index in range(28)}
-            self.positions = torch.zeros(28)
-            self.positions[5] = torch.pi / 2
-            self.velocities = torch.zeros(28)
-            self.velocities[self.base_control_idx] = torch.tensor([1.0, 2.0, 0.5])
-            self.sensors = {
-                f"robot_r1:{link}": Sensor(index)
-                for index, link in enumerate(
-                    (
-                        "zed_link:Camera:0",
-                        "left_realsense_link:Camera:0",
-                        "right_realsense_link:Camera:0",
-                    )
-                )
-            }
-
-        def get_joint_positions(self):
-            return self.positions
-
-        def get_joint_velocities(self):
-            return self.velocities
-
-        def get_position_orientation(self):
-            return self.positions[:3], torch.tensor([0.0, 0.0, 0.0, 1.0])
-
-        def get_eef_pose(self, *, arm):
-            return torch.tensor(
-                [1.0, 2.0, 3.0 if arm == "left" else 4.0]
-            ), torch.tensor([0.0, 0.0, 0.0, 1.0])
-
-        def get_relative_eef_pose(self, *, arm):
-            return torch.tensor(
-                [0.1, 0.2, 0.3 if arm == "left" else 0.4]
-            ), torch.tensor([0.0, 0.0, 0.0, 1.0])
-
-    class Metric:
-        def __init__(self):
-            self.timesteps = 0
-            self.forbid_aggregate = False
-
-        def reset(self, **kwargs):
-            self.timesteps = 0
-
-        def step(self, **kwargs):
-            self.timesteps += 1
-
-        def aggregate(self, **kwargs):
-            if self.forbid_aggregate:
-                raise AssertionError("A read operation must not aggregate metrics")
-            if self.timesteps == 0:
-                return {}
-            return {"q_score": {"final": self.timesteps / 10}}
-
-    class NativeEnvironment:
-        def __init__(self):
-            self.robot = Robot()
-            self.scenes = [SimpleNamespace(robots=[self.robot])]
-            self.proprio = torch.zeros(256)
-            self.image = torch.zeros((2, 2, 3), dtype=torch.uint8)
-            self.physics_steps = self.render_count = self.close_count = 0
-            self.clear_count = 0
-            self.fail_step = self.fail_close = False
-
-        def get_obs(self, **kwargs):
-            self.proprio[0] = self.robot.positions[0]
-            return [{"robot_r1": {"proprio": self.proprio, "rgb": self.image}}], [
-                {"camera": {"frame": self.render_count}}
-            ]
-
-        def reset(self, **kwargs):
-            self.robot.positions[0] = 0
-            self.image.zero_()
-            self.physics_steps = 0
-            obs, info = self.get_obs()
-            return obs, {"obs_info": info}
-
-        def step(self, actions):
-            self.physics_steps += 1
-            self.robot.positions[0] += actions[0, 0]
-            if self.fail_step:
-                raise RuntimeError("native step failed after changing physics")
-            self.image.fill_(self.physics_steps)
-            obs, _ = self.get_obs()
-            return (
-                obs,
-                torch.ones(1),
-                torch.zeros(1, dtype=torch.bool),
-                torch.zeros(1, dtype=torch.bool),
-                [{}],
-            )
-
-        def render(self):
-            self.render_count += 1
-            self.image.fill_(self.render_count)
-
-        def close(self):
-            self.close_count += 1
-            if self.fail_close:
-                raise RuntimeError("native close failed")
-
-        def clear(self):
-            self.clear_count += 1
-            self.scenes.clear()
-
-    native = NativeEnvironment()
-    metric = Metric()
-    shutdowns = []
-    simulator = BehaviorSimulator.__new__(BehaviorSimulator)
-    simulator._owner_thread = get_ident()
-    simulator.env = native
-    simulator.num_envs = 1
-    simulator.activity_name = "turning_on_radio"
-    simulator._closed = False
-    simulator._owns_simulator = True
-    simulator._has_reset = False
-    simulator._reset_required = True
-    simulator._execution_outcome_known = True
-    simulator._frozen = torch.zeros(1, dtype=torch.bool)
-    simulator._terminal = [None]
-    simulator._last_actions = torch.zeros((1, 23))
-    simulator._last_executed_actions = [None]
-    simulator._metrics_snapshot = [{}]
-    simulator._instance_ids = [301]
-    simulator._lights = [None]
-    simulator.ignore_terminations = False
-    simulator.metrics = [metric]
-    simulator.instances = SimpleNamespace(mode="disabled", select=lambda indices: {})
-    simulator.og = SimpleNamespace(
-        app=None,
-        clear=native.clear,
-        sim=SimpleNamespace(
-            render=native.render, render_on_step=lambda enabled: nullcontext()
-        ),
-        shutdown=lambda **kwargs: shutdowns.append(kwargs),
-    )
-    yield simulator, native, metric, shutdowns
-    simulator.close()
-
-
-def test_local_behavior_metric_reads_do_not_advance_episode(
-    local_behavior_simulator,
-):
-    simulator, native, metric, _ = local_behavior_simulator
-    simulator.reset()
-    simulator.step(torch.ones((1, 23)))
-    metric.forbid_aggregate = True
-    before = simulator.get_metrics()
-    assert simulator.get_metrics() == before
-    assert native.physics_steps == metric.timesteps == 1
-    before[0]["official_metrics"]["q_score"]["final"] = 99
-    assert simulator.get_metrics()[0]["q_score"] == 0.1
-
-
-def test_local_behavior_snapshots_survive_later_steps_and_reset(
-    local_behavior_simulator,
-):
-    simulator, native, metric, _ = local_behavior_simulator
-    metric.forbid_aggregate = True
-    initial, _ = simulator.reset()
-    metric.forbid_aggregate = False
-    first = simulator.step(torch.ones((1, 23)))
-    simulator.step(torch.full((1, 23), 2.0))
-    assert initial[0]["robot_r1"]["proprio"][0].item() == 0
-    assert first[0][0]["robot_r1"]["proprio"][0].item() == 1
-    assert first[0][0]["robot_r1"]["rgb"][0, 0, 0].item() == 1
-    assert native.robot.positions[0].item() == 3
-    assert first[4][0]["episode_length"] == 1
-    metric.forbid_aggregate = True
-    simulator.reset()
-    reset_metrics = simulator.get_metrics()[0]
-    assert reset_metrics["episode_length"] == 0
-    assert reset_metrics["official_metrics"] == {}
-    assert reset_metrics.get("q_score") is None
-    assert simulator.get_robot_state()["last_executed_action"] is None
-    assert first[4][0]["q_score"] == 0.1
-
-
-def test_local_behavior_state_separates_measurements_and_executed_inputs(
-    local_behavior_simulator,
-):
-    simulator, native, _, _ = local_behavior_simulator
-    simulator.reset()
-    state = simulator.get_robot_state()
-    assert state["last_executed_action"] is None
-    assert state["joint_names"] == list(native.robot.joints)
-    assert state["joint_positions"].shape == state["joint_velocities"].shape == (28,)
-    assert torch.allclose(
-        state["raw_virtual_joint_velocity"], torch.tensor([1.0, 2.0, 0.5])
-    )
-    assert torch.allclose(
-        state["robot_frame_base_velocity"], torch.tensor([2.0, -1.0, 0.5])
-    )
-    actions = torch.full((1, 23), 0.3)
-    simulator.step(actions)
-    native.robot.positions[7] = 8.0
-    state = simulator.get_robot_state()
-    assert state["joint_positions"][7].item() == 8
-    assert torch.equal(state["last_executed_action"], actions[0])
-    state["last_executed_action"].fill_(99)
-    actions.fill_(88)
-    assert simulator.get_robot_state()["last_executed_action"][
-        7
-    ].item() == pytest.approx(0.3)
-    assert state["eef_poses"]["left"]["world"]["position"][2].item() == 3
-    assert state["eef_poses"]["left"]["robot_base"]["position"][
-        2
-    ].item() == pytest.approx(0.3)
-
-
-def test_local_behavior_camera_metadata_is_native_and_owned(local_behavior_simulator):
-    simulator, native, _, _ = local_behavior_simulator
-    simulator.reset()
-    metadata = simulator.get_camera_metadata()
-    assert set(metadata) == {"head", "left_wrist", "right_wrist"}
-    for index, role in enumerate(("head", "left_wrist", "right_wrist")):
-        camera = metadata[role]
-        assert camera["intrinsic_matrix"][0, 0].item() == 120 + index
-        assert camera["height"] == 24 and camera["width"] == 32
-        assert camera["world_pose"]["position"][0].item() == index
-        assert camera["pose_frame"] == "world" and camera["quaternion_order"] == "xyzw"
-        assert camera["camera_axes"] == {"x": "right", "y": "up", "forward": "-z"}
-    metadata["head"]["intrinsic_matrix"].zero_()
-    metadata["head"]["world_pose"]["position"].fill_(99)
-    assert (
-        simulator.get_camera_metadata()["head"]["intrinsic_matrix"][0, 0].item() == 120
-    )
-    # This fake sensor is already initialized; the real SDK may render lazily.
-    assert native.physics_steps == native.render_count == 0
-
-
-def test_local_behavior_failed_step_is_not_recorded_as_completed(
-    local_behavior_simulator,
-):
-    simulator, native, metric, _ = local_behavior_simulator
-    simulator.reset()
-    successful = torch.full((1, 23), 0.2)
-    simulator.step(successful)
-    native.fail_step = True
-    with pytest.raises(RuntimeError, match="native step failed"):
-        simulator.step(torch.ones((1, 23)))
-    state = simulator.get_robot_state()
-    assert torch.equal(state["last_executed_action"], successful[0])
-    assert state["execution_outcome_known"] is False
-    assert native.physics_steps == 2 and metric.timesteps == 1
-    assert simulator.get_metrics()[0]["episode_length"] == 1
-    with pytest.raises(RuntimeError, match="reset"):
-        simulator.step(torch.ones((1, 23)))
-    assert native.physics_steps == 2
-    native.fail_step = False
-    simulator.reset()
-    assert simulator.get_robot_state()["last_executed_action"] is None
-    assert simulator.get_robot_state()["execution_outcome_known"] is True
-
-
-@pytest.mark.parametrize("has_application", [False, True])
-@pytest.mark.parametrize("close_fails", [False, True])
-def test_local_behavior_native_access_and_closed_lifecycle(
-    local_behavior_simulator, has_application, close_fails
-):
-    simulator, native, _, shutdowns = local_behavior_simulator
-    cleanup_events = []
-    settings = {"/app/fastShutdown": True}
-
-    def set_setting(name, value):
-        settings[name] = value
-        cleanup_events.append(("setting", name, value))
-
-    original_close = native.close
-
-    def close_environment():
-        cleanup_events.append(("env_close",))
-        original_close()
-
-    def clear():
-        cleanup_events.append(("clear",))
-        native.clear()
-
-    def shutdown(**kwargs):
-        # Model Isaac's default fast exit without exiting the test process.
-        cleanup_events.append(("shutdown", kwargs))
-        shutdowns.append(kwargs)
-        if has_application:
-            raise SystemExit(0)
-
-    if has_application:
-        simulator.og.app = SimpleNamespace(set_setting=set_setting)
-    native.close = close_environment
-    simulator.og.clear = clear
-    simulator.og.shutdown = shutdown
-    assert simulator.native_env is native
-    assert simulator.get_robot() is native.robot
-    with pytest.raises(RuntimeError, match="reset"):
-        simulator.get_metrics()
-    with pytest.raises(ValueError, match="env_index"):
-        simulator.get_robot(1)
-    simulator.reset()
-    native.fail_close = close_fails
-    if close_fails:
-        with pytest.raises(RuntimeError, match="native close failed"):
-            simulator.close()
-    elif has_application:
-        with pytest.raises(SystemExit) as shutdown_exit:
-            simulator.close()
-        assert shutdown_exit.value.code == 0
-    else:
-        simulator.close()
-    assert native.close_count == 1
-    assert len(shutdowns) == (0 if close_fails else 1)
-    expected_events = [("env_close",)]
-    if not close_fails:
-        expected_events.append(("shutdown", {"due_to_signal": True}))
-    assert settings["/app/fastShutdown"] is True
-    assert native.clear_count == 0
-    assert cleanup_events == expected_events
-    # Only the fake remains alive after terminal shutdown; access stays closed.
-    simulator.close()
-    assert native.close_count == 1
-    assert len(shutdowns) == (0 if close_fails else 1)
-    assert cleanup_events == expected_events
-    for operation in (
-        lambda: simulator.native_env,
-        simulator.get_robot,
-        simulator.get_robot_state,
-        simulator.get_camera_metadata,
-        simulator.get_metrics,
-        simulator.reset,
-        lambda: simulator.step(torch.zeros((1, 23))),
-    ):
-        with pytest.raises(RuntimeError, match="closed"):
-            operation()
-
-
-def test_local_behavior_rejects_cross_thread_native_access(local_behavior_simulator):
-    simulator, native, _, _ = local_behavior_simulator
-    simulator.reset()
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        pending = executor.submit(simulator.get_robot)
-        with pytest.raises(RuntimeError, match="constructing thread"):
-            pending.result()
-    assert simulator.get_robot() is native.robot
-    assert native.physics_steps == 0
-
-
-@pytest.mark.parametrize("already_running", [False, True])
-def test_local_behavior_constructor_owns_only_its_application(
-    monkeypatch, already_running
-):
-    resource = SimpleNamespace(active=already_running, stops=0, clears=0, shutdowns=0)
-
-    def stop():
-        resource.stops += 1
-        raise RuntimeError("secondary stop failure")
-
-    og = SimpleNamespace(
-        __version__="3.9.3",
-        __file__="/tmp/fake-omnigibson/__init__.py",
-        sim=SimpleNamespace(stop=stop) if already_running else None,
-        app=None,
-    )
-
-    def create_environment(**kwargs):
-        resource.active = True
-        og.sim = SimpleNamespace(stop=stop)
-        raise RuntimeError("environment initialization failed")
-
-    def clear():
-        resource.clears += 1
-
-    def shutdown(**kwargs):
-        assert kwargs == {"due_to_signal": True}
-        resource.shutdowns += 1
-        raise SystemExit("shutdown would conceal the construction error")
-
-    og.Environment = create_environment
-    og.clear = clear
-    og.shutdown = shutdown
-    monkeypatch.setitem(sys.modules, "omnigibson", og)
-    monkeypatch.setattr(behavior_env, "configure_macros", lambda cfg: None)
-    monkeypatch.setattr(behavior_env, "make_environment_config", lambda *args: {})
-    monkeypatch.setattr(
-        behavior_env,
-        "ActivityInstanceLoader",
-        lambda *args: SimpleNamespace(
-            activity_name="turning_on_radio",
-            instance_id=301,
-            initial_config=lambda config: config,
-        ),
-    )
-    expected = (
-        "already exists" if already_running else "environment initialization failed"
-    )
-    with pytest.raises(RuntimeError, match=expected):
-        simulator = BehaviorSimulator.__new__(BehaviorSimulator)
-        simulator.__init__(OmegaConf.create({}))
-    assert (
-        resource.active
-    )  # Only the owning process can reclaim these failed SDK resources.
-    assert resource.stops == (0 if already_running else 1)
-    assert resource.clears == resource.shutdowns == 0
-    if not already_running:
-        with pytest.raises(RuntimeError, match="closed"):
-            _ = simulator.native_env
 
 
 def test_generated_tro_uses_scene_scope_and_round_trips_robot_pose(

@@ -16,18 +16,15 @@ from __future__ import annotations
 
 from omnigibson.envs import Environment, EnvironmentWrapper
 
-from rlinf.envs.sim.behavior.utils import RGB_RESOLUTIONS, set_head_camera_aperture
+from rlinf.envs.sim.behavior.utils import CAMERA_LINKS
 
 
 class RGBWrapper(EnvironmentWrapper):
     """A RGB-only wrapper for OmniGibson."""
 
-    @classmethod
-    def camera_spec(cls) -> dict:
-        """Declare resolutions before the SDK creates its batched cameras."""
-        return {"modalities": ["rgb"], "resolution": dict(RGB_RESOLUTIONS)}
-
     def __init__(self, env: Environment):
         super().__init__(env=env)
         for scene in env.scenes:
-            set_head_camera_aperture(scene.robots[0])
+            robot = scene.robots[0]
+            sensor_name = f"{robot.name}:{CAMERA_LINKS['head']}"
+            robot.sensors[sensor_name].horizontal_aperture = 40.0

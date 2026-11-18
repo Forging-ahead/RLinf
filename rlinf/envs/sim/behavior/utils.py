@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from copy import deepcopy
-from pathlib import Path
+import os
 
 import torch
+import yaml
 from omegaconf import DictConfig, OmegaConf
+
+from rlinf.utils.logging import get_logger
 
 SUPPORTED_ENV_WRAPPERS = ("rgb", "default", "rgb_lowres", "rich_obs")
 
@@ -59,6 +61,45 @@ R1PRO_PROPRIO_KEYS = [
 ]
 
 
+CAMERA_LINKS = {
+    "head": "zed_link:Camera:0",
+    "left_wrist": "left_realsense_link:Camera:0",
+    "right_wrist": "right_realsense_link:Camera:0",
+}
+
+
+def set_camera_resolution(robot: DictConfig, camera_cfg, wrapper_name) -> None:
+    """Set per-sensor resolution before OmniGibson creates its batched cameras."""
+    for role, link in CAMERA_LINKS.items():
+        key = "head_resolution" if role == "head" else "wrist_resolution"
+        resolution = camera_cfg.get(key)
+        if wrapper_name == "rgb_lowres":
+            resolution = (224, 224)
+        elif resolution is None and wrapper_name is not None:
+            resolution = (720, 720) if role == "head" else (480, 480)
+        if resolution is not None:
+            if len(resolution) != 2 or min(resolution) <= 0:
+                raise ValueError(f"Invalid {role} resolution: {resolution!r}")
+            OmegaConf.update(
+                robot,
+                f"sensor_config.{link}.sensor_kwargs",
+                {"image_height": resolution[0], "image_width": resolution[1]},
+            )
+
+
+def apply_runtime_renderer_settings() -> None:
+    """
+    RLinf-specific renderer overrides after OmniGibson has launched.
+    """
+
+    import omnigibson.lazy as lazy
+
+    lazy.carb.settings.get_settings().set_float(
+        "/rtx-transient/resourcemanager/texturestreaming/memoryBudget",
+        0.1,
+    )
+
+
 def convert_uint8_rgb(image: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(image):
         image = torch.as_tensor(image)
@@ -77,179 +118,168 @@ def convert_uint8_rgb(image: torch.Tensor) -> torch.Tensor:
     return image[..., :3]
 
 
-INSTANCE_KEYS = (
-    "activity_instance_dir",
-    "instance_resample_mode",
-    "instance_file_format",
-    "instance_split",
-)
-CAMERA_LINKS = {
-    "head": "zed_link:Camera:0",
-    "left_wrist": "left_realsense_link:Camera:0",
-    "right_wrist": "right_realsense_link:Camera:0",
-}
+def apply_env_wrapper(env, wrapper_name: str | None):
+    if wrapper_name is None:
+        return env
+    from .rgb_wrapper import RGBWrapper
+
+    # All profiles use the same RGB optics. setup_omni_cfg sets their other
+    # modalities and camera dimensions before constructing the batched env.
+    return RGBWrapper(env)
 
 
-RGB_RESOLUTIONS = {
-    "head": (720, 720),
-    "left_wrist": (480, 480),
-    "right_wrist": (480, 480),
-}
-
-
-def set_head_camera_aperture(robot) -> None:
-    """Apply the R1Pro head camera optics used by the model."""
-    name = f"{robot.name}:{CAMERA_LINKS['head']}"
-    if name not in robot.sensors:
-        raise ValueError(f"R1Pro head camera is absent: {name}")
-    robot.sensors[name].horizontal_aperture = 40.0
-
-
-def make_environment_config(
-    cfg: DictConfig, num_envs: int, omnigibson_path: str
-) -> dict:
-    """Keep RLinf overrides, with canonical 3.9.3 robot and camera settings.
-
-    The official evaluation driver is deliberately not constructed here: it
-    unconditionally chooses its own scene, rates, robot mass, and camera profile.
-    """
-    base_name = OmegaConf.select(cfg, "base_config_name", default="r1pro_behavior")
-    base = OmegaConf.load(str(Path(omnigibson_path) / "configs" / f"{base_name}.yaml"))
-    overrides = OmegaConf.select(cfg, "omni_config")
-    if overrides is None:
-        raise ValueError("BEHAVIOR requires omni_config.")
-    # OmegaConf replaces lists. Merge the single robot separately so controller
-    # overrides do not accidentally discard the remaining robot configuration.
-    base_dict = OmegaConf.to_container(base, resolve=True)
-    override_dict = OmegaConf.to_container(overrides, resolve=True)
-    robots = override_dict.pop("robots", None)
-    if robots is None or len(robots) != 1:
-        raise ValueError("BEHAVIOR requires exactly one omni_config.robots entry.")
-    robot = OmegaConf.to_container(
-        OmegaConf.merge(base_dict["robots"][0], robots[0]), resolve=True
-    )
-    base_dict.pop("robots")
-    result = OmegaConf.to_container(
-        OmegaConf.merge(base_dict, override_dict), resolve=True
-    )
-    robot["model"] = str(robot.pop("type", robot.get("model", "r1pro"))).lower()
-    if robot["model"] != "r1pro":
-        raise ValueError(
-            "The RLinf legacy256 action/state contract requires model r1pro."
+def override_sub_cfg(omni_cfg: DictConfig, override_cfg: DictConfig, sub_attr: str):
+    omni_sub_cfg = OmegaConf.select(omni_cfg, sub_attr)
+    override_sub_cfg = OmegaConf.select(override_cfg, sub_attr)
+    if override_sub_cfg is not None:
+        setattr(
+            omni_cfg,
+            sub_attr,
+            override_sub_cfg
+            if omni_sub_cfg is None
+            else OmegaConf.merge(omni_sub_cfg, override_sub_cfg),
         )
+
+
+def setup_omni_cfg(cfg: DictConfig, num_envs: int = 1) -> DictConfig:
+    """
+    Setup OmniGibson's config, overrided by user-set config
+
+    Args:
+        cfg(DictConfig): rlinf's env config, must have `omni_config` field
+
+    Returns:
+        (DictConfig): overrided OmniGibson config
+    """
+    base_config_name = OmegaConf.select(
+        cfg, "base_config_name", default="r1pro_behavior"
+    )
+
+    import omnigibson as og
+    from omnigibson.macros import gm
+
+    override_cfg = OmegaConf.select(cfg, "omni_config")
+    cfg_path = os.path.join(og.example_config_path, f"{base_config_name}.yaml")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        omni_cfg = OmegaConf.create(yaml.load(f, Loader=yaml.FullLoader))
+    # override env/render/camera/robots/task/scene config
+    override_sub_cfg(omni_cfg, override_cfg, "env")
+    override_sub_cfg(omni_cfg, override_cfg, "render")
+    override_sub_cfg(omni_cfg, override_cfg, "camera")
+    override_sub_cfg(omni_cfg, override_cfg, "macro")
+    override_sub_cfg(omni_cfg, override_cfg, "task")
+    override_sub_cfg(omni_cfg, override_cfg, "scene")
+    for key in override_cfg:
+        if key not in ("env", "render", "camera", "macro", "task", "scene", "robots"):
+            override_sub_cfg(omni_cfg, override_cfg, key)
+    # here actually we only needs one robot config (and Behavior actually does do that)
+    # we must use update rather than merge to keep default robot config fields.
+    robot_override = OmegaConf.select(override_cfg, "robots[0]", default=None)
+    assert robot_override is not None and len(override_cfg.robots) == 1, (
+        "BEHAVIOR requires exactly one omni_config.robots entry."
+    )
+    OmegaConf.update(omni_cfg, "robots[0]", robot_override, merge=True)
+
+    override_proprio_obs = OmegaConf.select(
+        override_cfg, "robots[0].proprio_obs", default=None
+    )
+    if override_proprio_obs is None:
+        override_proprio_obs = R1PRO_PROPRIO_KEYS
+    OmegaConf.update(
+        omni_cfg, "robots[0].proprio_obs", override_proprio_obs, merge=True
+    )
+
+    # The 3.9.3 constructor identifies the robot by model and the plural
+    # self_collisions. The SDK example YAML still uses the old spellings.
+    robot = omni_cfg.robots[0]
+    robot.model = str(robot.pop("type", robot.get("model", "r1pro"))).lower()
+    if robot.model != "r1pro":
+        raise ValueError("RLinf BEHAVIOR requires the R1Pro robot.")
     robot.setdefault("name", "robot_r1")
-    # Correct the obsolete spelling in OmniGibson's example config. An explicit
-    # modern override always wins.
-    old_self_collision = robot.pop("self_collision", None)
-    if "self_collisions" not in robot and old_self_collision is not None:
-        robot["self_collisions"] = old_self_collision
-    proprio = robots[0].get("proprio_obs")
-    if proprio is None:
-        proprio = R1PRO_PROPRIO_KEYS
-    if list(proprio) != R1PRO_PROPRIO_KEYS:
+    if "self_collision" in robot:
+        robot.setdefault("self_collisions", robot.pop("self_collision"))
+    if list(override_proprio_obs) != R1PRO_PROPRIO_KEYS:
         from omnigibson.eval.utils.eval_utils import PROPRIOCEPTION_INDICES
 
-        if list(proprio) != list(PROPRIOCEPTION_INDICES["R1Pro"]):
-            raise ValueError(
-                "Use the RLinf or the official 2026 R1Pro proprio_obs field order."
-            )
-    robot["proprio_obs"] = list(proprio)
-    robot["obs_modalities"] = list(
-        dict.fromkeys([*robot.get("obs_modalities", []), "proprio", "rgb"])
-    )
-    result["robots"] = [robot]
+        if list(override_proprio_obs) != list(PROPRIOCEPTION_INDICES["R1Pro"]):
+            raise ValueError("Use the RLinf or official 2026 R1Pro proprio_obs order.")
 
-    env = result.setdefault("env", {})
-    wrapper = env.pop("env_wrapper", "rgb")
+    wrapper = omni_cfg.env.pop("env_wrapper", "rgb")
     if wrapper is not None and wrapper not in SUPPORTED_ENV_WRAPPERS:
-        raise ValueError(f"Unsupported BEHAVIOR observation wrapper: {wrapper!r}")
-    if env.get("automatic_reset", False):
         raise ValueError(
-            "Set omni_config.env.automatic_reset=false; RLinf owns reset and final observations."
+            f"Unsupported wrapper name: {wrapper}, expected one of {SUPPORTED_ENV_WRAPPERS}"
         )
-    if env.get("flatten_obs_space", False):
-        raise ValueError("RLinf BEHAVIOR requires flatten_obs_space=false.")
-    env["num_envs"] = int(num_envs)
-
-    # Sensor resolution must be final before native batched cameras are created.
-    camera = result.pop("camera", {}) or {}
-    sensor_config = robot.setdefault("sensor_config", {})
-    for role, link in CAMERA_LINKS.items():
-        resolution = camera.get(
-            "head_resolution" if role == "head" else "wrist_resolution"
+    if omni_cfg.env.get("automatic_reset") or omni_cfg.env.get("flatten_obs_space"):
+        raise ValueError(
+            "RLinf BEHAVIOR requires automatic_reset=false and flatten_obs_space=false."
         )
-        if wrapper == "rgb_lowres":
-            resolution = (224, 224)
-        elif wrapper is not None and resolution is None:
-            resolution = RGB_RESOLUTIONS[role]
-        if resolution is not None:
-            if len(resolution) != 2 or any(int(x) <= 0 for x in resolution):
-                raise ValueError(f"Invalid {role} resolution: {resolution!r}")
-            sensor = sensor_config.setdefault(link, {}).setdefault("sensor_kwargs", {})
-            sensor.update(
-                image_height=int(resolution[0]), image_width=int(resolution[1])
-            )
-    # These are the OLD RLinf wrapper names. In particular, old "default"
-    # provides depth/segmentation and is not the new evaluator's RGB-only
-    # DefaultWrapper. Declare additions before sensor construction.
-    additions = {
+    omni_cfg.env.num_envs = num_envs
+    extra_modalities = {
         "default": ("depth_linear", "seg_semantic", "seg_instance_id"),
         "rich_obs": ("normal", "flow"),
     }.get(wrapper, ())
-    robot["obs_modalities"] = list(
-        dict.fromkeys([*robot["obs_modalities"], *additions])
+    robot.obs_modalities = list(
+        dict.fromkeys(
+            [*robot.get("obs_modalities", []), "proprio", "rgb", *extra_modalities]
+        )
     )
-
-    task = result["task"]
-    # RLinf-only fields are consumed by ActivityInstanceLoader, never forwarded to the
-    # changed BehaviorTask constructor.
-    for key in INSTANCE_KEYS:
-        task.pop(key, None)
-    task.pop("predefined_problem", None)  # Removed by the compiled BDDL task API.
-    task.pop("debug_object_sampling", None)
-    task.setdefault("include_obs", False)
     if wrapper == "rich_obs":
-        task["include_obs"] = True
-    max_steps = OmegaConf.select(cfg, "max_episode_steps")
-    if max_steps is None or int(max_steps) < 1:
-        raise ValueError("max_episode_steps must be positive.")
-    # OmniGibson checks episode_steps before incrementing it in step().
-    task.setdefault("termination_config", {})["max_steps"] = int(max_steps) - 1
-    scene = result["scene"]
-    if scene.pop("partial_scene_load", False):
+        omni_cfg.task.include_obs = True
+    else:
+        omni_cfg.task.setdefault("include_obs", False)
+
+    # Instance selection belongs to RLinf; the 3.9.3 task constructor also
+    # dropped predefined_problem and debug_object_sampling.
+    for key in (
+        "activity_instance_dir",
+        "instance_resample_mode",
+        "instance_file_format",
+        "instance_split",
+        "predefined_problem",
+        "debug_object_sampling",
+    ):
+        omni_cfg.task.pop(key, None)
+
+    # 3.9.3 publishes task-specific room instances in the challenge metadata.
+    if omni_cfg.scene.pop("partial_scene_load", False):
         from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
 
-        try:
-            scene["load_room_instances"] = deepcopy(
-                TASK_NAMES_TO_ROOMS[task["activity_name"]]
-            )
-        except KeyError as exc:
-            raise ValueError(
-                f"No 2026 room metadata for task {task['activity_name']!r}."
-            ) from exc
-        scene["load_room_types"] = None
-    result.pop("macro", None)
-    return result
+        activity_name = omni_cfg.task.activity_name
+        if activity_name not in TASK_NAMES_TO_ROOMS:
+            raise ValueError(f"No 2026 room metadata for task {activity_name!r}.")
+        omni_cfg.scene.load_room_instances = TASK_NAMES_TO_ROOMS[activity_name]
+        omni_cfg.scene.load_room_types = None
+        get_logger().info(
+            f"Loaded task-relevant rooms for {activity_name}: {omni_cfg.scene.load_room_instances}"
+        )
 
+    # setup omnigibson macros, according to configuration yaml
+    for key, value in omni_cfg.pop("macro", {}).items():
+        # The old flatcache macro was removed in 3.9.3.
+        if key in (
+            "headless",
+            "enable_object_states",
+            "use_gpu_dynamics",
+            "enable_transition_rules",
+            "render_viewer_camera",
+            "use_numpy_controller_backend",
+        ):
+            setattr(gm, key.upper(), value)
 
-def configure_macros(cfg: DictConfig) -> None:
-    """Apply supported legacy macros before Environment launches the simulator."""
-    from omnigibson.macros import gm
+    # setup head/wrist camera resolutions
+    set_camera_resolution(robot, omni_cfg.pop("camera", {}) or {}, wrapper)
 
-    macro = OmegaConf.select(cfg, "omni_config.macro", default={})
-    mapping = {
-        "headless": "HEADLESS",
-        "enable_object_states": "ENABLE_OBJECT_STATES",
-        "use_gpu_dynamics": "USE_GPU_DYNAMICS",
-        "enable_transition_rules": "ENABLE_TRANSITION_RULES",
-        "render_viewer_camera": "RENDER_VIEWER_CAMERA",
-        "use_numpy_controller_backend": "USE_NUMPY_CONTROLLER_BACKEND",
-    }
-    for key, name in mapping.items():
-        if key in macro:
-            setattr(gm, name, bool(macro[key]))
-    # enable_flatcache has no equivalent in 3.9.3; the simulator now owns its
-    # state cache. Do not create a fake macro with no runtime effect.
+    # override behavior's termination config `max_steps` field
+    max_episode_steps = OmegaConf.select(cfg, "max_episode_steps")
+    if max_episode_steps is None or max_episode_steps < 1:
+        raise ValueError("max_episode_steps must be positive.")
+    OmegaConf.update(
+        omni_cfg,
+        "task.termination_config.max_steps",
+        max_episode_steps - 1,  # OmniGibson checks the counter before incrementing it.
+    )
+
+    return omni_cfg
 
 
 def validate_simulator_version(cfg: DictConfig) -> None:
@@ -259,14 +289,3 @@ def validate_simulator_version(cfg: DictConfig) -> None:
         raise ValueError(
             f"Unsupported BEHAVIOR simulator_version {version!r}; expected 3.9.3."
         )
-
-
-def setup_omni_cfg(cfg: DictConfig) -> DictConfig:
-    """Build a single-scene SDK configuration for instance generation."""
-    import omnigibson as og
-
-    validate_simulator_version(cfg)
-    configure_macros(cfg)
-    return OmegaConf.create(
-        make_environment_config(cfg, 1, str(Path(og.__file__).parent))
-    )

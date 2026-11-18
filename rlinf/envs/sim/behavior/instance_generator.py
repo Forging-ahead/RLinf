@@ -152,11 +152,12 @@ def build_sampling_omni_cfg(
     path = get_task_instance_path(scene, template, mode="train")
     if path is None:
         raise FileNotFoundError(f"Missing canonical 2026 task template: {template}")
-    omni_cfg.scene.scene_file = path
-    omni_cfg.scene.scene_instance = None
-    task.activity_instance_id = seed
-    task.online_object_sampling = False
-    task.use_presampled_robot_pose = False
+    OmegaConf.update(omni_cfg, "env.automatic_reset", False)
+    OmegaConf.update(omni_cfg, "task.activity_instance_id", seed)
+    OmegaConf.update(omni_cfg, "task.online_object_sampling", False)
+    OmegaConf.update(omni_cfg, "task.use_presampled_robot_pose", False)
+    OmegaConf.update(omni_cfg, "scene.scene_instance", None, merge=False)
+    OmegaConf.update(omni_cfg, "scene.scene_file", path, merge=False)
     for idx, _ in enumerate(OmegaConf.select(omni_cfg, "robots", default=[])):
         OmegaConf.update(
             omni_cfg,
@@ -186,13 +187,14 @@ def resolve_output_dir(omni_cfg: DictConfig, explicit_output_dir: str | None) ->
 
     from omnigibson.utils.asset_utils import get_dataset_path
 
-    scene_model = omni_cfg.scene.scene_model
+    scene_model = OmegaConf.select(omni_cfg, "scene.scene_model")
+    activity_name = OmegaConf.select(omni_cfg, "task.activity_name")
     return (
         Path(get_dataset_path("2026-challenge-task-instances"))
         / "scenes"
         / scene_model
         / "json"
-        / f"{scene_model}_task_{omni_cfg.task.activity_name}_instances"
+        / f"{scene_model}_task_{activity_name}_instances"
     )
 
 
@@ -248,7 +250,7 @@ def dump_tro_state(
         output_path: Target ``*_template-tro_state.json`` file.
         overwrite: Whether existing files may be overwritten.
         capture_current_robot_pose: When True, record the robot's *current*
-            base pose (so a subsequent ``ActivityInstanceLoader.load_tro_batch``
+            base pose (so a subsequent ``load_activity_instance_tro_state``
             restores where the robot is right now). When False (default),
             preserve the presampled ``robot_poses`` metadata used to bootstrap
             future resets. Offline sampling (``instance_generator.main``)
@@ -293,6 +295,10 @@ def dump_tro_state(
         tro_state[bddl_name] = state
     robot_poses = scene.get_task_metadata(key="robot_poses")
     if capture_current_robot_pose:
+        # Mid-rollout dump: overwrite the presampled pose entry with the
+        # robot's actual current scene-frame base pose, so a subsequent load
+        # restores where the robot is right now (otherwise the loader would
+        # teleport it back to the reset-time presampled pose).
         robot = env.task.get_agent(env, env_idx=0)
         cur_pos, cur_ori = robot.get_position_orientation(frame="scene")
         # The SDK selects the generic "robot" entry before a model-specific one.
@@ -348,9 +354,7 @@ def _validate_sample(env, scene_state, stable_scene, validate_task) -> None:
     """Validate the sampled scene with the SDK's single-scene sampling script."""
     from omnigibson.macros import gm
 
-    # The v3.9.3-post2 validation script expects a callback accepting
-    # (predicate, *entities). The batched task also requires the scene index.
-    # Bind the single generator scene without changing the live task callback.
+    # The sampling validator accepts unbatched predicates. Bind its one scene.
     validation_task = SimpleNamespace(
         _base_conditions=env.task._base_conditions,
         activity_initial_conditions=env.task.activity_initial_conditions,
