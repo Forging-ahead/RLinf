@@ -33,9 +33,18 @@ data:
   train_data_paths: /workspace/dataset/ci_behavior/dataset
   behavior_dataset_root: ${data.train_data_paths}
   repo_id: "behavior-1k/2026-challenge-demos"
+  modalities: ["rgb"]
   num_workers: 1
   tolerance_s: 1.0e-4
   tasks: ["turning_on_radio"]
+  # Set use_skill to train on the instruction for each annotated stage.
+  use_skill: false
+  task_subtasks:
+    turning_on_radio:
+      - "move to radio"
+      - "pick up radio from coffee table"
+      - "press radio"
+      - "place radio on coffee table"
 
 algorithm:
   adv_type: gae

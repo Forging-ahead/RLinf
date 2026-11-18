@@ -402,6 +402,8 @@ This recipe requires the `2026 challenge demonstrations <https://huggingface.co/
      repo_id: "behavior-1k/2026-challenge-demos"
      num_workers: 8
      tasks: ["turning_on_radio"]
+     modalities: ["rgb"]
+     use_skill: false
 
    actor:
      model:
@@ -412,7 +414,13 @@ This recipe requires the `2026 challenge demonstrations <https://huggingface.co/
        openpi_data:
          norm_stats_path: /path/to/norm_stats.json
 
-Each radio sample uses the instruction for ``turning_on_radio`` in ``meta/tasks.jsonl``.
+With ``use_skill: false``, every radio frame uses the main instruction from ``meta/tasks.jsonl``.
+To train on individual stages, set ``data.use_skill=true`` and select one task.
+Download the annotation files referenced by its episodes' ``annotation_path``. The loader
+uses the frame intervals in those files and the ordered labels in ``data.task_subtasks``.
+For example, the radio configuration supplies ``press radio`` for the third stage.
+Both modes use the head and two wrist RGB cameras.
+
 When evaluating the resulting policy, set
 ``omni_config.robots[0].proprio_obs`` to the SDK field order in
 ``PROPRIOCEPTION_INDICES["R1Pro"]`` so that the 61-value state includes

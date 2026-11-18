@@ -108,7 +108,7 @@ class _TransformedStreamingDataset(torch.utils.data.Dataset):
         return self._transform(self._dataset[idx])
 
     def __len__(self) -> int:
-        return len(self._dataset.hf_dataset)
+        return len(self._dataset)
 
 
 def _sft_collate(items) -> tuple[Observation, torch.Tensor]:
@@ -189,6 +189,12 @@ def create_behavior_sft_data_loader(
     seed: int,
     dist_rank: int,
     dist_world_size: int,
+    modalities: list[str] | None = None,
+    skill_labels: dict[int, str] | None = None,
+    use_skill: bool = False,
+    enable_gap: bool = True,
+    allow_left: int = 0,
+    allow_right: int = 0,
     data_kwargs: dict | None = None,
 ) -> "BehaviorSftDataLoader":
     """Build the BEHAVIOR-1K SFT data loader yielding ``(Observation, actions)``.
@@ -200,6 +206,12 @@ def create_behavior_sft_data_loader(
         config_name: openpi TrainConfig key (e.g. ``pi05_behavior``).
         repo_id: LeRobot dataset repo id (used for metadata bookkeeping).
         tasks: BEHAVIOR task names to include.
+        modalities: Visual modalities to read. OpenPI requires RGB.
+        skill_labels: Per-task text keyed by the annotation's skill index.
+        use_skill: Train on skill instructions for annotated frames.
+        enable_gap: Share gaps between adjacent skills and sample covered frames.
+        allow_left: Frames by which a skill window may extend to the left.
+        allow_right: Frames by which a skill window may extend to the right.
         action_dim: Model action dimension (metadata).
         action_horizon: Number of future action steps per sample.
         max_token_len: Maximum tokenized-prompt length (metadata).
@@ -221,7 +233,13 @@ def create_behavior_sft_data_loader(
         root=behavior_dataset_root,
         tolerance_s=tolerance_s,
         tasks=tasks or None,
+        modalities=modalities,
         action_horizon=action_horizon,
+        skill_labels=skill_labels,
+        use_skill=use_skill,
+        enable_gap=enable_gap,
+        allow_left=allow_left,
+        allow_right=allow_right,
         shuffle=shuffle,
         seed=seed,
         dist_rank=dist_rank,
@@ -333,12 +351,34 @@ def build_behavior_sft_dataloader(
     if data_kwargs is not None:
         data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
 
+    use_skill = bool(data_cfg.get("use_skill", False))
+    tasks = list(data_cfg.tasks)
+    skill_labels, enable_gap, allow_left, allow_right = None, True, 0, 0
+    if use_skill:
+        if len(tasks) != 1:
+            raise ValueError(
+                "openpi BEHAVIOR SFT use_skill:true supports exactly one task "
+                f"(the task-0000 skill recipe); got data.tasks={tasks}."
+            )
+        subtask_labels = data_cfg.get("task_subtasks")
+        labels = subtask_labels.get(tasks[0]) if subtask_labels else None
+        if not labels:
+            raise ValueError(
+                "openpi BEHAVIOR SFT use_skill:true requires the reference "
+                f"skill labels at data.task_subtasks.{tasks[0]}; none was configured."
+            )
+        skill_labels = {i: str(label) for i, label in enumerate(labels)}
+        # Fixed reference skill-window recipe (pi05_b1k-task0000_sft_local_skill);
+        # intentionally hardcoded so the reference recipe cannot drift via config.
+        enable_gap, allow_left, allow_right = True, 100, 100
+
     loader = create_behavior_sft_data_loader(
         behavior_dataset_root=str(data_cfg.behavior_dataset_root),
         model_path=str(model_cfg.model_path),
         config_name=config_name,
         repo_id=str(data_cfg.repo_id),
-        tasks=list(data_cfg.tasks),
+        tasks=tasks,
+        modalities=list(data_cfg.get("modalities", ["rgb"])),
         action_dim=int(model_cfg.openpi.model_action_dim),
         action_horizon=int(model_cfg.num_action_chunks),
         max_token_len=int(model_cfg.openpi.max_token_len),
@@ -349,6 +389,11 @@ def build_behavior_sft_dataloader(
         tolerance_s=float(data_cfg.tolerance_s),
         shuffle=not eval_dataset,
         seed=int(cfg.actor.seed),
+        skill_labels=skill_labels,
+        use_skill=use_skill,
+        enable_gap=enable_gap,
+        allow_left=allow_left,
+        allow_right=allow_right,
         dist_rank=rank,
         dist_world_size=world_size,
         data_kwargs=data_kwargs,

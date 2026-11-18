@@ -349,6 +349,8 @@ Pi0.5 + BEHAVIOR-1K
      repo_id: "behavior-1k/2026-challenge-demos"
      num_workers: 8
      tasks: ["turning_on_radio"]
+     modalities: ["rgb"]
+     use_skill: false
 
    actor:
      model:
@@ -359,7 +361,7 @@ Pi0.5 + BEHAVIOR-1K
        openpi_data:
          norm_stats_path: /path/to/norm_stats.json
 
-收音机示范的每条样本都使用 ``meta/tasks.jsonl`` 中与 ``turning_on_radio`` 对应的主任务指令。
+默认 ``use_skill: false``，同一段收音机示范的每一帧都使用 ``meta/tasks.jsonl`` 中的主任务指令。要按阶段训练，设置 ``data.use_skill=true``，选择一个任务，并下载该任务各段示范的 ``annotation_path`` 指向的标注文件。读取器用标注里的帧区间确定阶段，再按阶段编号取 ``data.task_subtasks`` 里的指令。例如，收音机配置给第三阶段的指令是 ``press radio``。两种模式都读取头部和左右手腕三路 RGB。
 
 评估这次训练的策略时，按 SDK 中 ``PROPRIOCEPTION_INDICES["R1Pro"]`` 的字段顺序设置 ``omni_config.robots[0].proprio_obs``，使 61 维状态中的底盘速度与训练数据一样采用机器人自身坐标系。
 

@@ -14,6 +14,8 @@
 
 """BEHAVIOR camera/state/prompt inputs at the shared OpenPI SFT boundary."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -82,7 +84,8 @@ def test_behavior_policy_maps_both_r1pro_layouts(dimension, indices):
     np.testing.assert_array_equal(extract_state_from_proprio(proprio), indices)
 
 
-def test_behavior_sft_selects_task_from_shared_shard(tmp_path):
+@pytest.fixture
+def shared_shard(tmp_path):
     from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 
     if CODEBASE_VERSION != "v3.0":
@@ -108,9 +111,16 @@ def test_behavior_sft_selects_task_from_shared_shard(tmp_path):
     (root / "meta/tasks.jsonl").write_text(
         '{"task_name":"turning_on_radio","task":"Turn on the radio."}\n'
     )
+    return root
 
+
+def test_behavior_sft_selects_task_from_shared_shard(shared_shard):
     dataset = BehaviorSftDataset(
-        "local/test", root, tasks=["turning_on_radio"], action_horizon=3, shuffle=False
+        "local/test",
+        shared_shard,
+        tasks=["turning_on_radio"],
+        action_horizon=3,
+        shuffle=False,
     )
     assert len(dataset) == 2
     first, last = dataset[0], dataset[1]
@@ -119,6 +129,59 @@ def test_behavior_sft_selects_task_from_shared_shard(tmp_path):
     np.testing.assert_array_equal(first["action"], [[10, -10], [11, -11], [11, -11]])
     np.testing.assert_array_equal(last["action"], [[11, -11]] * 3)
     np.testing.assert_array_equal(last["action_is_pad"], [False, True, True])
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_behavior_skill_uses_episode_annotation_and_preserves_actions(
+    shared_shard, streaming
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    (metadata_file,) = (shared_shard / "meta/episodes").rglob("*.parquet")
+    metadata = pq.read_table(metadata_file)
+    annotation_path = "annotations/task-0000/episode_00000020.json"
+    pq.write_table(
+        metadata.append_column(
+            "annotation_path", pa.array(["unused.json", annotation_path])
+        ),
+        metadata_file,
+    )
+    kwargs = {
+        "tasks": ["turning_on_radio"],
+        "action_horizon": 3,
+        "chunk_streaming_using_keyframe": streaming,
+        "shuffle": False,
+        "use_skill": True,
+        "skill_labels": {0: "move to radio", 1: "press radio"},
+    }
+    with pytest.raises(FileNotFoundError, match="episode_00000020.json"):
+        BehaviorSftDataset("local/test", shared_shard, **kwargs)
+    path = shared_shard / annotation_path
+    path.parent.mkdir(parents=True)
+    annotation = {
+        "meta_data": {"valid_duration": [0, 2]},
+        "skill_annotation": [
+            {"skill_idx": 0, "frame_duration": [0, 1]},
+            {"skill_idx": 1, "frame_duration": [1, 2]},
+        ],
+    }
+    path.write_text(json.dumps(annotation))
+    dataset = BehaviorSftDataset("local/test", shared_shard, **kwargs)
+    assert len(dataset) == 2
+    first, last = dataset[0], dataset[1]
+    assert first["task"] == last["task"] == "Turn on the radio."
+    assert first["prompt"] == "move to radio"
+    assert last["prompt"] == "press radio"
+    np.testing.assert_array_equal(first["action"], [[10, -10], [11, -11], [11, -11]])
+    np.testing.assert_array_equal(last["action_is_pad"], [False, True, True])
+
+    annotation["meta_data"]["valid_duration"] = [1, 2]
+    path.write_text(json.dumps(annotation))
+    dataset = BehaviorSftDataset("local/test", shared_shard, **kwargs)
+    assert len(dataset) == 1
+    assert int(dataset[0]["frame_index"]) == 1
+    assert dataset[0]["prompt"] == "press radio"
 
 
 def test_behavior_sft_rejects_v21(tmp_path):
