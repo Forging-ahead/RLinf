@@ -335,25 +335,26 @@ class BehaviorSimulator:
                         f"23-D RLinf action layout at [{start}:{stop}]."
                     )
             proprio, _ = robot.get_proprioception()
-            if proprio.shape != (256,):
-                raise ValueError(
-                    f"Expected legacy256 proprio, got {tuple(proprio.shape)}."
+            if proprio.shape == (256,):
+                # Validate the legacy positions against the live robot. The SDK
+                # defines the field order of its compact 61-value observation.
+                joints = robot.get_joint_positions()
+                checks = (
+                    (slice(158, 165), robot.arm_control_idx["left"]),
+                    (slice(193, 195), robot.gripper_control_idx["left"]),
+                    (slice(197, 204), robot.arm_control_idx["right"]),
+                    (slice(232, 234), robot.gripper_control_idx["right"]),
+                    (slice(236, 240), robot.trunk_control_idx),
                 )
-            # Validate field positions against live robot joint groupings, rather
-            # than accepting a 256-vector that happens to have the same size.
-            joints = robot.get_joint_positions()
-            checks = (
-                (slice(158, 165), robot.arm_control_idx["left"]),
-                (slice(193, 195), robot.gripper_control_idx["left"]),
-                (slice(197, 204), robot.arm_control_idx["right"]),
-                (slice(232, 234), robot.gripper_control_idx["right"]),
-                (slice(236, 240), robot.trunk_control_idx),
-            )
-            for region, indices in checks:
-                if not torch.allclose(proprio[region], joints[indices]):
-                    raise ValueError(
-                        f"R1Pro proprio field {region} no longer matches the RLinf model contract."
-                    )
+                for region, indices in checks:
+                    if not torch.allclose(proprio[region], joints[indices]):
+                        raise ValueError(
+                            f"R1Pro proprio field {region} no longer matches the RLinf model contract."
+                        )
+            elif proprio.shape != (61,):
+                raise ValueError(
+                    f"Unexpected R1Pro state shape {tuple(proprio.shape)}."
+                )
             wrapper = OmegaConf.select(
                 self.cfg, "omni_config.env.env_wrapper", default="rgb"
             )
@@ -371,7 +372,11 @@ class BehaviorSimulator:
     ) -> list[dict]:
         for observation, index in zip(observations, indices, strict=True):
             robot = self.env.scenes[index].robots[0]
-            proprio = observation[robot.name]["proprio"].clone()
+            proprio = observation[robot.name]["proprio"]
+            if proprio.shape == (61,):
+                # The 2026 demos record the SDK's native robot-frame base velocity.
+                continue
+            proprio = proprio.clone()
             if proprio.shape != (256,):
                 raise ValueError(
                     f"Expected legacy256 proprio, got {tuple(proprio.shape)}."

@@ -56,7 +56,9 @@ class FakeBehaviorPool:
         self.cfg = cfg
         self.num_envs = num_envs
         self.seed = seed
-        self.activity_name = "turning_on_radio"
+        self.activity_name = OmegaConf.select(
+            cfg, "omni_config.task.activity_name", default="turning_on_radio"
+        )
         self.steps = torch.zeros(num_envs, dtype=torch.int64)
         self.reset_calls = []
         self.actions = []
@@ -276,8 +278,9 @@ def test_behavior_reset_defers_official_score_until_first_step(make_behavior_env
     assert infos[-1]["episode"]["q_score"].item() == 0.5
 
 
-def test_behavior_reset_preserves_worker_observations(make_behavior_env):
-    env = make_behavior_env()
+@pytest.mark.parametrize("task", ["turning_on_radio", "freeze_fruit"])
+def test_behavior_reset_preserves_worker_observations(make_behavior_env, task):
+    env = make_behavior_env(omni_config={"task": {"activity_name": task}})
     obs, info = env.reset()
 
     assert set(obs) == {"main_images", "wrist_images", "states", "task_descriptions"}
@@ -603,15 +606,16 @@ def test_behavior_actor_python_command_runs_with_shell_characters_in_path(
     inline_behavior_actors, monkeypatch, tmp_path
 ):
     processes, _ = inline_behavior_actors
-    python_dir = tmp_path / "Rpent&behavior tools"
+    python_dir = tmp_path / "simulator & tools"
     python_dir.mkdir()
     python_path = python_dir / "python"
     python_path.symlink_to(sys.executable)
     monkeypatch.setattr(behavior_env.sys, "executable", str(python_path))
     pool = behavior_env.BehaviorProcessPool(
-        OmegaConf.create({"auto_reset": False}), num_envs=1, seed=40
+        OmegaConf.create({"auto_reset": False}), num_envs=2, seed=40
     )
     try:
+        assert len(processes) == 1
         command = processes[0].actor_options["runtime_env"]["py_executable"]
         assert shlex.split(command) == [str(python_path)]
         result = subprocess.run(
@@ -752,6 +756,17 @@ def test_legacy_velocity_is_raw_joint_velocity_not_rotated_proprio():
     assert torch.equal(converted[253:256], torch.tensor([1.0, 2.0, 3.0]))
     assert torch.equal(converted[:253], native[:253])
     assert torch.equal(native[253:256], torch.tensor([253.0, 254.0, 255.0]))
+
+
+def test_official_proprio_keeps_robot_frame_base_velocity():
+    backend = backend_without_simulator()
+    backend.env = SimpleNamespace(
+        scenes=[SimpleNamespace(robots=[SimpleNamespace(name="robot_r1")])]
+    )
+    native = torch.arange(61, dtype=torch.float32)
+    observation = {"robot_r1": {"proprio": native}}
+    result = backend._legacy_observations([observation], [0])
+    torch.testing.assert_close(result[0]["robot_r1"]["proprio"], native)
 
 
 @pytest.mark.parametrize(

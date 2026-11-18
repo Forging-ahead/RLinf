@@ -10,10 +10,7 @@ Environment Setup
 
 **Install dependencies**
 
-.. code-block:: bash
-
-   bash requirements/install.sh embodied --model openpi --env behavior
-   source .venv/bin/activate
+These evaluation steps assume a working OpenPI and BEHAVIOR runtime. The published OpenPI package requires PyTorch 2.7.1 and Isaac Sim 5.1 requires 2.7.0, so the standard single-environment installation is blocked. See :doc:`../../examples/embodied/behavior` for model compatibility.
 
 ``evaluations/behavior/`` currently ships an OpenPI π₀.₅ example only. Training also supports OpenVLA-OFT; you can derive an eval YAML from ``examples/embodiment/config/`` (see :doc:`../reference/configuration`).
 
@@ -23,7 +20,7 @@ BEHAVIOR depends on Isaac Sim 5.1 and has additional GPU and driver requirements
 
 - Isaac Sim 5.1 requires an RTX-capable GPU. NVIDIA lists the RTX 4080 as the minimum for x86-64 and does not support the A100 or H100, which lack RT cores.
 
-For Docker, build the OpenPI image from this checkout as shown in :doc:`../../examples/embodied/behavior`.
+The RLinf OpenPI image for BEHAVIOR 3.9.3 is pending release.
 
 **Environment variables**
 
@@ -31,13 +28,9 @@ Set the OmniGibson data path for the 2026 assets before each run:
 
 .. code-block:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
-   export OMNIGIBSON_DATASET_PATH=${OMNIGIBSON_DATA_PATH}/behavior-1k-assets/
-   export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson.key
-   export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson-robot-assets/
 
-BEHAVIOR assets exceed 30 GB; see the "Resource download" section in :doc:`../../examples/embodied/behavior` for download and license setup.
+For asset downloads and first-run license setup, see “Download the Assets” in :doc:`../../examples/embodied/behavior`.
 
 Example Configs
 ---------------
@@ -60,16 +53,12 @@ If ``evaluations/behavior/<config>.yaml`` is missing, ``run_eval.sh`` falls back
 End-to-End Workflow
 -------------------
 
-**Step 1: Activate the environment and set paths**
+**Step 1: Activate the environment and set the data path**
 
 .. code-block:: bash
 
    source .venv/bin/activate
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
-   export OMNIGIBSON_DATASET_PATH=${OMNIGIBSON_DATA_PATH}/behavior-1k-assets/
-   export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson.key
-   export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson-robot-assets/
 
 **Step 2: Prepare the model**
 
@@ -97,12 +86,12 @@ The terminal prints ``eval/success_once``; see :doc:`../reference/results` for l
 Evaluation Configuration
 --------------------------
 
-BEHAVIOR evaluation runs **one task per launch** (selected by ``omni_config.task.activity_name``). A single run does not automatically sweep all 50 tasks. The fields below control parallel scale, trajectory length, and initial scene instances.
+BEHAVIOR evaluation runs **one task per launch** (selected by ``omni_config.task.activity_name``). The fields below control parallel scale, trajectory length, and initial scene instances.
 
 Evaluation protocol
 ~~~~~~~~~~~~~~~~~~~
 
-BEHAVIOR-1K defines 50 household tasks (names listed in ``rlinf/envs/sim/behavior/behavior_task.jsonl``). The ``behavior_r1pro`` preset defaults to ``turning_on_radio`` on scene ``house_double_floor_lower``.
+The `2026 BEHAVIOR Challenge <https://behavior.stanford.edu/challenge/tasks/index.html>`_ includes 100 household tasks. Set ``omni_config.scene.scene_model`` to the scene for the selected task. The ``behavior_r1pro`` preset defaults to ``turning_on_radio`` on scene ``house_double_floor_lower``.
 
 Each evaluation trajectory is determined by:
 
@@ -114,7 +103,7 @@ Each evaluation trajectory is determined by:
 
 - ``disabled`` (default): every reset loads the fixed instance for ``activity_instance_id``; if ``activity_instance_dir`` is set, the matching JSON is read from that directory.
 - ``offline``: every reset **randomly** picks a cached instance from the configured split or ``activity_instance_dir`` (download official ``2026-challenge-task-instances`` or generate files with ``instance_generator.py``).
-- ``online``: online object resampling on reset (one scene per process; use no cached instances; requires ``online_object_sampling: True`` and ``use_presampled_robot_pose: False``; slower startup).
+- ``online``: generate a new arrangement at reset. Give each environment its own simulator process, leave ``activity_instance_dir`` and ``instance_split`` unset, and set ``online_object_sampling: True`` and ``use_presampled_robot_pose: False``.
 
 .. note::
 
@@ -138,7 +127,7 @@ Generic ``env.eval`` fields
    * - ``max_steps_per_rollout_epoch``
      - Total interaction steps per rollout round; **must be divisible by** ``rollout.model.num_action_chunks``. Without ``auto_reset``, usually equals ``max_episode_steps``.
    * - ``num_env_subprocess``
-     - Simulator processes per env worker. Set one process per environment for independent resets. An explicit count must divide the local env count.
+     - Simulator processes per local environment worker (preset default ``1``). Use one process per environment for automatic resets or online sampling.
    * - ``skip_intermediate_renders``
      - When ``True``, skips intermediate observations inside action chunks for faster stepping; saved videos only contain chunk-boundary frames.
 
@@ -204,6 +193,8 @@ Advanced Usage
 
 **Adjust parallel scale**
 
+This example assumes one environment worker hosts all four environments and runs them in two simulator processes.
+
 .. code-block:: bash
 
    bash evaluations/run_eval.sh behavior behavior_openpi_pi05_eval \
@@ -216,6 +207,7 @@ Advanced Usage
 .. code-block:: bash
 
    bash evaluations/run_eval.sh behavior_ppo_openpi_pi05 \
+     runner.only_eval=True \
      rollout.model.model_path=/path/to/model
 
 FAQ

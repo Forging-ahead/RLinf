@@ -748,15 +748,6 @@ configure_nvidia() {
             echo "[install.sh] Could not resolve a driver-compatible CUDA wheel for torch ${_torch_ver}; leaving torch on the default index (UV_TORCH_BACKEND=${UV_TORCH_BACKEND})." >&2
         fi
     fi
-    if [ "$ENV_NAME" = "behavior" ]; then
-        # Official setup uses pip to replace uv-installed packages.
-        export UV_LINK_MODE=copy
-        # Match the official 5.1 SDK CUDA line, including GPU-less image builds.
-        PLATFORM_TORCH_STR="+cu128"
-        PLATFORM_TORCH_INDEX="https://download.pytorch.org/whl/cu128"
-        PLATFORM_TORCH_PACKAGES=("torch" "torchvision" "torchaudio")
-        export UV_TORCH_BACKEND=cu128
-    fi
 }
 
 configure_amd() {
@@ -3856,111 +3847,37 @@ install_liberoplus_env() {
     reset_libero_config
 }
 
-validate_behavior_install() {
-    [ "$ENV_NAME" = "behavior" ] || return 0
-    if [ "$PLATFORM" != "nvidia" ] || [ "$(uname -s)" != "Linux" ]; then
-        echo "BEHAVIOR 3.9.3 requires Linux and an NVIDIA RTX GPU." >&2
-        return 1
-    fi
-    if [[ "$PYTHON_VERSION" != 3.11* ]]; then
-        echo "BEHAVIOR 3.9.3 requires --python 3.11.x." >&2
-        return 1
-    fi
-    local expected_torch="2.7.0"
-    if [ -n "$TORCH_VERSION" ] && [ "$TORCH_VERSION" != "$expected_torch" ]; then
-        echo "BEHAVIOR 3.9.3 requires torch ${expected_torch} for this install profile; omit --torch." >&2
-        return 1
-    fi
-}
-
 install_behavior_env() {
     # Use BEHAVIOR_PATH as the checkout location if set (shared, cloned on first use);
     # otherwise clone into the venv.
-    local behavior_dir
-    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_PATH "$VENV_DIR/BEHAVIOR-1K" https://github.com/StanfordVL/BEHAVIOR-1K.git -b v3.9.3-post2 --depth 1)
-    local expected_ref="a8247a8cc1633fe1ca0cc66aa07243d46c64f155"
-    if [ "$(git -C "$behavior_dir" rev-parse HEAD)" != "$expected_ref" ]; then
-        echo "BEHAVIOR_PATH must point to v3.9.3-post2 (${expected_ref})." >&2
+    local behavior_dir sdk_tag="v3.9.3-post2"
+    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_PATH "$VENV_DIR/BEHAVIOR-1K" https://github.com/StanfordVL/BEHAVIOR-1K.git -b "$sdk_tag" --depth 1)
+    if ! git -C "$behavior_dir" describe --exact-match --tags --match "$sdk_tag" HEAD >/dev/null 2>&1; then
+        echo "BEHAVIOR checkout must point to $sdk_tag: $behavior_dir" >&2
         return 1
     fi
-    local source_dir="$behavior_dir"
-    behavior_dir=$(clone_or_reuse_repo BEHAVIOR_BUILD_PATH "$VENV_DIR/BEHAVIOR-1K-install" "$source_dir" --no-local -b v3.9.3-post2 --depth 1)
-    if [ "$behavior_dir" -ef "$source_dir" ] || [ "$(git -C "$behavior_dir" rev-parse HEAD)" != "$expected_ref" ]; then
-        echo "BEHAVIOR_BUILD_PATH must be a separate v3.9.3-post2 checkout." >&2
-        return 1
-    fi
-    # release/b1k now requires Python 3.12. Pin its Python 3.11-compatible
-    # revision in an installation copy, leaving a supplied SDK checkout alone.
-    python - "$behavior_dir/OmniGibson/setup.py" <<'PIN'
-from pathlib import Path
-import sys
 
-path = Path(sys.argv[1])
-source = path.read_text()
-url = "git+https://github.com/wensi-ai/lerobot@"
-old = url + "release/b1k"
-new = url + "436812bd8ee39b768c645c248c91f1330834e687"
-if old not in source and new not in source:
-    raise RuntimeError("Unexpected LeRobot dependency in BEHAVIOR v3.9.3-post2")
-path.write_text(source.replace(old, new))
-PIN
+    # The SDK depends on LeRobot's release/b1k branch, which now requires Python 3.12.
+    # Pin its Python 3.11 revision in the venv, leaving a shared checkout untouched.
+    if [ -n "${BEHAVIOR_PATH:-}" ] || [ -L "$VENV_DIR/BEHAVIOR-1K" ]; then
+        local checkout="$behavior_dir"
+        behavior_dir="$VENV_DIR/BEHAVIOR-1K-$sdk_tag"
+        if [ "$behavior_dir" -ef "$checkout" ] || [ -L "$behavior_dir" ]; then
+            echo "The venv installation directory must be separate from BEHAVIOR_PATH." >&2
+            return 1
+        fi
+        mkdir -p "$behavior_dir"
+        git -C "$checkout" archive "$sdk_tag" | tar -x -C "$behavior_dir"
+    fi
+    pushd "$behavior_dir" >/dev/null
+    sed -i 's|wensi-ai/lerobot@release/b1k|wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687|' OmniGibson/setup.py
     uv pip install pip "setuptools>=71,<81" wheel
-    # This release has no --use-uv option. Reuse an existing 5.1 runtime;
-    # otherwise the official setup installs its simulator wheels.
-    if OMNI_KIT_ACCEPT_EULA=YES python -c 'import importlib.metadata as m; from pathlib import Path; assert m.version("isaacsim").startswith("5.1.0"); import isaacsim; assert (Path(isaacsim.__file__).parent / "apps").is_dir()' >/dev/null 2>&1; then
-        echo "Reusing installed Isaac Sim 5.1 runtime."
-    else
-        pushd "$behavior_dir" >/dev/null
-        env -u EXP_PATH -u CARB_APP_PATH -u ISAAC_PATH \
-            bash setup.sh --omnigibson --bddl --confirm-no-conda --accept-nvidia-eula
-        popd >/dev/null
-    fi
-    # A system-site runtime must remain complete. Installing only core/kernel
-    # in the child venv shadows its apps and other extension distributions.
-    local isaac_specs
-    isaac_specs=$(python - <<'SDK_DEPS'
-import importlib.metadata as metadata
-from pathlib import Path
-import sys
-
-core = metadata.distribution("isaacsim-core")
-if Path(core.locate_file("")).resolve().is_relative_to(Path(sys.prefix).resolve()):
-    print("isaacsim-core==5.1.0.0")
-else:
-    for name in ("isaacsim-core", "isaacsim-kernel"):
-        for requirement in metadata.requires(name) or []:
-            if not requirement.lower().replace("_", "-").startswith("isaacsim-"):
-                print(requirement)
-SDK_DEPS
-)
-    local isaac_requirements=()
-    mapfile -t isaac_requirements <<< "$isaac_specs"
-    # Include the original model environment requirements in the same solve.
-    # Otherwise updating the SDK can silently replace dependencies of the model.
-    local model_requirements=()
-    if [ -n "$MODEL" ]; then
-        model_requirements+=(--extra embodied)
-    fi
-    if [ "$MODEL" = "openpi" ]; then
-        model_requirements+=("rlinf-openpi==0.1.1")
-    fi
-    uv pip install --no-config --no-build-isolation --index https://pypi.nvidia.com \
-        -r "$PYPROJECT_FILE" "${model_requirements[@]}" "${RAY_COMPAT_DEPS[@]}" "imageio[ffmpeg]" \
-        -e "$behavior_dir/OmniGibson" -e "$behavior_dir/bddl3" "${isaac_requirements[@]}" \
-        "lerobot[dataset] @ git+https://github.com/wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687"
-    if [ -z "$NO_INSTALL_RLINF_CMD" ]; then
-        uv pip install --no-deps -e "$(dirname "$PYPROJECT_FILE")"
-    fi
-    python - <<'CHECK'
-import importlib.metadata as metadata
-import sys
-
-assert sys.version_info[:2] == (3, 11), "BEHAVIOR 3.9.3 requires Python 3.11"
-for name, expected in (("omnigibson", "3.9.3"), ("isaacsim", "5.1.0"), ("torch", "2.7.0")):
-    version = metadata.version(name)
-    if not version.startswith(expected):
-        raise RuntimeError(f"{name} must be {expected}, found {version}")
-CHECK
+    ./setup.sh --omnigibson --bddl --joylo --confirm-no-conda --accept-nvidia-eula
+    popd >/dev/null
+    # These models install their Torch dependencies before the SDK runs pip.
+    case "$MODEL" in
+        openpi|openvla-oft) uv pip check ;;
+    esac
 }
 
 install_geniesim_env() {
@@ -4860,7 +4777,6 @@ main() {
         echo "--paddle-gpu is only supported with 'embodied --model diffusion'." >&2
         exit 1
     fi
-    validate_behavior_install
     validate_python_version
     validate_engine
     apply_model_default_torch

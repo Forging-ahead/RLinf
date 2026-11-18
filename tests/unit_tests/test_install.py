@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from shlex import quote
 
 import pytest
 
@@ -22,19 +23,6 @@ def run_functions(body: str) -> subprocess.CompletedProcess:
         text=True,
         capture_output=True,
     )
-
-
-@pytest.mark.parametrize(
-    "python,torch,platform",
-    [("3.10", "", "nvidia"), ("3.11.14", "2.8.0", "nvidia"), ("3.11.14", "", "amd")],
-)
-def test_incompatible_behavior_stack_fails_before_install(python, torch, platform):
-    result = run_functions(
-        f'ENV_NAME=behavior; PYTHON_VERSION={python}; TORCH_VERSION="{torch}"; PLATFORM={platform}\n'
-        "uname() { echo Linux; }\nvalidate_behavior_install\n"
-    )
-    assert result.returncode != 0
-    assert "BEHAVIOR 3.9.3 requires" in result.stderr
 
 
 def test_behavior_selects_sdk_torch_version():
@@ -55,7 +43,7 @@ def test_behavior_install_reuses_common_helpers():
         "python() { cat >/dev/null; echo 3.11; }\n"
         "cp() { return 0; }\n"
         "bash() { return 0; }\n"
-        'ENV_NAME=behavior\ninstall_openpi_model\n'
+        "ENV_NAME=behavior\ninstall_openpi_model\n"
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[:2] == ["CREATE", "COMMON"]
@@ -63,89 +51,48 @@ def test_behavior_install_reuses_common_helpers():
     assert "UV pip install rlinf-openpi==0.1.1" in result.stdout
 
 
-def test_wrong_reused_sdk_checkout_does_not_run_setup(tmp_path):
-    marker = tmp_path / "setup-ran"
-    result = run_functions(
-        f'clone_or_reuse_repo() {{ echo "{tmp_path}"; }}\n'
-        "git() { echo wrong-revision; }\n"
-        f'bash() {{ touch "{marker}"; }}\n'
-        "install_behavior_env\n"
-    )
-    assert result.returncode != 0
-    assert "BEHAVIOR_PATH must point to" in result.stderr
-    assert not marker.exists()
+@pytest.mark.skipif(sys.platform != "linux", reason="BEHAVIOR installer runs on Linux")
+@pytest.mark.parametrize("shared", [True, False])
+def test_sdk_setup_pins_the_dependency_in_the_venv(tmp_path, shared):
+    venv = tmp_path / "venv"
+    source = tmp_path / "shared" if shared else venv / "BEHAVIOR-1K"
+    source.mkdir(parents=True)
+    metadata = source / "OmniGibson/setup.py"
+    metadata.parent.mkdir()
+    dependency = "lerobot[dataset] @ git+https://github.com/wensi-ai/lerobot@"
+    metadata.write_text(dependency + "release/b1k\n")
+    setup = source / "setup.sh"
+    setup.write_text('#!/bin/bash\ncat OmniGibson/setup.py\necho "setup $*"\n')
+    setup.chmod(0o755)
+    for args in (
+        ["init", "-q"],
+        ["add", "."],
+        [
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "release",
+        ],
+        ["tag", "v3.9.3-post2"],
+    ):
+        subprocess.run(["git", *args], cwd=source, check=True)
 
-
-@pytest.mark.parametrize("checkout", ["separate", "same", "symlink"])
-def test_sdk_dependency_pin_preserves_supplied_source(tmp_path, checkout):
-    same_checkout = checkout != "separate"
-    original = tmp_path / "supplied"
-    build = original if checkout == "same" else tmp_path / "installation"
-    dependency = "git+https://github.com/wensi-ai/lerobot@release/b1k"
-    for directory in {original} if same_checkout else {original, build}:
-        (directory / "OmniGibson").mkdir(parents=True)
-        (directory / "OmniGibson/setup.py").write_text(dependency)
-        (directory / "setup.sh").write_text("exit 42\n")
-    if checkout == "symlink":
-        build.symlink_to(original, target_is_directory=True)
-    body = (
-        f'clone_or_reuse_repo() {{ if [ "$1" = BEHAVIOR_PATH ]; then echo "{original}"; else echo "{build}"; fi; }}\n'
-        "git() { echo a8247a8cc1633fe1ca0cc66aa07243d46c64f155; }\n"
-        "uv() { return 0; }\n"
-        'python() { if [ "$1" = "-c" ]; then return 1; fi; command python "$@"; }\n'
-        "install_behavior_env\n"
-    )
     for _ in range(2):
-        result = run_functions(body)
-        assert result.returncode == (1 if same_checkout else 42), result.stderr
-        assert (original / "OmniGibson/setup.py").read_text() == dependency
-    if not same_checkout:
+        result = run_functions(
+            f"VENV_DIR={quote(str(venv))}\n"
+            f"export BEHAVIOR_PATH={quote(str(source)) if shared else ''}\n"
+            'uv() { echo "uv $*"; }\n'
+            "MODEL=openpi\ninstall_behavior_env\n"
+        )
+        assert result.returncode == 0, result.stderr
+        assert dependency + "436812bd8ee39b768c645c248c91f1330834e687" in result.stdout
         assert (
-            "436812bd8ee39b768c645c248c91f1330834e687"
-            in (build / "OmniGibson/setup.py").read_text()
+            "setup --omnigibson --bddl --joylo --confirm-no-conda --accept-nvidia-eula"
+            in result.stdout
         )
-
-
-@pytest.mark.skipif(
-    sys.platform != "linux", reason="Native SDK installer requires Linux"
-)
-def test_sdk_runtime_reuse_keeps_the_complete_runtime(tmp_path):
-    sdk = tmp_path / "runtime"
-    app = sdk / "isaacsim/apps/complete-runtime.kit"
-    app.parent.mkdir(parents=True)
-    app.write_text("complete runtime")
-    (app.parent.parent / "__init__.py").write_text("")
-    for name, version, requirements in [
-        ("isaacsim", "5.1.0.0", []),
-        ("isaacsim-core", "5.1.0.0", ["isaacsim-kernel==5.1.0.0", "filelock==3.13.1"]),
-        ("isaacsim-kernel", "5.1.0.0", ["attrs==25.1.0"]),
-        ("torch", "2.7.0", []),
-        ("omnigibson", "3.9.3", []),
-    ]:
-        dist = sdk / f"{name.replace('-', '_')}-{version}.dist-info"
-        dist.mkdir()
-        (dist / "METADATA").write_text(
-            f"Name: {name}\nVersion: {version}\n"
-            + "".join(f"Requires-Dist: {req}\n" for req in requirements)
-        )
-    source, build = tmp_path / "supplied", tmp_path / "installation"
-    for directory in (source, build):
-        (directory / "OmniGibson").mkdir(parents=True)
-        (directory / "OmniGibson/setup.py").write_text(
-            "git+https://github.com/wensi-ai/lerobot@release/b1k"
-        )
-        (directory / "setup.sh").write_text("exit 42\n")
-    args = tmp_path / "uv-args"
-    result = run_functions(
-        f'export PYTHONPATH="{sdk}"\n'
-        f'clone_or_reuse_repo() {{ if [ "$1" = BEHAVIOR_PATH ]; then echo "{source}"; else echo "{build}"; fi; }}\n'
-        "git() { echo a8247a8cc1633fe1ca0cc66aa07243d46c64f155; }\n"
-        f'uv() {{ printf "%s\\n" "$@" >> "{args}"; }}\n'
-        "install_behavior_env\n"
-    )
-    assert result.returncode == 0, result.stderr
-    requirements = args.read_text().splitlines()
-    assert "filelock==3.13.1" in requirements
-    assert "attrs==25.1.0" in requirements
-    assert not any(req.startswith("isaacsim-") for req in requirements)
-    assert app.read_text() == "complete runtime"
+        assert "uv pip check" in result.stdout
+        if shared:
+            assert metadata.read_text() == dependency + "release/b1k\n"

@@ -32,7 +32,7 @@
    .. grid-item-card:: 任务
       :text-align: center
 
-      50 个 BEHAVIOR-1K 任务
+      2026 挑战的 100 个任务
 
    .. grid-item-card:: 硬件
       :text-align: center
@@ -52,7 +52,7 @@
    * - 字段
      - 说明
    * - 任务
-     - 来自 BEHAVIOR-1K 的 50 个家居操作任务（通过 ``omni_config.task.activity_name`` 选择）。
+     - `2026 BEHAVIOR 挑战 <https://behavior.stanford.edu/challenge/tasks/index.html>`_ 包含 100 个家居任务。用 ``omni_config.task.activity_name`` 选择任务，并在 ``omni_config.scene.scene_model`` 填写对应场景。
    * - 机器人
      - IsaacSim / OmniGibson 上的双臂 R1 Pro。
 
@@ -85,51 +85,18 @@
 
 .. include:: _setup_common.rst
 
-**选项 1：Docker 镜像** — 从当前代码构建对应模型的镜像。
+**选项 1：Docker 镜像** — 适配 BEHAVIOR 3.9.3 的 RLinf 镜像（OpenVLA-OFT、OpenPI）待发布。
 
-.. code-block:: bash
-
-   # OpenVLA-OFT 模型：
-   docker build -f docker/Dockerfile --build-arg BUILD_TARGET=embodied-behavior-openvlaoft -t rlinf:embodied-behavior-openvlaoft .
-   docker run -it --rm --gpus all \
-      --shm-size 20g \
-      --network host \
-      --name rlinf \
-      -v .:/workspace/RLinf \
-      rlinf:embodied-behavior-openvlaoft
-
-   # OpenPI 模型（独立镜像）：
-   docker build -f docker/Dockerfile --build-arg BUILD_TARGET=embodied-behavior-openpi -t rlinf:embodied-behavior-openpi .
-   docker run -it --rm --gpus all \
-      --shm-size 20g \
-      --network host \
-      --name rlinf \
-      -v .:/workspace/RLinf \
-      rlinf:embodied-behavior-openpi
-
-   # 两个镜像都会默认激活各自对应的虚拟环境。
-
-**选项 2：自定义环境** — 安装 ``--env behavior`` 依赖组合：
-
-.. code-block:: bash
-
-   # 国内用户可以添加 --use-mirror 加速下载。
-   bash requirements/install.sh embodied --model openvla-oft --env behavior
-   # 或安装 OpenPI 环境：
-   # bash requirements/install.sh embodied --model openpi --env behavior
-   source .venv/bin/activate
-
-本版本使用 OmniGibson 3.9.3（``v3.9.3-post2``）和 Isaac Sim 5.1。当前 OpenPI 和 Isaac Sim 分别要求 PyTorch 2.7.1 和 2.7.0，按两者发布的依赖无法在同一环境中安装 OpenPI 和仿真器。
+**选项 2：自定义环境** — OmniGibson 3.9.3（``v3.9.3-post2``）使用 Isaac Sim 5.1，需要 PyTorch 2.7.0。RLinf 的 OpenVLA-OFT 和 OpenPI 分别要求 PyTorch 2.2.0 和 2.7.1，按发布的依赖安装时，两种模型都会与仿真器冲突。以下资产下载和运行步骤供已备好相应环境的用户使用。
 
 
 下载资产
 ----------------------------------------
 
-下载 BEHAVIOR-1K 资产，并在每次运行前设置 ``OMNIGIBSON_DATA_PATH``：
+在装有 OmniGibson 3.9.3 和 Isaac Sim 5.1 的环境中，请参照 `官方安装与资产指南 <https://behavior.stanford.edu/getting_started/installation.html>`_，或用以下命令从 `官方资产仓库 <https://huggingface.co/datasets/behavior-1k/zipped-datasets/tree/main>`_ 下载机器人资产、场景与物体资产，以及 2026 挑战的任务实例。
 
 .. code-block:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    # 数据集会占用超过 30 GB。
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
    # 之后的 python 命令会下载数据集到 $OMNIGIBSON_DATA_PATH 中。
@@ -142,9 +109,10 @@
 
 **这些命令会：**
 
-1. 为 IsaacSim 5.1 环境指定数据根目录。
-2. 下载 BEHAVIOR 机器人资产、任务资产和 2026 challenge instances。
-3. 创建训练和评估脚本需要的环境变量。
+1. 设置训练和评测使用的数据根目录 ``OMNIGIBSON_DATA_PATH``。
+2. 将资产和挑战实例下载并解压到该目录。
+
+首次导入 Isaac Sim 时可以按提示接受 `NVIDIA 许可协议 <https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html#running-isaac-sim>`_。无人值守运行时，同意许可后可在启动终端设置 ``export OMNI_KIT_ACCEPT_EULA=YES``。
 
 
 下载模型
@@ -198,7 +166,6 @@
 
 .. code-block:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
    bash examples/embodiment/run_embodiment.sh behavior_ppo_openvlaoft
 
@@ -211,7 +178,7 @@
 .. admonition:: 进一步配置
    :class: note
 
-   - BEHAVIOR 吞吐调优 → 先增加 env GPU 数量，再调 ``env.num_env_subprocess`` 和 ``env.train.total_num_envs``。
+   - BEHAVIOR 吞吐调优 → 先增加 env GPU 数量，再调 ``env.train.num_env_subprocess`` 和 ``env.train.total_num_envs``。
    - 每个 BEHAVIOR 进程可能占用约 10 GiB 显存；请按 GPU 显存调节 subprocess 数量。
    - 缓存任务实例 → 使用 ``rlinf/envs/sim/behavior/instance_generator.py`` 和 ``examples/embodiment/config/env/behavior_r1pro.yaml`` 生成。
    - 组件放置和吞吐调优 → :doc:`组件放置 <../../concepts/placement>` 与 :doc:`执行模式 <../../concepts/execution_modes>`
@@ -272,7 +239,6 @@ checkpoint，即由 OpenPI checkpoint 转换器
 
 .. code:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
    bash evaluations/run_eval.sh behavior behavior_openpi_pi05_eval
 
@@ -286,8 +252,7 @@ checkpoint，即由 OpenPI checkpoint 转换器
 ----------------------------------------
 
 BEHAVIOR 环境由 ``examples/embodiment/config/env/behavior_r1pro.yaml`` 驱动。RLinf 先加载
-OmniGibson 的基础配置（``base_config_name``），再应用 ``omni_config`` 覆盖项（见
-``rlinf/envs/sim/behavior/utils.py`` 中的 ``setup_omni_cfg``）。下表中的字段控制 reset 行为、场景
+OmniGibson 的基础配置（``base_config_name``），再应用 ``omni_config`` 覆盖项。下表中的字段控制 reset 行为、场景
 加载、仿真器频率与吞吐，大多有合理默认值，仅在自定义任务或调优性能时需要修改。
 
 .. list-table::
@@ -304,7 +269,7 @@ OmniGibson 的基础配置（``base_config_name``），再应用 ``omni_config``
    * - ``omni_config.task.activity_name``
      - 所选场景中的任务名称，例如 ``turning_on_radio``。
    * - ``omni_config.task.instance_resample_mode``
-     - reset 时的实例切换：``disabled``\ （加载固定的 ``activity_instance_id``）、``offline``\ （启动时扫描一次 ``activity_instance_dir``，每次 reset 采样一个缓存实例——``*_template.json`` 走较重的场景重载路径，``*_template-tro_state.json`` 走较轻的原地路径）、或 ``online``\ （每个进程一个场景，不使用缓存实例，需 ``online_object_sampling: True`` 且 ``use_presampled_robot_pose: False``）。
+     - reset 时的实例切换：``disabled``\ （加载固定的 ``activity_instance_id``）、``offline``\ （启动时扫描一次 ``activity_instance_dir``，每次 reset 采样一个缓存实例——``*_template.json`` 走较重的场景重载路径，``*_template-tro_state.json`` 走较轻的原地路径）、或 ``online``\ （每次重置时重新采样场景，设置见 :doc:`评测指南 <../../evaluations/guides/behavior>`）。
    * - ``omni_config.task.activity_instance_dir``
      - 缓存实例 JSON 目录（``*_template.json`` / ``*_template-tro_state.json``），供 ``offline``
        模式以及 ``disabled`` 模式下的固定 id 加载使用。
@@ -313,8 +278,7 @@ OmniGibson 的基础配置（``base_config_name``），再应用 ``omni_config``
        ``robot_poses`` 的 ``tro_state`` 文件，此时会清除过期的缓存机器人位姿元数据，reset 回退到
        任务默认机器人位姿。
    * - ``omni_config.scene.partial_scene_load``
-     - 为 ``true`` 时自动按 ``activity_name`` 填充 ``scene.load_room_types``\ （减少启动时间与内存），
-       需要 ``activity_name`` 与 ``scene_model``。为 ``false``/省略时需显式设置 ``load_room_types``。
+     - 设为 ``true`` 时，只加载 2026 挑战场景中分配给该任务的房间。
    * - ``camera.head_resolution`` / ``camera.wrist_resolution``
      - 头部 / 腕部相机分辨率（默认 720×720 / 480×480，应用到 R1Pro 传感器）。
    * - ``omni_config.env.action_frequency`` / ``rendering_frequency`` / ``physics_frequency``
@@ -335,14 +299,14 @@ OmniGibson 的基础配置（``base_config_name``），再应用 ``omni_config``
      - 为 ``True`` 时跳过动作 chunk 内中间观测的采集（显著提升环境速度）。此时保存的视频只显示策略在
        chunk 边界观测到的帧。
    * - ``num_env_subprocess``
-     - 需要独立 reset 时，为每个环境单独分配一个仿真进程。显式设置的进程数须能整除本地环境数。启用 ``auto_reset`` 时每个环境需独占一个进程。
+     - 每个本地环境 worker 启动的仿真进程数，预设值为 ``1``。例如，4 个本地环境分给 2 个进程时，每个进程运行 2 个场景。各环境需要独立重置时，为每个环境分配一个进程。
 
 生成缓存任务实例
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``rlinf/envs/sim/behavior/instance_generator.py`` 直接从 ``behavior_r1pro.yaml`` 生成
 ``*_template.json`` 与 ``*_template-tro_state.json`` 文件（它读取 ``scene_model``、
-``activity_name``、``activity_definition_id``、机器人配置与房间加载设置，并临时切换为在线物体采样）。
+``activity_name``、``activity_definition_id``、机器人配置与房间加载设置，然后从任务的标准场景模板重新采样）。
 若设置了 ``activity_instance_dir`` 则写入该目录，否则写入 ``OMNIGIBSON_DATA_PATH`` 默认的
 ``2026-challenge-task-instances`` 中所选场景和任务的子目录；可用 ``--output-dir`` 覆盖。
 

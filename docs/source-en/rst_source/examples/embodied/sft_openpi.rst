@@ -253,9 +253,9 @@ and ``actions`` before SFT (especially important for real-robot data):
 If standard deviations are tiny or the q99–q01 range is very narrow, widening
 them often stabilizes training, especially when SFT is followed by online RL.
 
-BEHAVIOR does not use that script. Point
-``actor.model.openpi_data.norm_stats_path`` at an existing
-``{assets}/{asset_id}/norm_stats.json``.
+For BEHAVIOR, supply an OpenPI ``norm_stats.json`` for the 2026 training data
+and the state and action vectors used by ``pi05_behavior``. Set
+``actor.model.openpi_data.norm_stats_path`` to that file and use it for evaluation.
 
 Installation
 ------------
@@ -391,26 +391,22 @@ Filesystem paths live in the experiment config; the model shape comes from
 
    defaults:
      - model/pi0_5@actor.model
-     - hybrid_engines/fsdp@actor.fsdp_config
+     - hybrid_engines/openpi_fsdp@actor.fsdp_config
 
-The streaming loader reads only ``data:`` (no hidden defaults). Change at least:
+Set both dataset paths to the local copy of the official
+`2026 challenge demonstrations <https://huggingface.co/datasets/behavior-1k/2026-challenge-demos>`_
+(LeRobot v3). This SFT reader loads RGB from the head and both wrist cameras.
 
 .. code:: yaml
 
    data:
-     train_data_paths: /path/to/2025-challenge-demos
-     behavior_dataset_root: /path/to/2025-challenge-demos
-     repo_id: "behavior-1k/2025-challenge-demos"
+     train_data_paths: /path/to/2026-challenge-demos
+     behavior_dataset_root: /path/to/2026-challenge-demos
+     repo_id: "behavior-1k/2026-challenge-demos"
      modalities: ["rgb"]
      num_workers: 8
      tasks: ["turning_on_radio"]
      use_skill: false
-     task_subtasks:
-       turning_on_radio:
-         - "move to radio"
-         - "pick up radio from coffee table"
-         - "press radio"
-         - "place radio on coffee table"
 
    actor:
      model:
@@ -419,15 +415,22 @@ The streaming loader reads only ``data:`` (no hidden defaults). Change at least:
          task: sft
          embed_dtype: bf16
        openpi_data:
-         norm_stats_path: /path/to/assets/behavior-1k/2025-challenge-demos/norm_stats.json
+         norm_stats_path: /path/to/norm_stats.json
 
-- ``use_skill: false`` trains on the main-task text; ``true`` uses per-frame
-  skill text from ``task_subtasks`` (collapsed orchestrators in the dataset
-  are not valid labels).
-- ``fine_grained_level`` / ``tolerance_s`` control streaming time alignment.
+Use ``use_skill: false`` and ``fine_grained_level: 0`` for the main-task
+instructions in ``meta/tasks.jsonl``.
+When evaluating the resulting policy, set
+``omni_config.robots[0].proprio_obs`` to the SDK field order in
+``PROPRIOCEPTION_INDICES["R1Pro"]`` so that the 61-value state includes
+base velocity in the robot frame, as it does in the training data.
+
+In the OpenPI model environment from the Installation section, install the
+Hugging Face LeRobot revision that reads the v3 data and run SFT.
 
 .. code:: bash
 
+   uv pip install 'lerobot @ git+https://github.com/huggingface/lerobot.git@f55c6e89f01ad30594f8815a41720e6460656447'
+   uv pip check
    bash examples/sft/run_vla_sft.sh behavior_sft_openpi_pi05
 
 Pi0 + RoboTwin

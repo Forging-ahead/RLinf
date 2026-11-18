@@ -1,4 +1,4 @@
-# Copyright 2026 The RLinf Authors.
+# Copyright 2025 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -100,7 +100,7 @@ class BehaviorProcessPool:
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
         self.ray = ray
-        requested = cfg.get("num_env_subprocess")
+        requested = cfg.get("num_env_subprocess", 1)
         count = num_envs if requested is None else int(requested)
         if not 1 <= count <= num_envs:
             raise ValueError("num_env_subprocess must be null or in [1, num_envs].")
@@ -138,6 +138,7 @@ class BehaviorProcessPool:
                         },
                     ).remote(cfg, len(rows), seed + rows[0])
                 )
+            # Wait for all actors to initialize before using the pool.
             names = ray.get(
                 [process.get_activity_name.remote() for process in self.env_processes]
             )
@@ -355,9 +356,9 @@ class BehaviorEnv(gym.Env):
         if sensors is None:
             raise ValueError("BEHAVIOR observation requires robot proprioception.")
         state = torch.as_tensor(sensors["proprio"])
-        if state.shape != (256,):
+        if state.shape not in ((61,), (256,)):
             raise ValueError(
-                f"The BEHAVIOR adapter requires legacy256 proprioception, got {tuple(state.shape)}."
+                f"Expected 61 or 256 R1Pro state values, got {tuple(state.shape)}."
             )
         images = []
         for role in ("head", "left_wrist", "right_wrist"):
@@ -388,7 +389,7 @@ class BehaviorEnv(gym.Env):
             "task_descriptions": [self.task_description] * len(extracted_obs_list),
             "states": torch.stack(
                 [obs["state"] for obs in extracted_obs_list], axis=0
-            ),  # [N_ENV, 256]
+            ),  # [N_ENV, state_dim]
         }
         return obs
 

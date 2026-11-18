@@ -147,12 +147,13 @@ def make_environment_config(
     if proprio is None:
         proprio = R1PRO_PROPRIO_KEYS
     if list(proprio) != R1PRO_PROPRIO_KEYS:
-        raise ValueError(
-            "The RLinf BEHAVIOR model expects legacy256 proprio fields; "
-            "keep proprio_obs unset or equal to R1PRO_PROPRIO_KEYS. "
-            "The official 61-D evaluator observation is a different model contract."
-        )
-    robot["proprio_obs"] = list(R1PRO_PROPRIO_KEYS)
+        from omnigibson.eval.utils.eval_utils import PROPRIOCEPTION_INDICES
+
+        if list(proprio) != list(PROPRIOCEPTION_INDICES["R1Pro"]):
+            raise ValueError(
+                "Use the RLinf or the official 2026 R1Pro proprio_obs field order."
+            )
+    robot["proprio_obs"] = list(proprio)
     robot["obs_modalities"] = list(
         dict.fromkeys([*robot.get("obs_modalities", []), "proprio", "rgb"])
     )

@@ -10,10 +10,7 @@ BEHAVIOR-1K 是基于 OmniGibson 与 Isaac Sim 的大规模家居场景仿真基
 
 **安装依赖**
 
-.. code-block:: bash
-
-   bash requirements/install.sh embodied --model openpi --env behavior
-   source .venv/bin/activate
+以下评测步骤供已备好模型和仿真环境的用户使用。已发布的 OpenPI 和 Isaac Sim 5.1 分别要求 PyTorch 2.7.1 和 2.7.0，按 RLinf 原有流程在同一环境安装时会遇到依赖冲突。模型兼容情况见 :doc:`../../examples/embodied/behavior`。
 
 当前 ``evaluations/behavior/`` 仅提供 OpenPI π₀.₅ 示例；训练侧还支持 OpenVLA-OFT，可从 ``examples/embodiment/config/`` 中的训练配置派生评测 YAML（见 :doc:`../reference/configuration`）。
 
@@ -23,7 +20,7 @@ BEHAVIOR 依赖 Isaac Sim 5.1，对 GPU 与驱动有额外要求，详见训练�
 
 - Isaac Sim 5.1 需要支持光线追踪的 GPU。NVIDIA 在 x86-64 平台上列出的最低规格为 RTX 4080；A100 和 H100 缺少 RT 核心，不在支持范围内。
 
-使用 Docker 时，按 :doc:`../../examples/embodied/behavior` 从当前代码构建 OpenPI 镜像。
+适配 BEHAVIOR 3.9.3 的 RLinf OpenPI 镜像待发布。
 
 **环境变量**
 
@@ -31,13 +28,9 @@ BEHAVIOR 依赖 Isaac Sim 5.1，对 GPU 与驱动有额外要求，详见训练�
 
 .. code-block:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
-   export OMNIGIBSON_DATASET_PATH=${OMNIGIBSON_DATA_PATH}/behavior-1k-assets/
-   export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson.key
-   export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson-robot-assets/
 
-BEHAVIOR 资源体积超过 30 GB，下载与 license 配置步骤见 :doc:`../../examples/embodied/behavior` 中的「资源下载」一节。
+资产下载和首次启动时的许可设置见 :doc:`../../examples/embodied/behavior` 中的“下载资产”一节。
 
 示例配置
 --------
@@ -65,11 +58,7 @@ BEHAVIOR 资源体积超过 30 GB，下载与 license 配置步骤见 :doc:`../.
 .. code-block:: bash
 
    source .venv/bin/activate
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
-   export OMNIGIBSON_DATASET_PATH=${OMNIGIBSON_DATA_PATH}/behavior-1k-assets/
-   export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson.key
-   export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_DATA_PATH}/omnigibson-robot-assets/
 
 **Step 2：准备模型**
 
@@ -97,12 +86,12 @@ BEHAVIOR 资源体积超过 30 GB，下载与 license 配置步骤见 :doc:`../.
 评测配置详解
 ------------
 
-BEHAVIOR 评测 **每次运行对应单个任务** （由 ``omni_config.task.activity_name`` 指定），不会在一次启动中自动遍历全部 50 个任务。以下字段共同决定并行规模、单条轨迹长度与初始场景实例。
+BEHAVIOR 评测 **每次运行对应单个任务** （由 ``omni_config.task.activity_name`` 指定）。以下字段共同决定并行规模、单条轨迹长度与初始场景实例。
 
 评测协议概述
 ~~~~~~~~~~~~
 
-BEHAVIOR-1K 共 50 个 household 任务（任务名列表见 ``rlinf/envs/sim/behavior/behavior_task.jsonl``）。``behavior_r1pro`` preset 默认任务为 ``turning_on_radio``，场景为 ``house_double_floor_lower``。
+`2026 BEHAVIOR 挑战 <https://behavior.stanford.edu/challenge/tasks/index.html>`_ 包含 100 个家居任务。请把 ``omni_config.scene.scene_model`` 设为该任务对应的场景。``behavior_r1pro`` preset 默认任务为 ``turning_on_radio``，场景为 ``house_double_floor_lower``。
 
 每条评测轨迹由以下配置唯一确定：
 
@@ -114,7 +103,7 @@ BEHAVIOR-1K 共 50 个 household 任务（任务名列表见 ``rlinf/envs/sim/be
 
 - ``disabled`` （默认）：每次 reset 加载 ``activity_instance_id`` 对应的固定实例；若设置了 ``activity_instance_dir``，则从该目录读取对应 JSON。
 - ``offline``：每次 reset 从选定的 split 或 ``activity_instance_dir`` 中 **随机** 选取一个缓存实例（需先下载官方 ``2026-challenge-task-instances`` 或用 ``instance_generator.py`` 生成）。
-- ``online``：reset 时在线重采样物体布局（每个进程一个场景，不使用缓存实例，需 ``online_object_sampling: True`` 且 ``use_presampled_robot_pose: False``，启动较慢）。
+- ``online``：每次重置时重新生成物体布局。为每个环境分配一个仿真进程，留空 ``activity_instance_dir`` 和 ``instance_split``，并设置 ``online_object_sampling: True`` 和 ``use_presampled_robot_pose: False``。
 
 .. note::
 
@@ -138,7 +127,7 @@ BEHAVIOR-1K 共 50 个 household 任务（任务名列表见 ``rlinf/envs/sim/be
    * - ``max_steps_per_rollout_epoch``
      - 每轮 rollout 的总交互步数，**必须能被** ``rollout.model.num_action_chunks`` **整除**。无 ``auto_reset`` 时通常等于 ``max_episode_steps``。
    * - ``num_env_subprocess``
-     - 每个 env worker 的仿真进程数。需要独立 reset 时，为每个环境单独分配一个进程。显式指定的进程数须能整除本地环境数。
+     - 每个本地环境 worker 启动的仿真进程数，预设值为 ``1``。自动重置或在线采样时，为每个环境分配一个进程。
    * - ``skip_intermediate_renders``
      - 设为 ``True`` 时跳过 chunk 内中间 observation，显著加速环境步进；保存的视频仅含 chunk 边界帧。
 
@@ -204,6 +193,8 @@ BEHAVIOR 环境步进较慢，通常建议给 env 分配足够 GPU，并与 roll
 
 **调整并行规模**
 
+以下示例假设同一个环境 worker 负责四个环境，并用两个仿真进程运行它们。
+
 .. code-block:: bash
 
    bash evaluations/run_eval.sh behavior behavior_openpi_pi05_eval \
@@ -216,6 +207,7 @@ BEHAVIOR 环境步进较慢，通常建议给 env 分配足够 GPU，并与 roll
 .. code-block:: bash
 
    bash evaluations/run_eval.sh behavior_ppo_openpi_pi05 \
+     runner.only_eval=True \
      rollout.model.model_path=/path/to/model
 
 常见问题

@@ -33,7 +33,7 @@ RL-finetune a VLA on BEHAVIOR household tasks with PPO.
    .. grid-item-card:: Tasks
       :text-align: center
 
-      50 BEHAVIOR-1K tasks
+      100 tasks in the 2026 challenge
 
    .. grid-item-card:: Hardware
       :text-align: center
@@ -53,7 +53,7 @@ Tasks
    * - Field
      - Detail
    * - Tasks
-     - 50 household manipulation tasks from BEHAVIOR-1K (select via ``omni_config.task.activity_name``).
+     - The `2026 BEHAVIOR Challenge <https://behavior.stanford.edu/challenge/tasks/index.html>`_ includes 100 household tasks. Select one with ``omni_config.task.activity_name`` and set its ``omni_config.scene.scene_model``.
    * - Robot
      - Dual-arm R1 Pro on IsaacSim / OmniGibson.
 
@@ -86,51 +86,18 @@ Installation
 
 .. include:: _setup_common.rst
 
-**Option 1: Docker image** — build the image for your model from this checkout.
+**Option 1: Docker image** — the RLinf images for BEHAVIOR 3.9.3 (OpenVLA-OFT and OpenPI) are pending release.
 
-.. code-block:: bash
-
-   # OpenVLA-OFT model:
-   docker build -f docker/Dockerfile --build-arg BUILD_TARGET=embodied-behavior-openvlaoft -t rlinf:embodied-behavior-openvlaoft .
-   docker run -it --rm --gpus all \
-      --shm-size 20g \
-      --network host \
-      --name rlinf \
-      -v .:/workspace/RLinf \
-      rlinf:embodied-behavior-openvlaoft
-
-   # OpenPI model (separate image):
-   docker build -f docker/Dockerfile --build-arg BUILD_TARGET=embodied-behavior-openpi -t rlinf:embodied-behavior-openpi .
-   docker run -it --rm --gpus all \
-      --shm-size 20g \
-      --network host \
-      --name rlinf \
-      -v .:/workspace/RLinf \
-      rlinf:embodied-behavior-openpi
-
-   # In either image the matching virtual environment is already activated by default.
-
-**Option 2: Custom environment** — install bundle ``--env behavior``:
-
-.. code-block:: bash
-
-   # Add --use-mirror for faster downloads in mainland China.
-   bash requirements/install.sh embodied --model openvla-oft --env behavior
-   # Or install the OpenPI environment:
-   # bash requirements/install.sh embodied --model openpi --env behavior
-   source .venv/bin/activate
-
-This release uses OmniGibson 3.9.3 (``v3.9.3-post2``) and Isaac Sim 5.1. The current OpenPI and Isaac Sim packages require different PyTorch versions (2.7.1 and 2.7.0 respectively), which prevents a single-environment OpenPI installation with their published dependencies.
+**Option 2: Custom environment** — the RLinf model and simulator packages have conflicting PyTorch requirements. OmniGibson 3.9.3 (``v3.9.3-post2``) uses Isaac Sim 5.1 with PyTorch 2.7.0. OpenVLA-OFT requires 2.2.0 and OpenPI requires 2.7.1. Neither model can share this simulator environment with its declared dependencies. The asset and run instructions below assume a working runtime.
 
 
 Download the Assets
 -------------------
 
-Download BEHAVIOR-1K assets and set ``OMNIGIBSON_DATA_PATH`` before every run:
+In an environment with OmniGibson 3.9.3 and Isaac Sim 5.1, follow the `official asset setup guide <https://behavior.stanford.edu/getting_started/installation.html>`_ or run the commands below to download robot assets, scene and object assets, and 2026 task instances from the `official asset repository <https://huggingface.co/datasets/behavior-1k/zipped-datasets/tree/main>`_.
 
 .. code-block:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    # The datasets require more than 30 GB.
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
    mkdir -p $OMNIGIBSON_DATA_PATH
@@ -143,9 +110,10 @@ Download BEHAVIOR-1K assets and set ``OMNIGIBSON_DATA_PATH`` before every run:
 
 **What this does:**
 
-1. Selects the data root for the Isaac Sim 5.1 installation.
-2. Downloads the BEHAVIOR robot assets, task assets, and 2026 challenge instances.
-3. Creates the environment variables that the training and evaluation scripts need.
+1. Sets ``OMNIGIBSON_DATA_PATH`` to the directory used by training and evaluation.
+2. Downloads and unpacks the assets and challenge instances into that directory.
+
+For unattended runs, export ``OMNI_KIT_ACCEPT_EULA=YES`` in the launch shell after accepting the `NVIDIA license <https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html#running-isaac-sim>`_. Interactive runs can accept the license at the first Isaac Sim import.
 
 Download the Model
 ------------------
@@ -198,7 +166,6 @@ Launch a config with ``run_embodiment.sh``:
 
 .. code-block:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
    bash examples/embodiment/run_embodiment.sh behavior_ppo_openvlaoft
 
@@ -211,7 +178,7 @@ Launch a config with ``run_embodiment.sh``:
 .. admonition:: Configure further
    :class: note
 
-   - BEHAVIOR throughput → increase env GPU count first, then tune ``env.num_env_subprocess`` and ``env.train.total_num_envs``.
+   - BEHAVIOR throughput → increase env GPU count first, then tune ``env.train.num_env_subprocess`` and ``env.train.total_num_envs``.
    - Each BEHAVIOR process can use roughly 10 GiB of VRAM; tune subprocess count for your GPU memory.
    - Cached task instances → generate them with ``rlinf/envs/sim/behavior/instance_generator.py`` and ``examples/embodiment/config/env/behavior_r1pro.yaml``.
    - Placement and throughput → :doc:`Placement <../../concepts/placement>` and :doc:`Execution modes <../../concepts/execution_modes>`
@@ -263,7 +230,7 @@ Configure Further
 
 The BEHAVIOR env is driven by ``examples/embodiment/config/env/behavior_r1pro.yaml``.
 RLinf first loads OmniGibson's base config (``base_config_name``) and then applies the
-``omni_config`` overrides (see ``setup_omni_cfg`` in ``rlinf/envs/sim/behavior/utils.py``).
+``omni_config`` overrides.
 The fields below control reset behavior, scene loading, simulator frequencies, and
 throughput — most have sensible defaults and only need tuning for custom tasks or
 performance.
@@ -285,8 +252,7 @@ performance.
      - Reset-time instance switching: ``disabled`` (load the fixed ``activity_instance_id``),
        ``offline`` (scan ``activity_instance_dir`` once and sample a cached instance per reset —
        ``*_template.json`` use the heavy scene-reload path, ``*_template-tro_state.json`` the
-       lighter in-place path), or ``online`` (one scene per process; use no cached instances; requires ``online_object_sampling: True`` and
-       ``use_presampled_robot_pose: False``).
+       lighter in-place path), or ``online`` (resample the scene at reset; see the :doc:`evaluation guide <../../evaluations/guides/behavior>` for settings).
    * - ``omni_config.task.activity_instance_dir``
      - Directory of cached instance JSONs (``*_template.json`` / ``*_template-tro_state.json``),
        used by ``offline`` mode and by fixed-id loading when the mode is ``disabled``.
@@ -295,9 +261,7 @@ performance.
        only). RLinf accepts ``tro_state`` files without ``robot_poses``; it then clears stale
        cached robot-pose metadata and the reset falls back to the task's default robot pose.
    * - ``omni_config.scene.partial_scene_load``
-     - When ``true``, auto-fills ``scene.load_room_types`` with rooms relevant to
-       ``activity_name`` (reduces startup time and memory). Requires ``activity_name`` and
-       ``scene_model``. Set ``load_room_types`` explicitly when ``false``/omitted.
+     - When ``true``, loads only the rooms assigned to the task in the 2026 challenge scene.
    * - ``camera.head_resolution`` / ``camera.wrist_resolution``
      - Head / wrist camera resolutions (defaults 720×720 / 480×480, applied to R1Pro sensors).
    * - ``omni_config.env.action_frequency`` / ``rendering_frequency`` / ``physics_frequency``
@@ -318,8 +282,7 @@ performance.
      - When ``True``, skips collecting intermediate observations inside an action chunk (large
        env-speed gain). Saved videos then show only the frames the policy observes at chunk boundaries.
    * - ``num_env_subprocess``
-     - For independent resets, use one simulator process per environment.
-       An explicit count must divide the local environment count. Use one process per env with ``auto_reset``.
+     - Number of simulator processes per local environment worker (preset default ``1``). For example, with four local environments and two processes, each process runs two scenes. Use one process per environment for independent resets.
 
 Generating cached task instances
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -327,7 +290,7 @@ Generating cached task instances
 ``rlinf/envs/sim/behavior/instance_generator.py`` generates ``*_template.json`` and
 ``*_template-tro_state.json`` files directly from ``behavior_r1pro.yaml`` (it reads
 ``scene_model``, ``activity_name``, ``activity_definition_id``, the robot config, and
-room-loading settings, then temporarily switches to online object sampling). It writes to
+room-loading settings and resamples from the task's canonical scene template). It writes to
 ``activity_instance_dir`` if set, otherwise to ``OMNIGIBSON_DATA_PATH``'s default
 ``2026-challenge-task-instances`` directory for the selected scene and task; use ``--output-dir`` to override.
 
@@ -375,7 +338,6 @@ Normalization statistics are loaded from the converted checkpoint's bundled
 
 .. code:: bash
 
-   export OMNI_KIT_ACCEPT_EULA=YES
    export OMNIGIBSON_DATA_PATH=/path/to/behavior-2026-data
    bash evaluations/run_eval.sh behavior behavior_openpi_pi05_eval
 
