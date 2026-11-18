@@ -18,10 +18,14 @@ from rlinf.data.datasets.openpi.behavior.behavior_sft_data_loader import (
     build_behavior_sft_dataloader,
     create_behavior_sft_data_loader,
 )
+from rlinf.data.datasets.openpi.behavior.behavior_sft_dataset import (
+    BehaviorSftDataset,
+)
 
 __all__ = [
     "BehaviorSftDataConfig",
     "BehaviorSftDataLoader",
+    "BehaviorSftDataset",
     "build_behavior_sft_dataloader",
     "create_behavior_sft_data_loader",
 ]

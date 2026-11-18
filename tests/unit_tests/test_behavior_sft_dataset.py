@@ -19,6 +19,7 @@ import pytest
 
 pytest.importorskip("openpi")
 
+from rlinf.data.datasets.openpi.behavior import BehaviorSftDataset
 from rlinf.data.datasets.openpi.behavior.behavior_sft_data_loader import _Repack
 from rlinf.models.embodiment.openpi.policies.behavior_policy import (
     extract_state_from_proprio,
@@ -33,8 +34,8 @@ def test_behavior_sft_repack_preserves_camera_order_state_and_task():
         "observation.rgb.right_realsense_link_camera_0",
     )
     state = np.arange(61, dtype=np.float32)
-    frame = {"task": "turning_on_radio"}
-    repack = _Repack({"turning_on_radio": prompt})
+    frame = {"task": prompt}
+    repack = _Repack()
     for index, key in enumerate(keys):
         frame[key] = np.full((3, 4, 4), index, dtype=np.uint8)
     frame["observation.state"] = state
@@ -79,3 +80,49 @@ def test_behavior_sft_repack_preserves_camera_order_state_and_task():
 def test_behavior_policy_maps_both_r1pro_layouts(dimension, indices):
     proprio = np.arange(dimension, dtype=np.float32)
     np.testing.assert_array_equal(extract_state_from_proprio(proprio), indices)
+
+
+def test_behavior_sft_selects_task_from_shared_shard(tmp_path):
+    from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
+
+    if CODEBASE_VERSION != "v3.0":
+        pytest.skip("Requires the 2026 BEHAVIOR SFT LeRobot v3 reader")
+
+    root = tmp_path / "demonstrations"
+    feature = {"dtype": "float32", "shape": (2,), "names": None}
+    writer = LeRobotDataset.create(
+        "local/test",
+        fps=30,
+        root=root,
+        features={"action": feature, "observation.state": feature},
+        use_videos=False,
+    )
+    for task, start in (("other_task", 0), ("turning_on_radio", 10)):
+        for value in (start, start + 1):
+            action = np.array([value, -value], dtype=np.float32)
+            writer.add_frame(
+                {"task": task, "action": action, "observation.state": action}
+            )
+        writer.save_episode()
+    assert len(list((root / "data").rglob("*.parquet"))) == 1
+    (root / "meta/tasks.jsonl").write_text(
+        '{"task_name":"turning_on_radio","task":"Turn on the radio."}\n'
+    )
+
+    dataset = BehaviorSftDataset(
+        "local/test", root, tasks=["turning_on_radio"], action_horizon=3, shuffle=False
+    )
+    assert len(dataset) == 2
+    first, last = dataset[0], dataset[1]
+    assert int(first["episode_index"]) == 1
+    assert first["task"] == "Turn on the radio."
+    np.testing.assert_array_equal(first["action"], [[10, -10], [11, -11], [11, -11]])
+    np.testing.assert_array_equal(last["action"], [[11, -11]] * 3)
+    np.testing.assert_array_equal(last["action_is_pad"], [False, True, True])
+
+
+def test_behavior_sft_rejects_v21(tmp_path):
+    (tmp_path / "meta").mkdir()
+    (tmp_path / "meta/info.json").write_text('{"codebase_version":"v2.1"}')
+    with pytest.raises(ValueError, match=r"2026 demonstrations .*v2\.1"):
+        BehaviorSftDataset("local/test", tmp_path)
