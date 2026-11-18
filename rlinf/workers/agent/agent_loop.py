@@ -193,6 +193,10 @@ class AgentLoopWorker(Worker):
         image_data: Optional[list[bytes]] = None,
         return_prompt_token_ids: bool = False,
         mm_token_expansion_start_len: Optional[int] = None,
+        image_spans: Optional[list[tuple[int, int]]] = None,
+        image_history: Optional[dict] = None,
+        image_store_dir: Optional[str] = None,
+        image_token_budget: Optional[tuple[int, int]] = None,
     ):
         """Sample one turn; images the prompt stands for ride with the request.
 
@@ -203,6 +207,13 @@ class AgentLoopWorker(Worker):
             "prompt_ids": prompt_ids,
             "sampling_params": sampling_params,
         }
+        if image_spans is not None:
+            request["capture_images"] = {
+                "image_spans": image_spans,
+                "history": image_history,
+                "store_dir": image_store_dir,
+                "token_budget": image_token_budget,
+            }
         if image_data:
             request["image_data"] = image_data
         if return_prompt_token_ids:

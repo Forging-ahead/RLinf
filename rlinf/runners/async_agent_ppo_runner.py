@@ -23,7 +23,10 @@ from typing import Any
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from rlinf.config import shared_multi_modal_processor_enabled
+from rlinf.config import (
+    release_image_replay_enabled,
+    shared_multi_modal_processor_enabled,
+)
 from rlinf.data.schema.agent_trajectory import (
     construct_rollout_batch,
     prepare_agent_ppo_targets,
@@ -142,6 +145,9 @@ class AsyncAgentPPORunner(AgentPPORunner):
                 "token_space": shared_multi_modal_processor_enabled(
                     OmegaConf.select(self.cfg, "rollout.sglang")
                 ),
+                "release_image_replay": release_image_replay_enabled(
+                    self.cfg.get("rollout")
+                ),
                 "buffer": buffer,
                 "pending": [
                     prompt
@@ -168,7 +174,9 @@ class AsyncAgentPPORunner(AgentPPORunner):
         token_space = shared_multi_modal_processor_enabled(
             OmegaConf.select(self.cfg, "rollout.sglang")
         )
-        if rollout.get("token_space", False) != token_space:
+        if rollout.get("token_space", False) != token_space or rollout.get(
+            "release_image_replay", False
+        ) != release_image_replay_enabled(self.cfg.get("rollout")):
             raise ValueError(
                 "Checkpoint rollout input contract changed; start with fresh rollout state"
             )

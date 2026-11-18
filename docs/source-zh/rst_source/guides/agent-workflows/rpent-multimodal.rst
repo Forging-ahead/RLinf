@@ -1,7 +1,7 @@
 配置 RPent 多模态训练
 ============================
 
-先完成 :doc:`单机 smoke <../../examples/agentic/rpent_libero_rl>`，再按需要调整重算、缓存和历史处理。默认路径与实验性共享多模态预处理路径使用独立依赖环境。
+先完成 :doc:`单机 smoke <../../examples/agentic/rpent_libero_rl>`，再按需要调整重算、缓存和历史处理。
 
 启用 Logprob 重算与 TIS
 --------------------------
@@ -24,24 +24,18 @@ SAO 默认关闭训练端 Logprob 重算和截断重要性采样（TIS）。试�
 
    开启这些选项后，SAO 的损失计算方式会改变，并额外执行一次 actor 前向计算。扩批前，先用小规模运行检查 TIS 权重的截断比例、有效样本量和 policy 滞后。启用这些选项后的优化器更新、权重同步和 checkpoint 恢复尚未验证。logprob 重算和 TIS 不能证明 SGLang 与 Megatron 的数值一致。
 
-试用共享多模态预处理（实验性）
---------------------------------
+回放 Qwen3.5 图像输入
+---------------------------
 
-共享多模态预处理（Shared Multimodal Preprocessing）复用 SGLang TokenSpace，让 rollout 和训练使用同一套图像预处理。它核对推理服务实际使用并返回的 prompt token ID，从带校验和的文件重建图像，并在训练模型的语言输入处核对 M-RoPE。此模式支持 Qwen3.5 图像输入，使用 PIL 预处理和 Megatron-Bridge，要求 PP=1、CP=1。文字和生成回复中不能包含视觉特殊标记；这条路径不支持视频和音频。
+安装页的 SGLang 0.5.12.post1、Torch 2.11.0 和 Transformers 5.6.1 即可运行共享图像回放。Rollout 保存推理实际使用的 prompt ID、预处理像素、图片区间、网格和 M-RoPE。Megatron 的 Actor 和 Critic 读取这些像素，各自执行视觉塔前向。当前支持静态图片和 PP1/CP1。
 
-.. warning::
-
-   这条路径仍处于实验阶段。默认的 SGLang 0.5.12.post1 环境不能运行此模式。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
-
-   这个开发版仅用于启用共享多模态预处理的 rollout。其他 rollout 路径以及独立的奖励模型、具身推理服务会在启动前拒绝该版本。这些任务应使用受支持的 SGLang 发布版，不能因为安装成功就认定兼容。
-
-受支持的 SGLang 发布版统一使用 ``rollout.cuda_graph_max_bs`` 配置项。SGLang 0.5.19 更改了对应服务参数的名称，RLinf 会完成映射，并将实际取值限制在 ``rollout.max_running_requests`` 以内。关闭共享多模态预处理时也适用这些规则。Search-R1 和具身任务的 GPU 回归尚未完成。
-
-新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同路径访问 ``output_dir``。
+训练和评测模板已注册 RLinf 图像处理器。要启用回放，请使用以下配置，并让 rollout 和 learner 节点通过同一绝对路径访问 ``tools.rpent.output_dir``。
 
 .. code-block:: yaml
 
    rollout:
+     env_vars:
+       SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
      sglang:
        enable_shared_multi_modal_processor: true
    tools:
@@ -49,22 +43,18 @@ SAO 默认关闭训练端 Logprob 重算和截断重要性采样（TIS）。试�
        store_images_on_disk: true
        keep_episodes: all
 
-公开开关为 ``rollout.sglang.enable_shared_multi_modal_processor``，默认关闭。旧配置项 ``rollout.sglang.enable_token_space_processor`` 仍作为兼容别名接受，行为保持一致。新旧字段同时存在会报错，即使取值一致也不例外；迁移时直接替换旧配置项。使用当前训练模板的命令改为 ``rollout.sglang.enable_shared_multi_modal_processor=true``。评测模板没有预设这个字段，命令中使用 ``+rollout.sglang.enable_shared_multi_modal_processor=true``。
+有待训练的轨迹或需要恢复的 checkpoint 时，请保留引用的像素文件。发布版要求 ``agentloop.thinking_token_budget=null``，并关闭原生 TokenSpace 预处理缓存。模型生成的视觉标记保留原始 token ID。新套用模板的消息和工具定义仍会拒绝字面视觉标记。
 
-这个开关仍映射到 SGLang 原生的 ``enable_token_space_processor`` 参数。下文的 SGLang 缓存字段、``sglang-token-space-v1`` 轨迹格式和 checkpoint 模式标记保持不变。仅修改配置项名称，不会改变 checkpoint 的输入约定。
-
-缺少 SGLang TokenSpace 接口时，rollout 初始化会报错。Server 和 Engine 都必须返回实际使用的 prompt token ID。采样前先预处理一次图像，再按展开后的 prompt 长度计算输出和思考的 token 预算。这一步对吞吐的影响尚未测量。
-
-切换模式时使用全新的 rollout 状态。异步 checkpoint 恢复会拒绝不同模式，训练端也会拒绝 Processor 指纹变化或混合图像格式。Torch 和内核升级后，不能直接假定旧 optimizer 状态仍然兼容。恢复 checkpoint 前须保留其引用的图像文件。
-
-训练验收前，先在部署环境验证多轮图像、历史压缩和打包后的 M-RoPE。再按固定的 96 点方案比较 logprob，记录平均值、P95 和最大绝对误差，以 0.03/0.10 为诊断参考。验收还需确认 Token、图片和位置输入正确，更新数值有限，权重同步及新进程恢复成功；重算和 TIS 不能证明原生数值一致。基础模型 logprob 与经过采样惩罚、top-k、top-p 修改的概率须分开比较。CPU 输入检查不能证明 GPU 数值对齐。
+恢复旧的原生 TokenSpace 训练时，沿用 ``requirements/agentic/sglang-token-space.txt`` 固定的 SGLang 构建，从配置和 rollout 环境中移除外部处理器，保留原缓存及图像文件。两种回放方式之间切换时，使用新的 rollout 状态。CPU-offload 优化器恢复所需的 Megatron 版本与补丁见安装页。
 
 减少重复图像预处理
 ~~~~~~~~~~~~~~~~~~
 
+下列 rollout 缓存参数仅用于固定源码版本的原生 TokenSpace。发布版回放可以单独使用 Actor 和 Critic 的预取参数。
+
 此模式可以让 rollout、actor 和 critic 共用图像预处理缓存。缓存保存处理后的像素和网格信息。rollout 和训练端仍各自运行冻结的视觉编码器，不共享视觉 embedding。
 
-共享预处理缓存和 CPU 预取默认都关闭。启用时，在上面的部署配置中加入以下内容。将 ``<cache-dir>`` 替换为本作业专用缓存目录的绝对路径。所有作业进程都必须能用同一路径访问缓存目录。
+共享预处理缓存和 CPU 预取默认都关闭。启用时，在旧版原生 TokenSpace 配置中加入以下内容。将 ``<cache-dir>`` 替换为本作业专用缓存目录的绝对路径。所有作业进程都必须能用同一路径访问缓存目录。
 
 .. code-block:: yaml
 

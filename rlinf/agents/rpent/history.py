@@ -289,6 +289,7 @@ class AppendOnlyHistory:
         # so a later turn never inherits a dropped chain's images and only
         # turns of one chain merge. The id advances on every new chain.
         self._image_prompt: ImagePrompt | None = None
+        self.image_history: dict | None = None
         self._chain_id = 0
 
     @property
@@ -300,6 +301,7 @@ class AppendOnlyHistory:
         """Start a fresh prefix chain: new id, no inherited images."""
         self._chain_id += 1
         self._image_prompt = None
+        self.image_history = None
 
     def _continues(self, request: dict) -> bool:
         messages = request["messages"]

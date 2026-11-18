@@ -21,6 +21,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
     """Validate RPent planner PPO or evaluation, selected by ``tools.rpent``."""
     from rlinf.config import (
+        release_image_replay_enabled,
         shared_multi_modal_processor_enabled,
         validate_agent_ppo_cfg,
         validate_async_agent_ppo_cfg,
@@ -59,7 +60,18 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
             raise ValueError(
                 "Shared multimodal preprocessing for RPent requires SGLang and store_images_on_disk=True"
             )
-        if cfg.rollout.get("env_vars", {}).get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"):
+        if release_image_replay_enabled(cfg.rollout):
+            if cfg.rollout.sglang.get("enable_token_space_preprocess_cache", False):
+                raise ValueError(
+                    "Release image replay stores captured pixels; disable the native TokenSpace cache"
+                )
+            if cfg.agentloop.get("thinking_token_budget") is not None:
+                raise ValueError(
+                    "Release image replay requires thinking_token_budget=null"
+                )
+        elif cfg.rollout.get("env_vars", {}).get(
+            "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"
+        ):
             raise ValueError(
                 "Remove SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE when enabling shared multimodal preprocessing"
             )

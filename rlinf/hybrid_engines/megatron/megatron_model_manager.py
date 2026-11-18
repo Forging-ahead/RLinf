@@ -844,6 +844,10 @@ class MegatronModelManager:
                 input_ids_rmpad = input_ids_rmpad[:, :used].contiguous()
                 model_attention_mask = attention_mask[:, :used].contiguous()
                 model_position_ids = position_ids[..., :used].contiguous()
+                if "image_input_mask" in model_forward_kwargs:
+                    model_forward_kwargs["image_input_mask"] = model_forward_kwargs[
+                        "image_input_mask"
+                    ][:, :used].contiguous()
             model_inputs = dict(
                 input_ids=input_ids_rmpad,
                 attention_mask=model_attention_mask,
@@ -861,18 +865,18 @@ class MegatronModelManager:
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-            verification = nullcontext()
+            verification = nullcontext(model_inputs)
             if multimodal_position_ids is not None:
                 from rlinf.hybrid_engines.megatron.qwen_vl_inputs import (
-                    verify_qwen_vl_positions,
+                    qwen_vl_replay_inputs,
                 )
 
-                verification = verify_qwen_vl_positions(
+                verification = qwen_vl_replay_inputs(
                     unwrap_model(model),
                     multimodal_position_ids[..., : input_ids_rmpad.shape[1]],
-                    model_attention_mask,
+                    model_inputs,
                 )
-            with verification:
+            with verification as model_inputs:
                 if post_process and scoring_forward is not None:
                     output_orig = scoring_forward(
                         model,

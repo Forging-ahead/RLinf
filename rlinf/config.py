@@ -293,6 +293,16 @@ def shared_multi_modal_processor_enabled(cfg: DictConfig | dict | None) -> bool:
     return enabled
 
 
+def release_image_replay_enabled(rollout: DictConfig | dict | None) -> bool:
+    """Select image capture from the rollout configuration on every worker."""
+    return (
+        rollout is not None
+        and shared_multi_modal_processor_enabled(rollout.get("sglang"))
+        and rollout.get("env_vars", {}).get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
+        == "rlinf.hybrid_engines.sglang.multimodal"
+    )
+
+
 def validate_sglang_multimodal_cfg(cfg: DictConfig) -> None:
     """Check multimodal options supported by the default serving worker."""
     shared_processor = shared_multi_modal_processor_enabled(cfg)

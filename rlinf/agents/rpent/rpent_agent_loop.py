@@ -38,7 +38,10 @@ from rlinf.agents.rpent.thinking_budget import (
     serialized_thinking_processor,
 )
 from rlinf.agents.tokenization import get_agentic_tokenizer
-from rlinf.config import shared_multi_modal_processor_enabled
+from rlinf.config import (
+    release_image_replay_enabled,
+    shared_multi_modal_processor_enabled,
+)
 from rlinf.scheduler import Channel
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.agent_loop import (
@@ -302,9 +305,16 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
     async def _complete(self, episode: Episode, request: dict) -> dict:
         """Sample one planner request, record the turn, and return its completion."""
         turn_idx = len(episode.turns)
-        prompt_ids, images, image_grid_thw = await self._render_request(
-            episode, request
-        )
+        release_capture = release_image_replay_enabled(self.cfg.rollout)
+        if release_capture:
+            rendered = await asyncio.to_thread(
+                episode.history.render_token_space, request
+            )
+            prompt_ids, images, multimodal = rendered.input_ids, rendered.images, None
+        else:
+            prompt_ids, images, multimodal = await self._render_request(
+                episode, request
+            )
         sampling_params = {
             "max_new_tokens": self._output_budget(len(prompt_ids)),
             # SGLang skips tokenizer initialization for token-ID requests,
@@ -313,6 +323,10 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         }
         budget = None
         if self._thinking_limit is not None:
+            if release_capture:
+                raise ValueError(
+                    "Thinking budget is unavailable with release image capture"
+                )
             budget = ThinkingBudget.from_prompt(
                 prompt_ids,
                 self._thinking_limit,
@@ -321,9 +335,24 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             )
             sampling_params["custom_params"] = budget.custom_params()
             sampling_params["custom_logit_processor"] = serialized_thinking_processor()
-        # A text turn keeps the plain request; only an image turn carries bytes.
         extra = {"image_data": images} if images else {}
-        if shared_multi_modal_processor_enabled(
+        if release_capture:
+            if images:
+                extra.update(
+                    image_spans=rendered.image_spans,
+                    image_history=episode.history.image_history,
+                    image_token_budget=(
+                        self.cfg.runner.seq_length,
+                        self.cfg.agentloop.minimum_output_tokens,
+                    ),
+                )
+                if self.cfg.tools.rpent.get("store_images_on_disk", False):
+                    extra["image_store_dir"] = str(
+                        Path(self.cfg.tools.rpent.output_dir)
+                        / episode.episode_id
+                        / "training_images"
+                    )
+        elif shared_multi_modal_processor_enabled(
             OmegaConf.select(self.cfg, "rollout.sglang")
         ):
             extra["return_prompt_token_ids"] = True
@@ -331,6 +360,14 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         generated = await self.generate(
             prompt_ids, sampling_params=sampling_params, **extra
         )
+        if release_capture:
+            if images:
+                multimodal = generated["multimodal_input"]
+                prompt_ids = episode.history.accept_token_space(multimodal).input_ids
+                episode.history.image_history = generated["image_history"]
+            else:
+                # The release uses the supplied token IDs directly for text.
+                generated["prompt_token_ids"] = prompt_ids
         self._check_generation(generated, prompt_ids)
         response_ids = generated["output_ids"]
         response_text, calls, message = await self._parse_response(
@@ -356,7 +393,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 ),
                 response_logprobs=generated.get("logprobs"),
                 response_weight_versions=generated.get("weight_versions"),
-                response_images=image_grid_thw,
+                response_images=multimodal,
                 is_end=generated["finish_reason"] == "stop",
                 extra_fields=extra_fields,
             )
@@ -400,19 +437,20 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 raise ValueError(
                     "SGLang consumed different prompt IDs from the recorded trajectory"
                 )
-            vision_ids = {
-                self.tokenizer.convert_tokens_to_ids(marker)
-                for marker in (
-                    "<|image_pad|>",
-                    "<|video_pad|>",
-                    "<|vision_start|>",
-                    "<|vision_end|>",
-                )
-            }
-            if vision_ids.intersection(generated["output_ids"]):
-                raise ValueError(
-                    "Generated vision markers are unsupported in token-space chats"
-                )
+            if not release_image_replay_enabled(self.cfg.rollout):
+                vision_ids = {
+                    self.tokenizer.convert_tokens_to_ids(marker)
+                    for marker in (
+                        "<|image_pad|>",
+                        "<|video_pad|>",
+                        "<|vision_start|>",
+                        "<|vision_end|>",
+                    )
+                }
+                if vision_ids.intersection(generated["output_ids"]):
+                    raise ValueError(
+                        "Generated vision markers are unsupported in token-space chats"
+                    )
         response_ids = generated["output_ids"]
         if not response_ids:
             raise RuntimeError("rollout returned an empty response")

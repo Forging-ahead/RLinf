@@ -540,3 +540,102 @@ def test_bundled_cudart_preserves_library_search_paths(
     monkeypatch.setenv("LD_LIBRARY_PATH", f"/existing:{library}:/another")
     _pin_bundled_cudart()
     assert os.environ["LD_LIBRARY_PATH"] == f"{library}:/existing:/another"
+
+
+@pytest.fixture
+def qwen_image_processor(monkeypatch):
+    """Real SGLang/HF preprocessing; model assets are optional in CPU CI."""
+    model_path = os.environ.get("RLINF_TEST_QWEN_VL_MODEL")
+    if not model_path:
+        pytest.skip("Set RLINF_TEST_QWEN_VL_MODEL to a local Qwen3.5 processor.")
+    pytest.importorskip("sglang")
+    from transformers import AutoConfig, AutoProcessor
+
+    from rlinf.hybrid_engines.sglang.multimodal.qwen_vl import TokenizedQwenVLProcessor
+
+    hf = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    server = SimpleNamespace(
+        mm_process_config={},
+        skip_tokenizer_init=True,
+        disable_fast_image_processor=True,
+        keep_mm_feature_on_device=False,
+        tokenizer_worker_num=1,
+    )
+    # Recent SGLang reads processor settings from a process-local context.
+    # Publish real config bags without initializing the GPU engine.
+    if importlib.util.find_spec("sglang.srt.runtime_context") is not None:
+        from sglang.srt import runtime_context
+        from sglang.srt.server_args import ServerArgs
+
+        server = ServerArgs(
+            model_path=model_path,
+            mm_process_config={},
+            skip_tokenizer_init=True,
+            disable_fast_image_processor=True,
+            mm_preprocess_cache_size_mb=0,
+        )
+        context = runtime_context.RuntimeContext(runtime_context.ParallelContext())
+        context.set_server_args(server)
+        monkeypatch.setattr(runtime_context, "_CONTEXT", context)
+    processor = TokenizedQwenVLProcessor(config, server, hf, "cpu", skip_mm_pool=True)
+    try:
+        yield processor, hf, config
+    finally:
+        processor.io_executor.shutdown()
+        processor.cpu_executor.shutdown()
+
+
+def test_qwen_release_capture_replays_only_real_images(qwen_image_processor):
+    from tempfile import TemporaryDirectory
+    from uuid import uuid4
+
+    from PIL import Image
+
+    from rlinf.hybrid_engines.sglang.multimodal.replay import (
+        CAPTURE_KEY,
+        capture_file,
+        finish_capture,
+    )
+
+    processor, _, config = qwen_image_processor
+    start, pad, end = (
+        config.vision_start_token_id,
+        config.image_token_id,
+        config.vision_end_token_id,
+    )
+    images = [Image.new("RGB", (64, 64), color) for color in ("red", "blue")]
+    ids, spans, history = [], [], None
+    for turn, sampled in enumerate(([pad], [start]), start=1):
+        spans = [*spans, [len(ids) + 1, len(ids) + 2]]
+        ids = [*ids, start, pad, end]
+        with TemporaryDirectory(prefix="rlinf-qwen-") as directory:
+            ticket, rid = Path(directory).name, uuid4().hex
+            request = SimpleNamespace(
+                video_data=None,
+                audio_data=None,
+                rid=rid,
+                sampling_params={
+                    "custom_params": {
+                        CAPTURE_KEY: {
+                            "ticket": ticket,
+                            "image_spans": spans,
+                            "prefix_length": history["length"] if history else 0,
+                        }
+                    }
+                },
+            )
+            output = asyncio.run(
+                processor.process_mm_data_async(images[:turn], ids, request)
+            )
+            entry, history = finish_capture(
+                capture_file(ticket, rid), sampled, history, None
+            )
+        assert entry["prompt_token_ids"] == output.input_ids
+        assert torch.equal(
+            entry["pixel_values"], torch.cat([i.feature.cpu() for i in output.mm_items])
+        )
+        assert len(entry["image_spans"]) == turn
+        assert entry["prompt_token_ids"][: spans[-1][0]] == ids[: spans[-1][0]]
+        ids = output.input_ids + sampled + [start, pad, end]
+        spans = entry["image_spans"]

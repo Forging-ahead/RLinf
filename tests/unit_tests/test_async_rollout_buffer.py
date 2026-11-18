@@ -346,8 +346,11 @@ def test_async_resume_preserves_producer_sampler_order(
     assert restored._restored_pending == [prompt]
 
 
-@pytest.mark.parametrize("saved,current", [(False, True), (True, False)])
-def test_resume_rejects_changed_multimodal_contract(saved, current):
+@pytest.mark.parametrize(
+    "saved,current,release",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_resume_rejects_changed_multimodal_contract(saved, current, release):
     from types import SimpleNamespace
 
     from omegaconf import OmegaConf
@@ -359,6 +362,10 @@ def test_resume_rejects_changed_multimodal_contract(saved, current):
             {"rollout": {"sglang": {"enable_shared_multi_modal_processor": current}}}
         )
     )
+    if release:
+        runner.cfg.rollout.env_vars = {
+            "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE": "rlinf.hybrid_engines.sglang.multimodal"
+        }
     with pytest.raises(ValueError, match="rollout input contract changed"):
         AsyncAgentPPORunner._load_data_state(
             runner, {"async_rollout": {"token_space": saved}}
