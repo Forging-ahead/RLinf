@@ -18,6 +18,8 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 export TOKENIZERS_PARALLELISM=false
+# The prepared Qwen3.8 template defaults to xhigh; omit the unsupported API tier.
+export RPENT_REASONING_EFFORT="${RPENT_REASONING_EFFORT:-none}"
 export NCCL_MAX_CTAS=8
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1

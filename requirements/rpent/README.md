@@ -36,6 +36,11 @@ encoders. No SGLang source backport or import override is installed. Native
 TokenSpace remains available for older runs through upstream's separate profile;
 new H200 runs use release capture and fresh rollout state.
 
+For the prepared Qwen3.8-27B teacher, activation defaults
+`RPENT_REASONING_EFFORT=none` to omit a tier rejected by this SGLang API.
+Thinking stays enabled. The checkpoint's template defaults to xhigh and renders
+the same prompt as an explicit xhigh tier. An explicit CLI option takes priority.
+
 The Bridge wheel uses FLA core for Qwen3.5 and the image's FlashInfer and Hydra
 versions. The Core wheel uses installed distribution metadata for namespace NVRx packages
 and selects the standard checkpoint implementation when their optional async
