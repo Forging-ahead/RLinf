@@ -457,3 +457,108 @@ def test_bridge_replays_literal_media_ids_as_text():
             model.language_model(input_ids=geometry, position_ids=positions), ids
         )
     assert not model.language_model.embedding._forward_pre_hooks
+
+
+def test_qwen_chunked_adapter_bypasses_dense_projection(monkeypatch):
+    from types import SimpleNamespace
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import (
+        forward_qwen_vl_with_chunked_log_probs,
+    )
+
+    torch.manual_seed(12)
+    hidden = torch.randn(7, 1, 4, requires_grad=True)
+    head = torch.nn.Linear(4, 11)
+    head.gradient_accumulation_fusion = False
+    labels = torch.tensor([[2, 4, 1, 3, 5, 2, 8]])
+    mask = labels.remainder(2).bool()
+    temperature = 0.7
+    logits = head(hidden).transpose(0, 1) / temperature
+    expected = logits.log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    expected = expected.masked_fill(~mask, 0)
+    parameters = (hidden, head.weight, head.bias)
+    gradients = torch.autograd.grad(expected.sum(), parameters)
+
+    # This is the Bridge/Core output-processor boundary. A regular head call
+    # after the decoder would materialize the full vocabulary tensor.
+    def postprocess(*, output_processor):
+        return output_processor(
+            hidden_states=hidden,
+            output_layer=head,
+            output_weight=None,
+            labels=None,
+            inference_context=None,
+        )
+
+    language = SimpleNamespace(
+        post_process=True,
+        mtp_process=False,
+        pg_collection=SimpleNamespace(tp=None),
+        config=SimpleNamespace(
+            mtp_num_layers=0,
+            use_mup=False,
+            defer_embedding_wgrad_compute=False,
+            fp8=False,
+        ),
+        _postprocess=postprocess,
+    )
+    monkeypatch.setattr(head, "forward", lambda *_: pytest.fail("dense projection"))
+    result = forward_qwen_vl_with_chunked_log_probs(
+        lambda: language._postprocess(),
+        SimpleNamespace(post_process=True, language_model=language),
+        label=labels,
+        label_mask=mask,
+        chunk_size=2,
+        temperature=temperature,
+    )["log_probs"]
+    torch.testing.assert_close(result, expected)
+    for actual, reference in zip(
+        torch.autograd.grad(result.sum(), parameters), gradients
+    ):
+        torch.testing.assert_close(actual, reference)
+
+
+def test_chunked_actor_scores_variable_length_rows(monkeypatch):
+    from types import SimpleNamespace
+
+    pytest.importorskip("megatron.training")
+    from megatron.core import parallel_state
+    from omegaconf import OmegaConf
+
+    from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
+
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(parallel_state, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(parallel_state, "get_context_parallel_rank", lambda: 0)
+
+    def score(model, module, *, label, label_mask, packed_seq_params, **inputs):
+        assert packed_seq_params.cu_seqlens_q.tolist() == [0, 4, 6, 8]
+        assert label.tolist() == [[2, 3, 0, 0, 0, 0, 6, 0]]
+        assert label_mask.nonzero(as_tuple=True)[1].tolist() == [0, 6]
+        return {"log_probs": label.float().masked_fill(~label_mask, 0)}
+
+    actor = MAMegatronActor.__new__(MAMegatronActor)
+    actor.cfg = OmegaConf.create(
+        {"actor": {}, "algorithm": {"sampling_params": {"temperature": 1.0}}}
+    )
+    actor.transformer_config = SimpleNamespace(sequence_parallel=True)
+    actor.torch_device_type = "cpu"
+    actor.lm_head_chunk_size = 2
+    actor.response_only_logits = False
+    actor.calculate_entropy = False
+    actor.return_loss = False
+    actor.scoring_forward = score
+    monkeypatch.setattr(actor, "_forward_multimodal_inputs", lambda batch: {})
+    model = torch.nn.Module()
+    model.pre_process = model.post_process = True
+    rows = torch.tensor([[1, 2, 3], [4, 9, 9], [5, 6, 9]])
+    batch = {
+        "input_ids": rows,
+        "attention_mask": rows.ne(9),
+        "position_ids": torch.arange(3).expand_as(rows),
+        "response_mask": torch.tensor([[0, 1, 0], [0, 0, 0], [0, 1, 0]]).bool(),
+    }
+    output, collect = actor.get_forward_step_func()(iter([batch]), model)
+    assert collect(output).tolist() == [[0, 2, 0], [0, 0, 0], [0, 6, 0]]

@@ -2094,6 +2094,21 @@ def _validate_steam_ensemble_cfg(actor_cfg: DictConfig) -> None:
 
 
 def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
+    logprob_chunk_size = cfg.actor.get("logprob_chunk_size", 0)
+    if type(logprob_chunk_size) is not int or logprob_chunk_size < 0:
+        raise ValueError("actor.logprob_chunk_size must be a nonnegative integer")
+    if logprob_chunk_size and (
+        cfg.actor.training_backend != "megatron"
+        or not OmegaConf.select(
+            cfg, "agentloop.is_dynamic_rollout_batch", default=False
+        )
+        or cfg.algorithm.get("calculate_entropy", False)
+        or cfg.algorithm.get("entropy_bonus", 0) != 0
+    ):
+        raise ValueError(
+            "actor.logprob_chunk_size requires a dynamic Megatron agent batch "
+            "with entropy calculation disabled"
+        )
     assert cfg.algorithm.recompute_logprobs or cfg.rollout.return_logprobs, (
         "One of `algorithm.recompute_logprobs` or `rollout.return_logprobs` must be True to compute `prev_logprobs`."
     )
@@ -2144,6 +2159,12 @@ def validate_qwen_vl_chunked_cfg(cfg) -> int:
         )
     if size == 0:
         return 0
+    if cfg.actor.get("training_backend") != "megatron" or not OmegaConf.select(
+        cfg, "agentloop.is_dynamic_rollout_batch", default=False
+    ):
+        raise ValueError(
+            "Chunked LM-head scoring requires a dynamic-batch Megatron Actor"
+        )
     if (
         not cfg.actor.megatron.get("mbridge", False)
         or cfg.actor.model.model_type != "qwen3_5"
@@ -2158,6 +2179,8 @@ def validate_qwen_vl_chunked_cfg(cfg) -> int:
         raise ValueError(
             "Qwen-VL chunked scoring supports entropy metrics only; entropy_bonus must be zero"
         )
+    if cfg.actor.model.get("load_mtp", False):
+        raise ValueError("Qwen-VL chunked scoring requires actor.model.load_mtp=False")
     for option in (
         "fp8",
         "mtp_num_layers",
