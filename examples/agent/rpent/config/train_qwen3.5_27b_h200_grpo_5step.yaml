@@ -22,6 +22,8 @@ rollout:
     enable_cache_report: true
 
 actor:
+  env_vars:
+    CUDA_DEVICE_MAX_CONNECTIONS: "1"
   logprob_chunk_size: 256
   response_only_logits: true
   model:
