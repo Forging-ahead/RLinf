@@ -103,8 +103,8 @@ revisions. Install on every node, then activate the same environment:
 .. code-block:: bash
 
    export STACK_ROOT=/mnt/public/xzxuan
-   bash "$STACK_ROOT/envs/offline_package/install.sh"
-   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/install.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
    python -m pip check
 
 The installer checks image versions and SHA256 hashes, backs up replaced
@@ -112,12 +112,19 @@ packages and installs local wheels without network access. Repeating it keeps
 the same package versions. ``requirements/rpent/README.md`` describes the
 package layout and dependency builds.
 
-This profile uses SGLang ``0.5.12.post1``, Transformers 5.8.1,
-Megatron-Core ``0.18.0+rpent.cu128.1``, Bridge ``0.5.0+rpent.cu128.1``,
-NumPy 1.26.4, MuJoCo 3.3.0 and robosuite 1.5.2. RLinf's upstream image processor captures actual serving prompt IDs,
-pixels, image spans, grid and M-RoPE for learner replay. SGLang is the unmodified
-release; no source backport is needed. The Core wheel includes the CPU-offload
-checkpoint repair.
+The minimal release keeps the image's SGLang 0.5.12.post1, Transformers 5.6.1,
+NumPy 2.2.0, Megatron-Core checkout at ``dc0ee41ad`` and official Bridge 0.5.0.
+It installs FLA core 0.6.0, MuJoCo 3.3.0, robosuite 1.5.2, SAM3 and the paired
+projects. OpenAI SDK 3.19.0 supplies the interfaces required by RPent's planner.
+The benchmark wheels use the prepared robosuite 1.5 adapter, including the
+``NullBase`` declaration for ground-mounted Panda models.
+Core and Bridge are neither patched nor repackaged; preserve the Core source
+path set by the image activation. The installer retains its pip-check report;
+optional metadata conflicts are distinct from runtime failures.
+
+RLinf captures serving prompt IDs, pixels, image spans, grid and M-RoPE for
+learner replay with the unmodified SGLang release. The earlier compatibility
+wheel bundle remains a separate historical release.
 
 RLinf, its RPent planner subprocesses, SGLang, SAM3 and LIBERO all use
 ``/opt/venv/reason/bin/python``. Use this path for ``tools.rpent.python``.
@@ -182,7 +189,7 @@ On each of the four nodes, activate the environment and start its local services
 
 .. code-block:: bash
 
-   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
    python -m robots.rl.services \
      --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
      --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
@@ -261,9 +268,29 @@ groups of four from 20 candidate groups, runs one update and saves a checkpoint:
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
+
+For 27B acceptance, use the following profile with all deployment model and
+tokenizer paths set to the full 27B checkpoint:
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_27b_h200_grpo_5step \
+     --config-dir "$CONFIG_DIR" +deployment@_global_=local
+
+The profile launches 40 groups of eight episodes and trains on the first
+32 complete groups. It runs five optimizer updates and saves a checkpoint after
+each. Provision ten environments and one SAM3 per GPU.
+
+Start with rollout TP1 and actor TP2/CP1/DP16 with sequence parallelism (SP).
+Disable multi-token prediction (MTP) and use 256-token logprob and LM-head chunks.
+Keep Core and Bridge unchanged. LM-head chunking supports CP1; disable it before
+validating multimodal inputs, masks and gradients with a CP fallback.
+The prepared ``Qwen3.8-27B`` directory declares the dense Qwen3.5 architecture.
+Restore a saved checkpoint and generate fresh replies from the restored weights
+before accepting the run. Do not extend it to 150 updates automatically.
 
 For a full run, use ``train_qwen3.5_4b_episode_sync_grpo``. It selects 32
 complete groups from 40 candidate groups, with eight episodes per group.

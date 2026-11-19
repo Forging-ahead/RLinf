@@ -84,13 +84,15 @@ GRPO 如何训练
 .. code-block:: bash
 
    export STACK_ROOT=/mnt/public/xzxuan
-   bash "$STACK_ROOT/envs/offline_package/install.sh"
-   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/install.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
    python -m pip check
 
-安装器检查镜像版本与 SHA256，备份被替换的包，再完全离线安装本地 wheel。重复执行不会改变包版本。离线包结构与依赖构建说明见 ``requirements/rpent/README.md``。
+安装器检查镜像版本与 SHA256，备份被替换的包，再完全离线安装本地 wheel。重复安装会检查已安装包的文件，并保持版本不变。离线包结构与依赖构建说明见 ``requirements/rpent/README.md``。
 
-该配置使用 SGLang ``0.5.12.post1``、Transformers 5.8.1、Megatron-Core ``0.18.0+rpent.cu128.1``、Bridge ``0.5.0+rpent.cu128.1``、NumPy 1.26.4、MuJoCo 3.3.0 和 robosuite 1.5.2。RLinf 上游图像处理器保存推理实际使用的 prompt ID、像素、图片区间、grid 和 M-RoPE，供训练端回放。SGLang 使用未修改的发布版，无需回移源码。Core wheel 包含 CPU offload checkpoint 修补。
+最小安装包保留镜像的 SGLang 0.5.12.post1、Transformers 5.6.1、NumPy 2.2.0、commit 为 ``dc0ee41ad`` 的 Megatron-Core checkout，以及官方 Bridge 0.5.0。补装 FLA core 0.6.0、MuJoCo 3.3.0、robosuite 1.5.2、SAM3 和配套项目。OpenAI SDK 3.19.0 提供 RPent planner 所需的接口。benchmark wheel 使用已准备的 robosuite 1.5 适配，包括地面 Panda 模型的 ``NullBase`` 声明。Core 和 Bridge 均不打补丁、不重新打包；保留镜像激活脚本设置的 Core 源码路径。安装器保存 pip-check 报告，报告中的元数据冲突还需结合运行测试判断。
+
+RLinf 使用未修改的 SGLang 发布版，保存实际推理的 prompt ID、像素、图片区间、grid 和 M-RoPE，供 learner 回放。早期兼容 wheel 包单独保留为历史版本。
 
 RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv/reason/bin/python``，``tools.rpent.python`` 也设为该路径。安装后的 benchmark 包通过软链接引用共享资源。模型及资源准备见 RPent 的 ``tools/rl/INSTALL.md``。不要替换运行中作业使用的环境。
 
@@ -147,7 +149,7 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 
 .. code-block:: bash
 
-   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
    python -m robots.rl.services \
      --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
      --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
@@ -210,11 +212,24 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/offline_package/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
 该 smoke 从 20 个候选组中选入 16 个完整组，每组 4 条，并发 80 个环境，完成一次更新后保存 checkpoint。正式配置继续使用 ``train_qwen3.5_4b_episode_sync_grpo`` 的 32/40 组、每组 8 条，须另行配置足够的环境容量。
+
+27B 验收使用以下配置，部署 profile 中的模型和 tokenizer 路径均指向完整 27B checkpoint：
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_27b_h200_grpo_5step \
+     --config-dir "$CONFIG_DIR" +deployment@_global_=local
+
+每批启动 40 个候选组，每组 8 条 episode，选入最先完整结束的 32 组。完成 5 次 optimizer 更新，每次更新后保存 checkpoint。每张 GPU 配置 10 个环境和 1 个 SAM3 实例。
+
+起始布局为 rollout TP1、actor TP2/CP1/DP16，开启序列并行（SP），关闭多 token 预测（MTP）。logprob 和 LM-head 分块均为 256 token。Core 和 Bridge 保持原样。LM-head 分块仅支持 CP1；使用 CP 并行前，先关闭 LM-head 分块，再单独验证多模态输入、mask 和梯度。准备好的 ``Qwen3.8-27B`` 目录声明的是 dense Qwen3.5 架构。验收时还须恢复保存的 checkpoint，并用恢复后的权重生成新回复。验收结束后停止运行，不自动延长到 150 次更新。
+
+完整训练使用 ``train_qwen3.5_4b_episode_sync_grpo``：40 个候选组中选入最先完整结束的 32 组，每组 8 条 episode。启动前先验证环境服务容量。
 
 actor 使用 TP2/CP1/DP16，rollout 为 32 个 TP1 副本。actor、critic、rollout 保持 ``NCCL_MAX_CTAS=8``，SGLang 显存比例为 0.55。该比例不是共用 GPU 的总显存上限；对比实验时保持相同的 placement 和显存设置。
 

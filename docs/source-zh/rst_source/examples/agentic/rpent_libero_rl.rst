@@ -124,7 +124,7 @@ RPent 多模态强化学习
 
 使用 ``train_qwen3.5_4b_episode_sync_grpo`` 运行原 episode 工作流的分组 GRPO。RPent 代码中须包含 ``robots.rl.rl_episode``\ 。配置每批训练 32 组、每组 8 条 episode，同时启动 40 个候选组。同组共享任务和初始状态，分别独立采样。最先完整结束的 32 组用于训练；其余组取消并清理后才开始学习。组内 reward 全相同的组也保留。该配置不使用 critic，clip 上界为 0.28。``group_level``\ 、``agent_level`` 和 ``turn_level`` 三层 loss scale 使用现有的轨迹、agent 和有效 token 字段。
 
-GRPO 配置启用实验性 TokenSpace、共享图像预处理和 learner 图像预取。在部署 profile 中填写共享的 ``rollout.sglang.token_space_preprocess_cache_dir``\ ，安装固定版本的实验依赖，并重新采集 rollout。旧图像记录不能进入此路径。规划器沿用原 episode 工作流、提示词、工具和动作格式。先确认一次完整 optimizer 更新和下一批同步后的 rollout，再转入无人值守运行。
+GRPO 配置保存推理实际使用的 prompt token 和多模态输入，供 learner 回放。H200 最小环境使用未修改的 SGLang 0.5.12.post1，不需要定制 serving wheel 或预处理缓存路径。启用输入保存后重新采集 rollout；旧图像记录缺少这些输入，不能用于 learner 回放。规划器仍使用原 episode 工作流、提示词、工具和动作格式。单环境安装与 27B 五步验收配置见 :doc:`rpent_episode_sync`。
 
 结果与验证
 ----------
