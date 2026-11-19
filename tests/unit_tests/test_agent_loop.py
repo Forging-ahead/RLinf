@@ -1012,6 +1012,55 @@ def test_sync_candidates_emit_completed_failures_and_cancel_tail_after_cleanup(i
     asyncio.run(run())
 
 
+def test_sync_sampling_counts_remain_worker_local_after_metric_gather():
+    async def run():
+        gates = [asyncio.Event() for _ in range(3)]
+
+        async def query(input_ids, answer):
+            await gates[answer].wait()
+            return _candidate_output()
+
+        worker = _candidate_worker(query)
+        worker._world_size = 2
+        worker._group_name = "AgentGroup"
+        remote_messages = iter(
+            [
+                [{}],
+                [
+                    {
+                        "__sum__/sampling/candidates": 3,
+                        "__sum__/sampling/selected": 1,
+                        "__sum__/sampling/dropped": 2,
+                        "__sum__/sampling/cancelled": 2,
+                    }
+                ],
+            ]
+        )
+        worker.recv = lambda *args, **kwargs: next(remote_messages)
+        channel = _QueueChannel()
+        request = _request(n_groups=3, group_size=1, group_ids=[0, 1, 2])
+        request.answers = [0, 1, 2]
+        request.cohort_id, request.weight_version = "counted-cohort", 2
+        rollout = asyncio.create_task(
+            worker.run_agentloop_rollout(SimpleNamespace(get=lambda: request), channel)
+        )
+        for candidate in (0, 1):
+            gates[candidate].set()
+            await channel.get(async_op=True).async_wait()
+        receipt = await worker.cancel_rollout_candidates("counted-cohort", [0, 1, 3])
+        metrics = await asyncio.wait_for(rollout, timeout=3)
+        assert metrics["sampling/candidates"] == 6
+        assert metrics["sampling/selected"] == 3
+        assert metrics["sampling/dropped"] == 3
+        assert metrics["sampling/cancelled"] == 3
+        assert sum(row["kept"] for row in receipt["candidates"]) == 2
+        learner = _QueueChannel()
+        admitted = await worker.admit_rollout_candidates("counted-cohort", [learner])
+        assert admitted["admitted"] == 2
+
+    asyncio.run(run())
+
+
 def test_sync_candidate_failure_remains_an_error_not_a_replacement_or_zero_reward():
     async def run():
         async def query(input_ids, answer):

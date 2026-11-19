@@ -969,6 +969,7 @@ class MultiAgentLoopWorker(PartialRolloutMixin, AgentLoopWorker):
                 for candidate_id in state["records"]
                 if candidate_id in state["selected"]
             ]
+            selected_count = len(metrics)
             agent_metrics = (
                 self.post_process_metric(metrics)
                 if state["selected"]
@@ -979,9 +980,9 @@ class MultiAgentLoopWorker(PartialRolloutMixin, AgentLoopWorker):
                 [
                     {
                         "__sum__/sampling/candidates": len(state["records"]),
-                        "__sum__/sampling/selected": len(metrics),
+                        "__sum__/sampling/selected": selected_count,
                         "__sum__/sampling/dropped": len(state["records"])
-                        - len(metrics),
+                        - selected_count,
                         "__sum__/sampling/cancelled": sum(
                             record["status"] == "cancelled"
                             for record in state["records"].values()
