@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
@@ -175,7 +174,7 @@ class MAMegatronActor(MegatronActor):
         )
 
     def _scored_positions(
-        self, batch: dict[str, torch.Tensor], attention_mask: torch.Tensor
+        self, label_mask: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor | None:
         """Packed positions predicting a response token, or None to score all.
 
@@ -183,9 +182,7 @@ class MAMegatronActor(MegatronActor):
         """
         if not self.response_only_logits:
             return None
-        scored = torch.zeros_like(attention_mask)
-        scored[:, :-1] = batch["response_mask"][:, 1:]
-        packed = preprocess_packed_seqs(scored, attention_mask)[0][0]
+        packed = preprocess_packed_seqs(label_mask, attention_mask)[0][0]
         positions = packed.nonzero(as_tuple=True)[0]
         # Loss-free balancing rows still evaluate one output row.
         return positions if len(positions) else positions.new_zeros(1)
@@ -205,7 +202,7 @@ class MAMegatronActor(MegatronActor):
             batch = next(dataloader_iter)
 
             batch = {
-                key: val.cuda() if torch.is_tensor(val) else val
+                key: val.to(self.torch_device_type) if torch.is_tensor(val) else val
                 for key, val in batch.items()
             }
 
@@ -213,22 +210,17 @@ class MAMegatronActor(MegatronActor):
             attention_mask = batch["attention_mask"]
             position_ids = batch["position_ids"]
 
-            # In DynamicRolloutResult, we need to shift the labels to align with model outputs
-            # Create labels by shifting input_ids to the left (next token prediction)
-            label = copy.deepcopy(position_ids)
-            label[:, :-1] = input_ids[:, 1:]
-
-            # response_mask needs to be shifted left by 1 to align with the shifted labels
-            # because response_mask[i] indicates whether position i is a response token in input_ids
-            # but label[i] = input_ids[i+1], so we need to shift response_mask left to align
+            # Shift within each trajectory before packing rows for tensor parallelism.
+            label = torch.zeros_like(input_ids)
+            label[:, :-1] = input_ids[:, 1:].masked_fill(~attention_mask[:, 1:], 0)
             mask_source = (
                 batch["response_mask"]
-                if self.lm_head_chunk_size
-                else batch["attention_mask"]
+                if self.lm_head_chunk_size or self.response_only_logits
+                else attention_mask
             )
-            label_mask = copy.deepcopy(mask_source)
-            label_mask[:, :-1] = label_mask[:, 1:].clone()  # Shift left by 1
-            label_mask[:, -1] = False
+            label_mask = torch.zeros_like(attention_mask)
+            label_mask[:, :-1] = mask_source[:, 1:]
+            logprob_chunk_size = self.cfg.actor.get("logprob_chunk_size", 0)
             chunked_logprobs = self.response_only_logits and not self.calculate_entropy
 
             def logits_processor(logits, label, label_mask):
@@ -247,7 +239,8 @@ class MAMegatronActor(MegatronActor):
                     log_probs = vocab_parallel_log_probs_from_logits(
                         logits,
                         label,
-                        chunk_size=256 if self.response_only_logits else 0,
+                        chunk_size=logprob_chunk_size
+                        or (256 if chunked_logprobs else 0),
                         temperature=self.cfg.algorithm.sampling_params.temperature
                         if chunked_logprobs
                         else 1.0,
@@ -267,7 +260,7 @@ class MAMegatronActor(MegatronActor):
             positions = (
                 None
                 if self.lm_head_chunk_size
-                else self._scored_positions(batch, attention_mask)
+                else self._scored_positions(label_mask, attention_mask)
             )
             if positions is not None:
                 logits_processor = _at_positions(logits_processor, positions)
