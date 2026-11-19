@@ -680,6 +680,7 @@ def weight_sync_receiver(monkeypatch):
         scheduler.chunked_req = None
         scheduler.enable_overlap = False
         scheduler._sync_draft_model = None
+        scheduler._rlinf_weight_version = 0
         monkeypatch.setattr(native.Scheduler, "flush_cache", flush_cache)
         monkeypatch.setattr(
             Worker.torch_platform, "synchronize", lambda: events.append(("sync", None))
@@ -687,6 +688,16 @@ def weight_sync_receiver(monkeypatch):
         return scheduler, model, events, replies
 
     return make
+
+
+def test_sglang_weight_sync_publishes_new_version(weight_sync_receiver):
+    from rlinf.hybrid_engines.sglang.common.io_struct import SyncHFWeightInput
+
+    expected = {"weight": torch.tensor([[1.0, 2.0]])}
+    scheduler, model, _, _ = weight_sync_receiver(expected, [expected])
+    result = scheduler.sync_hf_weight(SyncHFWeightInput(weight_version=7))
+    _assert_tensor_bits_equal(model.weight, expected["weight"])
+    assert result.weight_version == scheduler._rlinf_weight_version == 7
 
 
 @pytest.mark.parametrize("idle", [False, True])
@@ -1118,6 +1129,7 @@ def test_qwen35_provider_keeps_virtual_pipeline_config(tmp_path, monkeypatch):
             virtual_pipeline_model_parallel_size=2,
         ),
         _rank=1,
+        is_dedicated_critic_model=False,
     )
 
     class ModelConstructionReached(Exception):
