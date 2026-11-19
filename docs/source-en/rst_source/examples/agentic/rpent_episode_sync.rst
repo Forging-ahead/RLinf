@@ -103,8 +103,8 @@ revisions. Install on every node, then activate the same environment:
 .. code-block:: bash
 
    export STACK_ROOT=/mnt/public/xzxuan
-   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/install.sh"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
+   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/install.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    python -m pip check
 
 The installer checks image versions and SHA256 hashes, backs up replaced
@@ -189,7 +189,7 @@ On each of the four nodes, activate the environment and start its local services
 
 .. code-block:: bash
 
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    python -m robots.rl.services \
      --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
      --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
@@ -197,8 +197,8 @@ On each of the four nodes, activate the environment and start its local services
 Use a fresh output directory on each start. The service manager launches one SAM3 per
 GPU, a local pool on port 28424 and an environment backend on port 28490.
 It stops its child processes on exit. Each GPU has three environment slots;
-the four nodes can host all 80 smoke candidates concurrently. Production's
-320-candidate recipe needs a separately qualified capacity configuration.
+the four nodes can host all 80 smoke candidates concurrently. Validate environment
+capacity separately before running the 320-candidate configuration.
 Completed episodes release their slots; all slots are released before learning.
 SAM3 stays resident during the learner phase.
 
@@ -268,7 +268,7 @@ groups of four from 20 candidate groups, runs one update and saves a checkpoint:
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
@@ -284,11 +284,15 @@ The profile launches 40 groups of eight episodes and trains on the first
 32 complete groups. It runs five optimizer updates and saves a checkpoint after
 each. Provision ten environments and one SAM3 per GPU.
 
-Start with rollout TP1 and actor TP2/CP1/DP16 with sequence parallelism (SP).
+Use rollout TP1 and actor TP4/CP1/DP8 with sequence parallelism (SP).
 Disable multi-token prediction (MTP) and use 256-token logprob and LM-head chunks.
-Keep Core and Bridge unchanged. LM-head chunking supports CP1; disable it before
-validating multimodal inputs, masks and gradients with a CP fallback.
+Keep Core and Bridge unchanged. LM-head chunking and response-only projection
+support CP1. Before evaluating CP, set ``actor.model.lm_head_chunk_size=0`` and
+``actor.response_only_logits=false``, then validate multimodal inputs, masks,
+gradients and loss normalization separately.
 The prepared ``Qwen3.8-27B`` directory declares the dense Qwen3.5 architecture.
+RLinf reads its layer count, dimensions, attention heads and embedding ties
+from the model config.
 Restore a saved checkpoint and generate fresh replies from the restored weights
 before accepting the run. Do not extend it to 150 updates automatically.
 
@@ -310,12 +314,14 @@ and the shared TokenSpace configuration:
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
 PPO uses 320 independent candidates and the first 256 complete episodes,
-an independent critic and chronological episode GAE. GRPO's group normalization
+an independent critic and GAE computed in temporal order over each complete
+episode. GRPO's group normalization
 does not apply to that PPO recipe.
 
 Inspect the first complete optimizer update, weight synchronization and the next
-online episode before leaving a new installation unattended. A finished cohort
-or a single TensorBoard tag does not establish a completed update. GPU numerical parity and compatibility with other driver or kernel versions
+online episode before leaving a new installation unattended. Completing a batch
+of sampled episodes or recording a single TensorBoard tag does not prove that
+an optimizer update has completed. GPU numerical parity and compatibility with other driver or kernel versions
 remain unverified for a new installation.
 
 Resume, Export and Evaluate
@@ -348,7 +354,8 @@ Use the TokenSpace rollout settings from the training profile:
 Use an output directory separate from training. Keep the original SFT directory
 and every checkpoint. Normal failures and output/context/turn/time limits have
 zero reward; only classified infrastructure failures have the configured bounded
-retry. A second exhausted infrastructure attempt must stop admission for review.
+retry. If the second infrastructure attempt also fails, stop accepting data from
+that batch and investigate.
 
 Visualization and Results
 -------------------------

@@ -84,8 +84,8 @@ GRPO 如何训练
 .. code-block:: bash
 
    export STACK_ROOT=/mnt/public/xzxuan
-   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/install.sh"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
+   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/install.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    python -m pip check
 
 安装器检查镜像版本与 SHA256，备份被替换的包，再完全离线安装本地 wheel。重复安装会检查已安装包的文件，并保持版本不变。离线包结构与依赖构建说明见 ``requirements/rpent/README.md``。
@@ -149,7 +149,7 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 
 .. code-block:: bash
 
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    python -m robots.rl.services \
      --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
      --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
@@ -212,7 +212,7 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3/activate.sh"
+   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
@@ -227,7 +227,9 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 
 每批启动 40 个候选组，每组 8 条 episode，选入最先完整结束的 32 组。完成 5 次 optimizer 更新，每次更新后保存 checkpoint。每张 GPU 配置 10 个环境和 1 个 SAM3 实例。
 
-起始布局为 rollout TP1、actor TP2/CP1/DP16，开启序列并行（SP），关闭多 token 预测（MTP）。logprob 和 LM-head 分块均为 256 token。Core 和 Bridge 保持原样。LM-head 分块仅支持 CP1；使用 CP 并行前，先关闭 LM-head 分块，再单独验证多模态输入、mask 和梯度。准备好的 ``Qwen3.8-27B`` 目录声明的是 dense Qwen3.5 架构。验收时还须恢复保存的 checkpoint，并用恢复后的权重生成新回复。验收结束后停止运行，不自动延长到 150 次更新。
+采用 rollout TP1、actor TP4/CP1/DP8，开启序列并行（SP），关闭多 token 预测（MTP）。logprob 和 LM-head 分块均为 256 token，Core 和 Bridge 保持原样。LM-head 分块与只计算回复位置的 logits 都仅支持 CP1。评估 CP 并行前，设置 ``actor.model.lm_head_chunk_size=0`` 和 ``actor.response_only_logits=false``，再单独验证多模态输入、mask、梯度及损失归一化。
+
+准备好的 ``Qwen3.8-27B`` 目录声明的是 dense Qwen3.5 架构。RLinf 从模型配置读取层数、维度、注意力头数和 embedding 绑定关系。验收时还须恢复保存的 checkpoint，并用恢复后的权重生成新回复。验收结束后停止运行，不自动延长到 150 次更新。
 
 完整训练使用 ``train_qwen3.5_4b_episode_sync_grpo``：40 个候选组中选入最先完整结束的 32 组，每组 8 条 episode。启动前先验证环境服务容量。
 
@@ -243,7 +245,7 @@ PPO 可以共用相同的预处理环境，启动时选择 PPO 配置和 TokenSp
 
 该 PPO 配置同时启动 320 个独立候选，选最先完整结束的 256 条，使用独立 critic 和按完整 episode 时间顺序计算的 GAE，不使用 GRPO 组内归一化。
 
-新环境首次运行时，先核实完整 optimizer 更新、权重同步和下一批真实在线 episode。cohort 完成或单个 TensorBoard tag 不代表一次更新已完成。新环境的 GPU 数值一致性及其他驱动、内核版本的兼容性仍需验证。
+新环境首次运行时，先核实完整 optimizer 更新、权重同步和下一批真实在线 episode。一批采样完成或出现单个 TensorBoard tag，均不能证明 optimizer 已完成一次更新。新环境的 GPU 数值一致性及其他驱动、内核版本的兼容性仍需验证。
 
 恢复、导出和评测
 ~~~~~~~~~~~~~~~~
@@ -288,6 +290,6 @@ pear 配置在每次动作后提供双相机 RGB 和实测机器人状态，沿�
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_pear_sync_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
-配置默认 ``tools.rpent.world_cord=general``：原点在安装基座中心，x 向前、y 向左、z 向上，抓取 TCP 是两指指垫中心的实测中点，初始观测给出桌面相对基座的高度。现有 LIBERO 感知工作流也会按此设置返回几何坐标。设为 ``tools.rpent.world_cord=base`` 可保留仿真世界坐标和原控制点。
+配置默认使用 ``tools.rpent.world_cord=general``。原点在安装基座中心，x 向前、y 向左、z 向上。抓取 TCP 是两指指垫中心的实测中点。初始观测给出桌面相对基座的高度。现有 LIBERO 感知工作流也会按此设置返回几何坐标。设为 ``tools.rpent.world_cord=base`` 可保留仿真世界坐标和原控制点。
 
 thinking 默认开启。添加 ``agentloop.chat_template_kwargs.enable_thinking=false`` 后，要求模型直接调用工具，不输出推理文本。RPent CLI 对应 ``--reasoning`` 和 ``--no-reasoning``。切换工作流或坐标系时，使用独立运行目录，并固定源码版本；原有 SFT 工作流仍保留默认行为。

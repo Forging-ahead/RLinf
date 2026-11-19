@@ -1,6 +1,6 @@
 # Install RPent in the Reason Image
 
-The minimal H200 release extends `/opt/venv/reason`. RLinf, SGLang, RPent,
+Install the minimal H200 release into `/opt/venv/reason`. RLinf, SGLang, RPent,
 SAM3 and LIBERO use that interpreter. Core and Bridge retain their original
 files and import paths. The LIBERO wheels are built from the prepared benchmark
 sources: ground-mounted Panda models declare the robosuite 1.5 `NullBase`
@@ -9,7 +9,7 @@ use the versioned minimal release for fresh reason images.
 
 ```bash
 export STACK_ROOT=/mnt/public/xzxuan
-export PACKAGE_ROOT="$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v3"
+export PACKAGE_ROOT="$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5"
 bash "$PACKAGE_ROOT/install.sh"
 source "$PACKAGE_ROOT/activate.sh"
 ```
@@ -81,7 +81,8 @@ replace it with a wheel or source overlay.
 Use `train_qwen3.5_27b_h200_grpo_5step` with a deployment profile containing
 the complete local 27B checkpoint, task manifest, RPent checkout, benchmark
 config and fresh output paths. `Qwen3.8-27B` is the prepared directory name;
-its config declares dense `Qwen3_5ForConditionalGeneration`.
+its config declares dense `Qwen3_5ForConditionalGeneration`. RLinf reads the
+layer count, dimensions, attention heads and embedding ties from that config.
 
 ```bash
 cd "$RLINF_ROOT"
@@ -97,7 +98,7 @@ they use the node-local environment backend and SAM3 pool.
 The profile selects 32 complete groups of eight from 40 candidate groups,
 uses the `episode` workflow in simulator coordinates (`world_cord=base`),
 and runs five optimizer updates with a checkpoint after each.
-Initial parallelism is rollout TP1 and actor TP2/CP1/PP1/DP16 with sequence
+Use rollout TP1 and actor TP4/CP1/PP1/DP8 with sequence
 parallelism (SP). Multi-token prediction (MTP) and the
 MCore HybridDeviceOptimizer are disabled; stage offload remains enabled.
 Logprob and LM-head chunks are 256. The remaining GRPO settings inherit the

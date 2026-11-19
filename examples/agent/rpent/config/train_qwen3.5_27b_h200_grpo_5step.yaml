@@ -29,7 +29,7 @@ actor:
   model:
     load_mtp: false
     lm_head_chunk_size: 256
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 4
     sequence_parallel: true
     context_parallel_size: 1
     pipeline_model_parallel_size: 1
