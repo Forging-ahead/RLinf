@@ -4,6 +4,7 @@ defaults:
 
 runner:
   task_type: reasoning_eval
+  synchronous: false
   experiment_name: rpent-episode-qwen3.5-4b-eval
   max_epochs: 1
   max_steps: -1
