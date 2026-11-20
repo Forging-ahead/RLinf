@@ -4,6 +4,7 @@ defaults:
 
 runner:
   task_type: reasoning_eval
+  # Evaluation loads fixed HF weights without actor synchronization.
   synchronous: false
   experiment_name: rpent-episode-qwen3.5-4b-eval
   max_epochs: 1

@@ -607,8 +607,9 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
         ("train_qwen3.5_4b_episode_sync_grpo", True),
     ],
 )
+@pytest.mark.parametrize("version", [None, 0])
 def test_episode_recipes_distinguish_static_weights_from_actor_sync(
-    make_agent, recipe, requires_sync
+    make_agent, recipe, requires_sync, version
 ):
     cfg = compose(config_name=recipe)
     worker = make_agent(FakeRPent(turns=1))
@@ -630,15 +631,26 @@ def test_episode_recipes_distinguish_static_weights_from_actor_sync(
     )
     worker.cfg.tools.rpent.entrypoint = "robots.libero_rl.rl_episode"
     worker.cfg.algorithm.sampling_params.update(cfg.algorithm.sampling_params)
-    if requires_sync:
+    generate = worker.generate
+
+    async def versioned(*args, **kwargs):
+        result = await generate(*args, **kwargs)
+        if version is not None:
+            result.update(version_start=version, version_end=version)
+        return result
+
+    worker.generate = versioned
+    if requires_sync and version is None:
         with pytest.raises(ValueError, match="installed weight version"):
             run_query(worker)
         return
     result = run_query(worker)
     assert result.extra_fields["turns"] == 1
     (turn,) = result.single_turn_outputs
-    assert turn.version_start is None and turn.version_end is None
+    assert turn.version_start == turn.version_end == version
     assert len(turn.response_ids) == len(turn.response_logprobs)
+    if requires_sync:
+        assert set(turn.response_weight_versions) == {version}
 
 
 @pytest.mark.parametrize(
