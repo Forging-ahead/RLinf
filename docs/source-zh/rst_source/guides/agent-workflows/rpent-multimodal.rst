@@ -80,7 +80,7 @@ CPU 测试覆盖缓存复用、图片校验、预取顺序和线程清理。GPU 
 
 工具结果和图片保留在后续输入中。Policy loss 只作用于 policy 生成的 assistant token，user/tool/history token 不参与监督。逐 token 前缀兼容的连续 turn 合并，压缩或历史改写后分段。Actor 和 critic 使用相同的 response 位置映射；共享轨迹 packing 在任意一个计分 token 重叠时都会保留独立行，避免合并覆盖学习目标；这也适用于纯文本 SearchR1。回归测试比较 packing 前后的 loss 和梯度。response-only logits 要求 CP1。
 
-启用 ``tools.rpent.store_images_on_disk=true`` 时，所有 rollout 和 learner 进程必须能读取 **相同绝对路径下的图像** 。``tools.rpent.output_dir`` 需要在模型节点与环境节点间共享，并在轨迹或保存的 checkpoint 仍引用它时保留；不同节点上同名的本地目录不够。没有共享图像存储时保留默认 ``false``，让轨迹携带图像字节，但内存成本更高。不要清理可恢复 checkpoint 所需的 Episode 产物。
+RPent 通过 RPC 将仿真图像复制到 planner。轨迹或 checkpoint 引用这些图像期间，所有 RLinf rollout 和 learner worker 都应能读取 ``tools.rpent.output_dir`` 的同一绝对路径。仿真服务可以使用自己的存储。如果 RLinf worker 没有共享存储，将 ``tools.rpent.store_images_on_disk`` 设为 ``false``，让轨迹携带图像字节。
 
 保留多轮图像的 token 边界
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
