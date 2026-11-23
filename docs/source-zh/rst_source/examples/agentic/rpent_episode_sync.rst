@@ -27,7 +27,7 @@ RPent Episode 训练
 
    {"prompt":"Adjust the bottle","answer":"{\"environment\":\"robotwin\",\"task_name\":\"adjust_bottle\",\"seed\":100000,\"task_config\":\"demo_randomized\"}"}
 
-LIBERO 使用 ``suite``、``task`` 和 ``seed``。RoboCasa 和 RoboDojo 使用 ``task_name`` 和 ``seed``，RoboDojo 还可指定 ``layout``。在 LIBERO 环境中运行 ``examples/agent/rpent/prepare_tasks.py`` 生成原生任务池，其余仿真器各提供一份任务清单。
+LIBERO 使用 ``suite``、``task`` 和 ``seed``。RoboCasa 和 RoboDojo 使用 ``task_name`` 和 ``seed``。RoboDojo 的 ``seed`` 选择 ``Assets/Eval_Layout`` 中已安装的组，``layout`` 指定组内索引。在 LIBERO 环境中运行 ``examples/agent/rpent/prepare_tasks.py`` 生成原生任务池，其余仿真器各提供一份任务清单。
 
 启动训练
 --------

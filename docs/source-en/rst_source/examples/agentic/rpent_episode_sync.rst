@@ -37,7 +37,8 @@ containing the simulator task as JSON. For example, a RoboTwin row is:
    {"prompt":"Adjust the bottle","answer":"{\"environment\":\"robotwin\",\"task_name\":\"adjust_bottle\",\"seed\":100000,\"task_config\":\"demo_randomized\"}"}
 
 LIBERO tasks use ``suite``, ``task`` and ``seed``. RoboCasa and RoboDojo use
-``task_name`` and ``seed``. RoboDojo also accepts ``layout``. Run
+``task_name`` and ``seed``. In RoboDojo, select a seed group installed in
+``Assets/Eval_Layout`` and set ``layout`` to an index within that group. Run
 ``examples/agent/rpent/prepare_tasks.py`` inside the LIBERO environment to
 build its native task pool, and supply a separate task list for each other
 simulator.
