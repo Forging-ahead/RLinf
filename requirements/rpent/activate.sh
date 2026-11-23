@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Source this file after installing the offline package.
-RPENT_OFFLINE_PACKAGE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export STACK_ROOT="$(cd -- "$RPENT_OFFLINE_PACKAGE/../.." && pwd)"
+export STACK_ROOT="${STACK_ROOT:-/mnt/public/xzxuan}"
 source /opt/venv/reason/bin/activate
-# The image activation adds its Megatron source checkout; use installed wheels.
-unset PYTHONPATH MEGATRON_PATH
+# Core remains the image's original source installation.
+export MEGATRON_PATH="/opt/venv/reason/Megatron-LM"
+case ":${PYTHONPATH:-}:" in
+    *":$MEGATRON_PATH:"*) ;;
+    *) export PYTHONPATH="$MEGATRON_PATH${PYTHONPATH:+:$PYTHONPATH}" ;;
+esac
 # Ray channels maintain peer connections across the rollout workers.
 if [[ "$(ulimit -Sn)" != unlimited ]] && (( $(ulimit -Sn) < 65536 )); then
     ulimit -Sn 65536
 fi
-export RLINF_ROOT="$STACK_ROOT/repos/RLinf"
-export RPENT_ROOT="$STACK_ROOT/repos/RPent"
+export RLINF_ROOT="${RLINF_ROOT:-$STACK_ROOT/repos/RLinf}"
+export RPENT_ROOT="${RPENT_ROOT:-$STACK_ROOT/repos/RPent}"
 export RPENT_RLINF_ROOT="$RLINF_ROOT"
 export RPENT_REPO_ROOT="$RPENT_ROOT"
 export CUDA_HOME=/usr/local/cuda

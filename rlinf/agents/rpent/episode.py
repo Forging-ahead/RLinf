@@ -30,9 +30,13 @@ class RPentEpisodeError(RuntimeError):
     The agent loop retries such an episode with a fresh process.
     """
 
-    def __init__(self, message: str, *, kind: str):
+    def __init__(self, message: str, kind: str):
         super().__init__(message)
         self.kind = kind
+
+    def __reduce__(self):
+        """Preserve the failure category across Ray's exception transport."""
+        return type(self), (str(self), self.kind)
 
 
 @dataclass

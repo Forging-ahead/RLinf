@@ -1,7 +1,7 @@
 RPent Episode PPO 与 GRPO
 =========================
 
-训练 Qwen3.5-4B 工具调用规划器，由远端 LIBERO-PRO 环境执行工具调用。rollout、训练和评测使用同一份完整多模态 SFT checkpoint，并保持 SFT 时的 RPent 工作流。本例采用 ``episode``：显式感知，每次最多顺序执行三个动作。
+训练 Qwen3.5-4B 工具调用规划器，由远端 LIBERO-PRO 环境执行工具调用。rollout、训练和评测使用同一份完整多模态 SFT checkpoint，并保持 SFT 时的 RPent 工作流。本例采用 ``episode``\ ：按需观测，每次最多顺序执行三个动作。
 
 概览
 ----
@@ -59,9 +59,9 @@ GRPO 配置执行 150 次更新，每次按完整组选择训练数据。
    * - 观测
      - 显式获取 1024 像素相机图像；首次观测前的 turn 可以没有图像
    * - 动作
-     - ``execute_actions`` 最多顺序执行三个动作；感知工具为 ``view_env``、``segment``、``back_project``，输出工具为 ``finish``
+     - ``execute_actions`` 最多顺序执行三个动作；感知工具为 ``view_env``\ 、``segment``\ 、``back_project``\ ，只有 ``view_env`` 返回 RGB
    * - 奖励
-     - 以环境成功信号为准；规划器调用 ``finish`` 不代表任务成功
+     - 仿真器的原生判定决定成功并结束 episode
    * - Prompt
      - thinking 开启，不发送 effort 档位；保留推理和图像历史；达到上下文的 70% 或 80 条消息时压缩，保留 10 条
    * - 预算
@@ -77,24 +77,13 @@ GRPO 如何训练
 安装
 ----
 
-每台 H200 主机使用 Linux x86-64 的 ``reason`` 镜像。保留 ``/opt/venv/reason`` 中的 Python 3.12.12、Torch 2.11.0/CUDA 12.8、torchvision 0.26.0、FA2 2.8.3 和 Transformer Engine 2.17。宿主机需具备 NVIDIA 驱动、CUDA 12.8 开发工具链及 EGL/OpenGL 库。
-
-将两个 ``rpent-ppo`` checkout 放在 ``$STACK_ROOT/repos/RLinf``、``$STACK_ROOT/repos/RPent``，记录各自的 Git revision。完整离线包放在 ``$STACK_ROOT/envs/offline_package``；模型和场景资源分别放在 ``$STACK_ROOT/models``、``$STACK_ROOT/data``。每个节点执行安装，再激活同一个环境：
+RL 环境运行 RLinf、模型服务和 RPent planner。从配套的 RPent 代码目录安装 planner 依赖：
 
 .. code-block:: bash
 
-   export STACK_ROOT=/mnt/public/xzxuan
-   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/install.sh"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
-   python -m pip check
+   python -m pip install -r requirements/episode-planner.txt
 
-安装器检查镜像版本与 SHA256，备份被替换的包，再完全离线安装本地 wheel。重复安装会检查已安装包的文件，并保持版本不变。离线包结构与依赖构建说明见 ``requirements/rpent/README.md``。
-
-最小安装包保留镜像的 SGLang 0.5.12.post1、Transformers 5.6.1、NumPy 2.2.0、commit 为 ``dc0ee41ad`` 的 Megatron-Core checkout，以及官方 Bridge 0.5.0。补装 FLA core 0.6.0、MuJoCo 3.3.0、robosuite 1.5.2、SAM3 和配套项目。OpenAI SDK 3.19.0 提供 RPent planner 所需的接口。benchmark wheel 使用已准备的 robosuite 1.5 适配，包括地面 Panda 模型的 ``NullBase`` 声明。Core 和 Bridge 均不打补丁、不重新打包；保留镜像激活脚本设置的 Core 源码路径。安装器保存 pip-check 报告，报告中的元数据冲突还需结合运行测试判断。
-
-RLinf 使用未修改的 SGLang 发布版，保存实际推理的 prompt ID、像素、图片区间、grid 和 M-RoPE，供 learner 回放。早期兼容 wheel 包单独保留为历史版本。
-
-RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv/reason/bin/python``，``tools.rpent.python`` 也设为该路径。安装后的 benchmark 包通过软链接引用共享资源。模型及资源准备见 RPent 的 ``tools/rl/INSTALL.md``。不要替换运行中作业使用的环境。
+在独立仿真环境中安装 LIBERO-PRO 和 RPent，并准备任务资产与 SAM3 权重。RPent 的机器人 Episode 指南列出四种仿真运行环境和启动命令。RPC 两端使用相同的 RPent 源码版本。已有 SFT595 checkpoint 3 使用冻结的 H200 环境及原 episode 契约。
 
 下载模型
 --------
@@ -137,7 +126,7 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
    export SAM3_CHECKPOINT_PATH="$STACK_ROOT/models/sam3/sam3.pt"
    hf download facebook/sam3 sam3.pt --local-dir "$(dirname "$SAM3_CHECKPOINT_PATH")"
 
-直接控制的 ``episode`` 工作流不使用 Pi0.5 权重。Pi0.5 属于 :doc:`原始规划器示例 <rpent>`；切换到该示例会改变动作工具。使用 episode 工作流做过 SFT 的模型应保持 ``workflow=episode``。
+直接控制的 ``episode`` 工作流不使用 Pi0.5 权重。Pi0.5 属于 :doc:`原始规划器示例 <rpent>`；切换到该示例会改变动作工具。使用 episode 工作流做过 SFT 的模型应保持 ``workflow=episode``\ 。
 
 运行
 ----
@@ -145,18 +134,17 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 启动 SAM3 和环境服务
 ~~~~~~~~~~~~~~~~~~~~
 
-四个节点各自激活环境，并启动本机服务：
+在每台环境主机上激活仿真环境，再启动本机服务：
 
 .. code-block:: bash
 
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
-   python -m robots.rl.services \
+   python -m robots.rl.services --simulator libero \
      --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
      --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
 
 每次启动使用新的输出目录。该进程统一管理每卡一个 SAM3、端口 28424 的本机 pool 和端口 28490 的环境 backend，退出时关闭自己的子进程。每卡提供三个环境槽位，四个节点可同时运行全部 80 个 smoke 候选。正式的 320 候选配置需要另外验证容量。episode 结束后释放槽位；学习前释放全部环境，SAM3 继续驻留。
 
-四个节点加入同一私有 Ray 集群。启动 Ray 前激活统一环境，并分别导出不同的 ``RLINF_NODE_RANK``，参见 :doc:`/rst_source/guides/multi_node`。worker 使用所在节点的 loopback backend；训练入口只在 head 启动一次。
+四个节点加入同一私有 Ray 集群。启动 Ray 前激活统一环境，并分别导出不同的 ``RLINF_NODE_RANK``\ ，参见 :doc:`/rst_source/guides/multi_node`。worker 使用所在节点的 loopback backend；训练入口只在 head 启动一次。
 
 准备任务和路径
 ~~~~~~~~~~~~~~
@@ -184,7 +172,7 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
    cp "$RLINF_ROOT/examples/agent/rpent/config/deployment/episode.yaml" \
      "$CONFIG_DIR/deployment/local.yaml"
 
-填完 ``local.yaml`` 中全部 ``???``。在 ``data`` 下按列表填写刚生成的训练、评测 JSONL 文件：
+填完 ``local.yaml`` 中全部 ``???``\ 。在 ``data`` 下按列表填写刚生成的训练、评测 JSONL 文件：
 
 .. code-block:: yaml
 
@@ -212,7 +200,6 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
@@ -227,13 +214,13 @@ RLinf、RPent planner 子进程、SGLang、SAM3 和 LIBERO 均使用 ``/opt/venv
 
 每批启动 40 个候选组，每组 8 条 episode，选入最先完整结束的 32 组。完成 5 次 optimizer 更新，每次更新后保存 checkpoint。每张 GPU 配置 10 个环境和 1 个 SAM3 实例。
 
-采用 rollout TP1、actor TP4/CP1/DP8，开启序列并行（SP），关闭多 token 预测（MTP）。logprob 和 LM-head 分块均为 256 token，Core 和 Bridge 保持原样。LM-head 分块与只计算回复位置的 logits 都仅支持 CP1。评估 CP 并行前，设置 ``actor.model.lm_head_chunk_size=0`` 和 ``actor.response_only_logits=false``，再单独验证多模态输入、mask、梯度及损失归一化。
+采用 rollout TP1、actor TP4/CP1/DP8，开启序列并行（SP），关闭多 token 预测（MTP）。logprob 和 LM-head 分块均为 256 token，Core 和 Bridge 保持原样。LM-head 分块与只计算回复位置的 logits 都仅支持 CP1。评估 CP 并行前，设置 ``actor.model.lm_head_chunk_size=0`` 和 ``actor.response_only_logits=false``\ ，再单独验证多模态输入、mask、梯度及损失归一化。
 
 准备好的 ``Qwen3.8-27B`` 目录声明的是 dense Qwen3.5 架构。RLinf 从模型配置读取层数、维度、注意力头数和 embedding 绑定关系。验收时还须恢复保存的 checkpoint，并用恢复后的权重生成新回复。验收结束后停止运行，不自动延长到 150 次更新。
 
-完整训练使用 ``train_qwen3.5_4b_episode_sync_grpo``：40 个候选组中选入最先完整结束的 32 组，每组 8 条 episode。启动前先验证环境服务容量。
+完整训练使用 ``train_qwen3.5_4b_episode_sync_grpo``\ ：40 个候选组中选入最先完整结束的 32 组，每组 8 条 episode。启动前先验证环境服务容量。
 
-actor 使用 TP2/CP1/DP16，rollout 为 32 个 TP1 副本。actor、critic、rollout 保持 ``NCCL_MAX_CTAS=8``，SGLang 显存比例为 0.55。该比例不是共用 GPU 的总显存上限；对比实验时保持相同的 placement 和显存设置。
+actor 使用 TP2/CP1/DP16，rollout 为 32 个 TP1 副本。actor、critic、rollout 保持 ``NCCL_MAX_CTAS=8``\ ，SGLang 显存比例为 0.55。该比例不是共用 GPU 的总显存上限；对比实验时保持相同的 placement 和显存设置。
 
 PPO 可以共用相同的预处理环境，启动时选择 PPO 配置和 TokenSpace 配置：
 
@@ -274,22 +261,13 @@ PPO 可以共用相同的预处理环境，启动时选择 PPO 配置和 TokenSp
 
 TensorBoard 记录 optimizer loss、梯度范数、学习率、采样成功率、TIS 诊断和更新耗时。sampling manifest 记录选入组、取消成员和清理回执；成功率分母使用实际选入的 episode，不使用目录数量。episode 文件保留请求、结果、图片引用和训练 turn。
 
-episode 训练默认关闭完整 HTTP 请求、响应和压缩前后输入的抓取。排查 planner 传输问题时设置 ``tools.rpent.record_api_trace=true``；直接运行 RPent 时使用 ``--record-api-trace``。开关不改变 prompt、压缩决策、token mask 或训练记录。
+episode 训练默认关闭完整 HTTP 请求、响应和压缩前后输入的抓取。排查 planner 传输问题时设置 ``tools.rpent.record_api_trace=true``\ ；直接运行 RPent 时使用 ``--record-api-trace``\ 。开关不改变 prompt、压缩决策、token mask 或训练记录。
 
 分别报告任务失败、基础设施错误、选入和取消组构成、token/turn 成本，以及准确的源码和依赖版本。60 条训练池回归不能当作独立测试集上的结果。
 
-纯图像控制
+坐标与单位
 ----------
 
-pear 配置在每次动作后提供双相机 RGB 和实测机器人状态，沿用 GRPO 算法及每批 32 组、每组 8 条、超发 40 组的设置。仅提供 ``move_to`` 和 ``set_gripper`` 两个工具，``move_to`` 使用绝对位姿。环境判定任务成功或预算耗尽后，episode 自动结束。非法动作回复按正常失败处理，不再请求模型纠正。
+设置 ``tools.rpent.world_cord=general`` 使用实测的安装基座坐标系。设置 ``tools.rpent.position_unit=cm`` 后，长度用厘米，角度用弧度。仿真器在批次的每一项开始时测量坐标系。感知与动作回执标明坐标版本。
 
-沿用上文的环境、完整多模态 planner checkpoint、任务清单和部署配置。启动相同版本的 RPent backend；仅运行 pear 的 backend 不需要 SAM3 端点或权重。在 Ray head 启动：
-
-.. code-block:: bash
-
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_pear_sync_grpo \
-     --config-dir "$CONFIG_DIR" +deployment@_global_=local
-
-配置默认使用 ``tools.rpent.world_cord=general``。原点在安装基座中心，x 向前、y 向左、z 向上。抓取 TCP 是两指指垫中心的实测中点。初始观测给出桌面相对基座的高度。现有 LIBERO 感知工作流也会按此设置返回几何坐标。设为 ``tools.rpent.world_cord=base`` 可保留仿真世界坐标和原控制点。
-
-thinking 默认开启。添加 ``agentloop.chat_template_kwargs.enable_thinking=false`` 后，要求模型直接调用工具，不输出推理文本。RPent CLI 对应 ``--reasoning`` 和 ``--no-reasoning``。切换工作流或坐标系时，使用独立运行目录，并固定源码版本；原有 SFT 工作流仍保留默认行为。
+恢复已有 SFT595 作业时，沿用保存的 base/m 配置、episode 工具和软件环境。使用当前四工具接口时另建运行目录。用 ``agentloop.chat_template_kwargs.enable_thinking=false`` 关闭模型 thinking。仿真后端使用 SAM3 分割目标。

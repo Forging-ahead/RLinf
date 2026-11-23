@@ -1,10 +1,7 @@
 RPent Episode PPO and GRPO
 ==========================
 
-Train a Qwen3.5-4B planner while remote LIBERO-PRO environments execute its tool calls.
-Use the same full multimodal SFT checkpoint and the same RPent workflow for rollout,
-training and evaluation. This recipe uses the ``episode`` workflow with explicit
-perception and ordered batches of at most three actions.
+Train a Qwen3.5-4B planner with PPO or GRPO. The planner requests observations from remote LIBERO-PRO environments and sends batches of up to three actions. Use a multimodal checkpoint fine-tuned with the episode tools you plan to run.
 
 Overview
 --------
@@ -52,7 +49,7 @@ The supplied GRPO configuration runs 150 updates. Each update selects whole grou
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The workflow preserves the SFT planner's prompts, tool schemas and history policy.
+The planner and evaluator use the same RPent episode tools.
 
 .. list-table::
    :header-rows: 1
@@ -60,11 +57,11 @@ The workflow preserves the SFT planner's prompts, tool schemas and history polic
    * - Item
      - Contract
    * - Observation
-     - Explicit camera observations at 1024 pixels; a turn before the first observation can contain no image
+     - The planner requests RGB from ``view_env``. LIBERO uses 1024 × 1024 images in this recipe
    * - Action
-     - ``execute_actions`` with at most three ordered actions; ``view_env``, ``segment``, ``back_project`` and the ``finish`` output tool
+     - ``execute_actions`` with at most three ordered actions; ``view_env``, ``segment``, ``back_project``
    * - Reward
-     - Environment success; a planner's ``finish`` response does not establish success
+     - The simulator's native verdict determines success and ends the episode
    * - Prompt
      - Thinking enabled without an effort tier; preserve reasoning and images, compact at 70% of context or 80 messages and retain 10 messages
    * - Limits
@@ -89,48 +86,18 @@ batches are not a controlled evaluation of policy improvement.
 Installation
 ------------
 
-Use the Linux x86-64 ``reason`` image on each H200 node. Keep the image’s Python 3.12.12,
-Torch 2.11.0/CUDA 12.8, torchvision 0.26.0, FA2 2.8.3 and Transformer Engine
-2.17 in ``/opt/venv/reason``. The host needs its NVIDIA driver,
-CUDA 12.8 development toolkit and EGL/OpenGL libraries.
-
-Put the two ``rpent-ppo`` checkouts under ``$STACK_ROOT/repos/RLinf`` and
-``$STACK_ROOT/repos/RPent``. Copy the complete offline package to
-``$STACK_ROOT/envs/offline_package`` and the separately downloaded models and
-assets to ``$STACK_ROOT/models`` and ``$STACK_ROOT/data``. Record both Git
-revisions. Install on every node, then activate the same environment:
+Run RLinf, the model backend and RPent planner in the RL environment. From
+the paired RPent checkout, install its planner requirements:
 
 .. code-block:: bash
 
-   export STACK_ROOT=/mnt/public/xzxuan
-   bash "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/install.sh"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
-   python -m pip check
+   python -m pip install -r requirements/episode-planner.txt
 
-The installer checks image versions and SHA256 hashes, backs up replaced
-packages and installs local wheels without network access. Repeating it keeps
-the same package versions. ``requirements/rpent/README.md`` describes the
-package layout and dependency builds.
-
-The minimal release keeps the image's SGLang 0.5.12.post1, Transformers 5.6.1,
-NumPy 2.2.0, Megatron-Core checkout at ``dc0ee41ad`` and official Bridge 0.5.0.
-It installs FLA core 0.6.0, MuJoCo 3.3.0, robosuite 1.5.2, SAM3 and the paired
-projects. OpenAI SDK 3.19.0 supplies the interfaces required by RPent's planner.
-The benchmark wheels use the prepared robosuite 1.5 adapter, including the
-``NullBase`` declaration for ground-mounted Panda models.
-Core and Bridge are neither patched nor repackaged; preserve the Core source
-path set by the image activation. The installer retains its pip-check report;
-optional metadata conflicts are distinct from runtime failures.
-
-RLinf captures serving prompt IDs, pixels, image spans, grid and M-RoPE for
-learner replay with the unmodified SGLang release. The earlier compatibility
-wheel bundle remains a separate historical release.
-
-RLinf, its RPent planner subprocesses, SGLang, SAM3 and LIBERO all use
-``/opt/venv/reason/bin/python``. Use this path for ``tools.rpent.python``.
-The installed benchmark packages link to the shared assets. Follow RPent's
-``tools/rl/INSTALL.md`` for model and asset preparation. Do not replace an
-environment while its jobs are running.
+Install LIBERO-PRO and RPent in a simulator environment, and prepare the
+native task assets and SAM3 checkpoint there. The RPent Robot Episodes
+guide lists the four simulator runtimes and commands. Use the same RPent
+source version on both sides of the RPC connection. Existing SFT595
+checkpoint 3 uses the frozen H200 runtime and its original episode contract.
 
 Download the Model
 ------------------
@@ -185,12 +152,11 @@ Run It
 Start SAM3 and the Environment Backend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-On each of the four nodes, activate the environment and start its local services:
+On each environment host, activate the simulator environment and start its local services:
 
 .. code-block:: bash
 
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
-   python -m robots.rl.services \
+   python -m robots.rl.services --simulator libero \
      --sam3-checkpoint "$SAM3_CHECKPOINT_PATH" \
      --envs-per-gpu 3 --output-dir "$STACK_ROOT/logs/services-node0"
 
@@ -254,7 +220,7 @@ Point each of these model paths to the same full SFT directory:
    actor.megatron.ckpt_convertor.hf_model_path
    critic.megatron.ckpt_convertor.hf_model_path
 
-Set ``tools.rpent.python`` to ``/opt/venv/reason/bin/python`` and ``repo_path``
+Set ``tools.rpent.python`` to the RL environment’s interpreter and ``repo_path``
 to the matching RPent checkout. The episode output and preprocessing cache
 directories must have the same absolute paths on all model hosts. Keep image
 files while trajectories or checkpoints reference them.
@@ -268,7 +234,6 @@ groups of four from 20 candidate groups, runs one update and saves a checkpoint:
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
-   source "$STACK_ROOT/envs/offline_package/releases/h200-minimal-20261120-v5/activate.sh"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_h200_smoke_grpo \
      --config-dir "$CONFIG_DIR" +deployment@_global_=local
 
@@ -376,18 +341,16 @@ Report task failures, infrastructure failures, selected/cancelled group
 composition, token/turn costs and the exact source/dependency revisions
 separately. A 60-episode training-pool regression is not a held-out benchmark.
 
-Use RGB-Only Control
---------------------
+Coordinates and Units
+---------------------
 
-Select the pear recipe to train with paired RGB images and measured robot state after every action. It inherits the GRPO algorithm and the 32-group, eight-member batch with 40 candidate groups. The only tools are ``move_to`` for absolute poses and ``set_gripper``. Episodes end automatically when the environment reports success or a budget is exhausted. Invalid action replies are normal failures, with no correction request.
+Set ``tools.rpent.world_cord=general`` to use the measured mounting-base frame.
+Set ``tools.rpent.position_unit=cm`` to use centimetres. Angles use radians.
+The simulator measures the frame at the start of each batch item. Perception
+and action receipts include coordinate versions.
 
-Use the same installation, full multimodal planner checkpoint, task manifests and deployment file above. Start a matching RPent backend; a pear-only backend needs no SAM3 endpoint or SAM3 weights. Launch from the Ray head:
-
-.. code-block:: bash
-
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_pear_sync_grpo \
-     --config-dir "$CONFIG_DIR" +deployment@_global_=local
-
-The recipe sets ``tools.rpent.world_cord=general``: positions are measured from the mounting base, with x forward, y left and z up, and the TCP is the measured finger-pad midpoint. The initial observation gives table height above the base. All LIBERO perception coordinates follow this choice when using an existing perception workflow. Set ``tools.rpent.world_cord=base`` to retain simulator-world coordinates and the original control point.
-
-Thinking is enabled by default. Add ``agentloop.chat_template_kwargs.enable_thinking=false`` for direct tool calls without reasoning text. The RPent CLI uses ``--reasoning`` and ``--no-reasoning``. Use separate run directories and pin source revisions when changing workflows or coordinates; an existing SFT workflow remains available with its original defaults.
+Restore the existing SFT595 run with its saved base/metre configuration,
+episode tools and software environment. Use a new run directory for the
+current four-tool episode contract. Set
+``agentloop.chat_template_kwargs.enable_thinking=false`` to disable model
+thinking. The simulator backend uses SAM3 for segmentation.

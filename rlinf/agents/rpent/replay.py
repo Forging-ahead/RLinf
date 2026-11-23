@@ -86,14 +86,20 @@ class SavedRPentBatch:
             request = _verified_json(
                 directory / "request.json", record["request_sha256"]
             )
-            key = (
-                record["candidate_id"]
-                if self._candidate_indexed
-                else _task_key(request["task"])
-            )
+            task = record.get("task", request["task"])
+            coordinates = manifest.get("request_coordinates", {})
+            if set(coordinates) - {"world_cord", "position_unit"}:
+                raise ValueError(
+                    "Replay request metadata contains non-coordinate fields"
+                )
+            if request["task"] != {**task, **coordinates}:
+                raise ValueError(
+                    f"Saved request differs from its dataset task: {directory}"
+                )
+            key = record["candidate_id"] if self._candidate_indexed else _task_key(task)
             if key in self._entries:
                 raise ValueError(f"Replay batch contains duplicate identity {key}")
-            self._entries[key] = (directory, record, request["task"])
+            self._entries[key] = (directory, record, task)
 
     def __len__(self) -> int:
         return len(self._entries)

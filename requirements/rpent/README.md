@@ -1,4 +1,21 @@
-# Install RPent in the Reason Image
+# RPent episode deployment
+
+Use the RLinf image for the model server, RPent planner and learner. Install
+RPent's `requirements/episode-planner.txt` in that environment. Use
+`tools.rpent.python` for that interpreter and set
+`tools.rpent.remote_toolkit_endpoint` to the matching RPent backend.
+
+Install the selected simulator and RPent in a separate environment. Start
+`python -m robots.rl.remote_manager --simulator libero` there with the GPU
+slots, SAM3 endpoint and output directory. The same environment runs direct
+RPent evaluation. The RPent Robot Episodes guide covers all four simulator
+profiles and the direct evaluation command.
+
+## Frozen H200 releases
+
+Restore the existing SFT595 checkpoint 3 with its saved source, package
+versions and episode contract. The following instructions describe that
+release.
 
 Install the minimal H200 release into `/opt/venv/reason`. RLinf, SGLang, RPent,
 SAM3 and LIBERO use that interpreter. Core and Bridge retain their original
@@ -29,7 +46,7 @@ To install from the RLinf checkout, run
 | Core / Bridge | Retain Core checkout `dc0ee41ad` / official Bridge 0.5.0 |
 | FA2 / Transformer Engine / Triton | Retain 2.8.3 / 2.17.0 / 3.6.0 |
 | Transformers / NumPy | Retain 5.6.1 / 2.2.0 unless runtime validation requires a change |
-| Qwen linear attention | Add `fla-core==0.6.0` |
+| Qwen linear attention | FLA 0.6.0; the H200 single-token TileLang path needs the layout fix below |
 | Simulation | Add MuJoCo 3.3.0, robosuite 1.5.2, LIBERO/PRO and their runtime dependencies |
 | Perception | Add SAM3, its tokenizer resource and image dependencies |
 | Planner | Add the paired RPent/RLinf wheels and planner dependencies; OpenAI SDK 3.19.0 provides the required planner interfaces |
@@ -40,6 +57,30 @@ runtime incompatibility. Protected GPU packages and Core/Bridge must remain
 unchanged. Replacement packages are backed up. Rerunning the installer verifies installed package files and keeps their
 versions unchanged. The installer saves `pip check` output; validate reported
 metadata conflicts with runtime tests. Do not run the historical `build_wheels.py` to prepare this release.
+
+### FLA singleton layout compatibility
+
+On this H200 image, FLA 0.6.0 selects TileLang for gated-delta-rule backward.
+A one-token value tensor can be PyTorch-contiguous while retaining a larger
+singleton-axis stride. TileLang rejects that legal layout (`expected 4096,
+got 8192`); calling `contiguous()` alone does not change it. The optional
+`0.6.0+rpent.layout1` wheel canonicalizes the value layout with
+`v.reshape(-1).view(v.shape)` at that kernel boundary. It changes no tensor
+values, attention equations or Core/Bridge source.
+
+Build it from the checksum-verified official wheel, then include the resulting
+wheel and manifest in the minimal offline release:
+
+```bash
+python requirements/rpent/build_fla_layout.py \
+  /path/to/fla_core-0.6.0-py3-none-any.whl /path/to/layout-release
+```
+
+The builder records the original and patched source hashes and the exact diff.
+Validate singleton and variable-length forward/backward against an independent
+recurrence before using the release for training. Keep the image's backend
+selection: FLA explicitly guards against the known gated-delta-rule gradient
+issue in Triton 3.4–3.7.0, so forcing `FLA_TILELANG=0` is not an equivalent fix.
 
 ## Start Services and Ray
 

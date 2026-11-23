@@ -49,6 +49,7 @@ tools:
   rpent:
     workflow: episode
     world_cord: base
+    position_unit: m
     entrypoint: robots.rl.rl_episode
     repo_path: ???
     remote_toolkit_endpoint: ???

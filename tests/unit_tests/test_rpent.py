@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import pickle
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ import torch
 from _qwen35_chat import Qwen35ToyTokenizer, qwen35_agentic_tokenizer
 from omegaconf import OmegaConf, open_dict
 
-from rlinf.agents.rpent.episode import merge_prefix_turns
+from rlinf.agents.rpent.episode import RPentEpisodeError, merge_prefix_turns
 from rlinf.agents.rpent.history import (
     AppendOnlyHistory,
 )
@@ -49,6 +50,14 @@ TOOLS = [
 @pytest.fixture
 def qwen35(monkeypatch):
     return qwen35_agentic_tokenizer(monkeypatch)
+
+
+def test_episode_failure_survives_ray_exception_serialization():
+    error = RPentEpisodeError("backend.open rejected the task", kind="startup")
+    restored = pickle.loads(pickle.dumps(error))
+    assert type(restored) is RPentEpisodeError
+    assert str(restored) == str(error)
+    assert restored.kind == "startup"
 
 
 def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
@@ -98,8 +107,11 @@ def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
 
 
 @pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "coordinates", [{}, {"world_cord": "base", "position_unit": "m"}]
+)
 def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
-    tmp_path, capture
+    tmp_path, capture, coordinates
 ):
     import hashlib
 
@@ -121,7 +133,9 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
         digest = hashlib.sha256(image).hexdigest()
         path = directory / "training_images" / digest
         path.write_bytes(image)
-        request_hash = write(directory / "request.json", {"task": task})
+        request_hash = write(
+            directory / "request.json", {"task": {**task, **coordinates}}
+        )
         status = {
             "terminal": True,
             "success": bool(candidate),
@@ -205,6 +219,7 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
         records.append(
             {
                 "candidate_id": candidate,
+                "task": task,
                 "episode_id": directory.name,
                 "request_sha256": request_hash,
                 "outcome_sha256": outcome_hash,
@@ -220,6 +235,7 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
             "episodes": 2,
             "weight_versions": [0],
             "policy_files": {"config.json": "policy-hash"},
+            "request_coordinates": coordinates,
             "records": records,
         },
     )
@@ -254,6 +270,11 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
             max_scored_tokens=8,
             token_space=True,
         )
+    altered = json.loads(manifest.read_text())
+    altered["records"][0]["task"]["task_id"] = 99
+    write(manifest, altered)
+    with pytest.raises(ValueError, match="Saved request differs"):
+        SavedRPentBatch(tmp_path, manifest, 0)
 
 
 # Stands in for RPent's ``robots.libero_rl.rl_episode``: it plans against the
@@ -589,6 +610,7 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
         "data.val_data_paths": ["/test/eval.jsonl"],
         "tools.rpent.python": "/test/env/bin/python",
         "tools.rpent.libero_config_path": "/test/libero-config",
+        "tools.rpent.remote_toolkit_endpoint": "http://127.0.0.1:28490",
         "tools.rpent.output_dir": "/test/episodes",
         "rollout.model.model_path": "/test/full-model",
     }.items():
@@ -619,6 +641,7 @@ def test_episode_recipes_distinguish_static_weights_from_actor_sync(
             key: cfg.tools.rpent[key]
             for key in (
                 "workflow",
+                "remote_toolkit_endpoint",
                 "world_cord",
                 "image_size",
                 "action_mode",
@@ -1446,14 +1469,17 @@ def test_episode_launcher_cancellation_reaps_child_and_releases_permit(
     ]
 
 
-def test_pear_recipe_preserves_grpo_and_exposes_explicit_frame():
+def test_episode_units_preserve_grpo_and_explicit_thinking():
     from rlinf.agents.rpent.config_validation import _validate_planner
 
-    cfg = compose(config_name="train_qwen3.5_4b_pear_sync_grpo")
+    cfg = compose(config_name="train_qwen3.5_4b_episode_sync_grpo")
+    assert cfg.tools.rpent.world_cord == "base"
+    assert cfg.tools.rpent.position_unit == "m"
+    cfg.tools.rpent.world_cord = "general"
+    cfg.tools.rpent.position_unit = "cm"
     _validate_planner(cfg, cfg.tools.rpent)
     assert cfg.tools.rpent.world_cord == "general"
-    assert cfg.tools.rpent.action_mode == "single"
-    assert cfg.tools.rpent.sam3_endpoint is None
+    assert cfg.tools.rpent.action_mode == "batch"
     assert (
         cfg.data.rollout_batch_size,
         cfg.data.sampling_batch_size,
@@ -1472,32 +1498,48 @@ def test_pear_recipe_preserves_grpo_and_exposes_explicit_frame():
     )
     assert planner["thinking"] is False and planner["reasoning_effort"] == "none"
     assert "no_images" not in planner
-    cfg.tools.rpent.action_mode = "batch"
-    with pytest.raises(ValueError, match="action_mode=single"):
+    cfg.tools.rpent.position_unit = "mm"
+    with pytest.raises(ValueError, match="position_unit"):
         _validate_planner(cfg, cfg.tools.rpent)
 
 
-def test_pear_launcher_preserves_candidate_cleanup_and_needs_no_sam(episode_launcher):
+def test_episode_launcher_carries_units_without_removed_cli_selectors(episode_launcher):
     from rlinf.agents.rpent.episode import Episode
 
     launcher = episode_launcher
-    launcher.cfg.tools.rpent.workflow = "pear"
+    launcher.cfg.tools.rpent.workflow = "episode"
     launcher.cfg.tools.rpent.world_cord = "general"
-    launcher.cfg.tools.rpent.action_mode = "single"
-    launcher.cfg.tools.rpent.sam3_endpoint = "http://must-not-be-used"
+    launcher.cfg.tools.rpent.position_unit = "cm"
+    launcher.cfg.tools.rpent.remote_toolkit_endpoint = None
+    with pytest.raises(ValueError, match="remote_toolkit_endpoint"):
+        launcher.command(Path("/test/episode"), 0)
+    launcher.cfg.tools.rpent.remote_toolkit_endpoint = "http://simulator"
+    launcher.cfg.tools.rpent.sam3_endpoint = "http://shared-sam3"
     result = asyncio.run(
         launcher.run(
-            Episode("pear", {}, None),
+            Episode("general", {}, None),
             {"thinking": False},
             0,
             candidate={"cohort_id": "groups", "candidate_id": 1},
         )
     )
     command = result["args"]
-    assert command[command.index("--workflow") + 1] == "pear"
+    for removed in (
+        "--workflow",
+        "--prompt",
+        "--observation-mode",
+        "--perception-mode",
+    ):
+        assert removed not in command
     assert command[command.index("--world-cord") + 1] == "general"
+    assert command[command.index("--position-unit") + 1] == "cm"
+    assert command[command.index("--remote-toolkit-endpoint") + 1] == "http://simulator"
     assert "--sam3-endpoint" not in command
-    output = Path(launcher.cfg.tools.rpent.output_dir) / "pear"
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "general"
+    assert json.loads((output / "request.json").read_text())["task"] == {
+        "world_cord": "general",
+        "position_unit": "cm",
+    }
     assert (
         json.loads((output / "request.json").read_text())["planner"]["thinking"]
         is False
@@ -1508,16 +1550,19 @@ def test_pear_launcher_preserves_candidate_cleanup_and_needs_no_sam(episode_laun
 
 
 @pytest.mark.parametrize("version", [7, None])
-def test_pear_keeps_synchronous_version_checks_and_training_turns(make_agent, version):
+def test_episode_keeps_synchronous_version_checks_and_training_turns(
+    make_agent, version
+):
     fake = FakeRPent(turns=1)
     worker = make_agent(fake)
     worker.cfg.tools.rpent.update(
         {
-            "workflow": "pear",
+            "workflow": "episode",
             "entrypoint": "robots.libero_rl.rl_episode",
             "world_cord": "general",
             "image_size": 1024,
-            "action_mode": "single",
+            "action_mode": "batch",
+            "remote_toolkit_endpoint": "http://127.0.0.1:28490",
             "max_actions_per_call": 3,
             "perception_mode": "single",
             "reasoning_history": -1,

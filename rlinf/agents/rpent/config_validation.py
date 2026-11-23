@@ -173,19 +173,19 @@ def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
 
     workflow = rpent.get("workflow", "libero")
     world_cord = rpent.get("world_cord", "base")
+    if rpent.get("position_unit", "m") not in {"m", "cm"}:
+        raise ValueError("tools.rpent.position_unit must be m or cm")
+    if workflow == "episode" and agentloop.get("prompt", "simple") != "simple":
+        raise ValueError("episode uses a fixed prompt per simulator")
     if world_cord not in {"base", "general"}:
         raise ValueError("tools.rpent.world_cord must be base or general")
-    if world_cord != "base" and workflow not in {"episode", "pear"}:
+    if world_cord != "base" and workflow != "episode":
+        raise ValueError("general coordinates require the episode interface")
+    if workflow not in ("libero", "libero_rl", "episode"):
         raise ValueError(
-            "general coordinates require the adaptive episode or pear workflow"
+            f"tools.rpent.workflow must be libero, libero_rl or episode, got {workflow!r}."
         )
-    if workflow == "pear" and rpent.get("action_mode") != "single":
-        raise ValueError("pear requires action_mode=single")
-    if workflow not in ("libero", "libero_rl", "episode", "pear"):
-        raise ValueError(
-            f"tools.rpent.workflow must be libero, libero_rl, episode or pear, got {workflow!r}."
-        )
-    if workflow in {"libero_rl", "episode", "pear"}:
+    if workflow in {"libero_rl", "episode"}:
         mode = agentloop.get("observation_mode", "adaptive")
         if mode != "adaptive":
             raise ValueError(
@@ -222,22 +222,28 @@ def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
                 "agentloop.history_compaction needs target_tokens (image-aware tiers) "
                 "or max_messages (message window)."
             )
-        if workflow in {"episode", "pear"}:
+        if workflow == "episode":
             if rpent.get("entrypoint") != "robots.rl.rl_episode":
                 raise ValueError(
                     "episode requires tools.rpent.entrypoint=robots.rl.rl_episode."
                 )
-            if rpent.get("action_mode") not in {"single", "batch"}:
-                raise ValueError("episode action_mode must be single or batch.")
+            if not rpent.get("remote_toolkit_endpoint"):
+                raise ValueError(
+                    "episode requires tools.rpent.remote_toolkit_endpoint."
+                )
+            if rpent.get("action_mode") != "batch":
+                raise ValueError("episode uses batch actions through execute_actions.")
             if (
                 type(rpent.get("max_actions_per_call")) is not int
-                or rpent.max_actions_per_call < 1
+                or not 1 <= rpent.max_actions_per_call <= 3
             ):
                 raise ValueError(
-                    "episode max_actions_per_call must be a positive integer."
+                    "episode max_actions_per_call must be an integer from 1 through 3."
                 )
             if rpent.get("perception_mode") != "single":
-                raise ValueError("remote episode PPO requires single perception.")
+                raise ValueError(
+                    "episode uses explicit view_env, segment and back_project calls."
+                )
             if rpent.get("image_size") not in {256, 512, 1024}:
                 raise ValueError("episode image_size must be 256, 512 or 1024.")
             for name in ("reasoning_history", "image_history"):
@@ -293,7 +299,7 @@ def _validate_training(cfg: DictConfig, rpent: DictConfig) -> None:
                 "RPent without algorithm.recompute_logprobs needs "
                 "rollout.return_logprobs=True."
             )
-        if workflow in {"libero_rl", "episode", "pear"} and (
+        if workflow in {"libero_rl", "episode"} and (
             cfg.actor.get("pack_traj", True)
             or not cfg.actor.get("expect_multi_modal_inputs", False)
         ):

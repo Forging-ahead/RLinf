@@ -55,7 +55,13 @@ class RPentEpisodeLauncher:
             (output / "sampling-candidate.json").write_text(
                 json.dumps({**candidate, "episode_id": episode.episode_id}) + "\n"
             )
-        request = {"task": episode.task, "planner": planner}
+        task = dict(episode.task)
+        if rpent.get("workflow") == "episode":
+            task.update(
+                world_cord=rpent.get("world_cord", "base"),
+                position_unit=rpent.get("position_unit", "m"),
+            )
+        request = {"task": task, "planner": planner}
         (output / "request.json").write_text(json.dumps(request))
         command = self.command(output, gpu)
         log = output / "episode.log"
@@ -162,7 +168,10 @@ class RPentEpisodeLauncher:
         env.pop("MUJOCO_EGL_DEVICE_ID", None)
         env.pop("EGL_DEVICE_ID", None)
         config_path = self.cfg.tools.rpent.get("libero_config_path")
-        if config_path is not None:
+        if (
+            config_path is not None
+            and self.cfg.tools.rpent.get("workflow") != "episode"
+        ):
             env["LIBERO_CONFIG_PATH"] = str(config_path)
         repo_path = self.cfg.tools.rpent.get("repo_path")
         if repo_path is not None:
@@ -184,34 +193,39 @@ class RPentEpisodeLauncher:
             "--request",
             str(output / "request.json"),
         ]
-        if workflow in {"libero_rl", "episode", "pear"}:
-            if workflow in {"episode", "pear"} and rpent.get("record_api_trace", False):
+        if workflow in {"libero_rl", "episode"}:
+            if workflow == "episode" and rpent.get("record_api_trace", False):
                 command.append("--record-api-trace")
-            command += [
-                "--observation-mode",
-                "adaptive",
-                "--prompt",
-                self.cfg.agentloop.get("prompt", "simple"),
-            ]
-            if rpent.get("remote_toolkit_endpoint") is not None:
-                command += ["--remote-toolkit-endpoint", rpent.remote_toolkit_endpoint]
-            elif workflow != "pear" and rpent.get("sam3_endpoint") is not None:
+            if workflow == "libero_rl":
+                command += [
+                    "--observation-mode",
+                    "adaptive",
+                    "--prompt",
+                    self.cfg.agentloop.get("prompt", "simple"),
+                ]
+            endpoint = rpent.get("remote_toolkit_endpoint")
+            if workflow == "episode" and not endpoint:
+                raise ValueError(
+                    "episode requires tools.rpent.remote_toolkit_endpoint."
+                )
+            if endpoint:
+                command += ["--remote-toolkit-endpoint", endpoint]
+            elif rpent.get("sam3_endpoint") is not None:
                 command += ["--sam3-endpoint", rpent.sam3_endpoint]
             if rpent.get("libero_type") is not None:
                 command += ["--libero-type", rpent.libero_type]
-            if workflow in {"episode", "pear"}:
+            if workflow == "episode":
                 command += [
-                    "--workflow",
-                    workflow,
                     "--world-cord",
                     rpent.get("world_cord", "base"),
+                    "--position-unit",
+                    rpent.get("position_unit", "m"),
                     "--image_size",
                     str(rpent.image_size),
                 ]
                 for name in (
                     "action_mode",
                     "max_actions_per_call",
-                    "perception_mode",
                     "reasoning_history",
                     "image_history",
                 ):
