@@ -169,6 +169,7 @@ def sglang_args_worker():
             "validate_weight_first_sync": True,
             "model": {
                 "model_path": "/model",
+                "model_type": "qwen",
                 "precision": "bf16",
                 "trust_remote_code": True,
             },
