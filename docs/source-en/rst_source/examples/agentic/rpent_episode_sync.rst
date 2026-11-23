@@ -50,6 +50,11 @@ four endpoints defined in the mixed GRPO example. Set the GPU placement and
 backend capacities for your cluster. This example assigns training and model
 rollout to eight GPUs. Four simulator backends run independently.
 
+Start a Ray head on the RLinf host if the training platform has not provided
+one. Use the address printed by ``ray start --head`` as ``RAY_ADDRESS``.
+The driver and its workers connect to that head. The placement ranges select
+physical GPUs on the training cluster.
+
 .. code-block:: bash
 
    cd "$RLINF_ROOT"

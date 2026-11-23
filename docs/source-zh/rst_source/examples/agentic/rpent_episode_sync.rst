@@ -34,6 +34,8 @@ LIBERO 使用 ``suite``、``task`` 和 ``seed``。RoboCasa 和 RoboDojo 使用 `
 
 每类仿真先启动一个 RPent 工具服务。下面沿用四环境示例中的四个地址，在八张 GPU 上分配训练和模型 rollout。仿真服务独立运行，GPU placement 和后端槽位数按实际资源配置。
 
+如果平台尚未提供 Ray 集群，在 RLinf 主机上运行 ``ray start --head``。把它打印的 head 地址设为 ``RAY_ADDRESS``，使驱动和所有 worker 接入同一集群。配置中的 placement 范围选择训练集群里的物理 GPU。
+
 .. code-block:: bash
 
    cd "$RLINF_ROOT"
