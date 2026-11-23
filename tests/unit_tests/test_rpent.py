@@ -106,178 +106,7 @@ def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
     assert second.prompt_ids == [1, 2, 7] and second.response_images["num_images"] == 1
 
 
-@pytest.mark.parametrize("capture", [False, True])
-@pytest.mark.parametrize(
-    "coordinates", [{}, {"world_cord": "base", "position_unit": "m"}]
-)
-def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
-    tmp_path, capture, coordinates
-):
-    import hashlib
-
-    from rlinf.agents.rpent.episode import Episode
-    from rlinf.agents.rpent.records import write_training_turn
-    from rlinf.agents.rpent.replay import SavedRPentBatch
-
-    def write(path, value):
-        path.write_text(json.dumps(value))
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-
-    task = {"task_id": 3, "init_state_id": 9}
-    records = []
-    for candidate in (0, 1):
-        directory = tmp_path / f"episode-{candidate}"
-        (directory / "training_audit").mkdir(parents=True)
-        (directory / "training_images").mkdir()
-        image = b"saved-image"
-        digest = hashlib.sha256(image).hexdigest()
-        path = directory / "training_images" / digest
-        path.write_bytes(image)
-        request_hash = write(
-            directory / "request.json", {"task": {**task, **coordinates}}
-        )
-        status = {
-            "terminal": True,
-            "success": bool(candidate),
-            "init_state_id": 9,
-            "memory_entries": [],
-            "truncated": False,
-            "termination_reason": "planner_completed",
-        }
-        outcome_hash = write(directory / "outcome.json", status)
-        contract = {
-            "format": "sglang-token-space-v1",
-            "image_refs": [{"path": str(path), "sha256": digest}],
-            "image_grid_thw": [[1, 2, 2]],
-            "num_images": 1,
-            "processor_fingerprint": "saved-processor",
-            "prompt_token_ids": [10, 11],
-            "image_spans": [[1, 2]],
-            "pixel_values_sha256": "saved-pixels",
-            "mrope_sha256": "saved-positions",
-        }
-        if capture:
-            from rlinf.hybrid_engines.sglang.multimodal.replay import store_pixels
-
-            contract = {
-                "format": "rlinf-qwen-image-inputs-v1",
-                "prompt_token_ids": [10, 11],
-                "image_spans": [[1, 2]],
-                "image_grid_thw": torch.tensor([[1, 2, 2]]),
-                "pixel_values": torch.ones(4, 2),
-                "mrope_positions": torch.tensor([[0, 1]] * 3),
-                "mrope_position_delta": torch.tensor([0]),
-            }
-            store_pixels(contract, directory / "training_images")
-            path.unlink()
-        turn = {
-            "episode_id": directory.name,
-            "task": task,
-            "turn_id": 0,
-            "chain_id": 0,
-            "input_ids": [10, 11],
-            "output_ids": [20 + candidate],
-            "response_mask": [1],
-            "behavior_logprobs": [-0.25 - candidate],
-            "token_weight_versions": [0],
-            "weight_version_start": 0,
-            "weight_version_end": 0,
-            "finish_reason": "stop",
-            "tool_names": [],
-            "image_sha256": [digest],
-            "image_grid_thw": [[1, 2, 2]],
-            "multimodal_contract": contract,
-        }
-        write_training_turn(
-            str(tmp_path),
-            Episode(directory.name, task, SimpleNamespace(chain_id=0)),
-            AgentLoopOutput(
-                prompt_ids=turn["input_ids"],
-                response_ids=turn["output_ids"],
-                response_mask=turn["response_mask"],
-                response_images={
-                    **contract,
-                    "image_grid_thw": torch.tensor([[1, 2, 2]]),
-                },
-                extra_fields={"turn_id": 0, "tool_names": []},
-            ),
-            {
-                "logprobs": turn["behavior_logprobs"],
-                "weight_versions": [0],
-                "version_start": 0,
-                "version_end": 0,
-                "prompt_token_ids": turn["input_ids"],
-                "finish_reason": "stop",
-            },
-            [image] if capture else [],
-            0.0,
-            {},
-        )
-        turn_hash = hashlib.sha256(
-            (directory / "training_audit/turn-00000.json").read_bytes()
-        ).hexdigest()
-        records.append(
-            {
-                "candidate_id": candidate,
-                "task": task,
-                "episode_id": directory.name,
-                "request_sha256": request_hash,
-                "outcome_sha256": outcome_hash,
-                "success": bool(candidate),
-                "turns": [{"file": "turn-00000.json", "sha256": turn_hash}],
-            }
-        )
-    manifest = tmp_path / "manifest.json"
-    write(
-        manifest,
-        {
-            "passed": True,
-            "episodes": 2,
-            "weight_versions": [0],
-            "policy_files": {"config.json": "policy-hash"},
-            "request_coordinates": coordinates,
-            "records": records,
-        },
-    )
-    saved = SavedRPentBatch(tmp_path, manifest, 0)
-    assert len(saved) == 2
-    outputs = [
-        saved.load_episode(
-            task,
-            candidate_id=i,
-            merge_prefix=True,
-            max_scored_tokens=8,
-            token_space=True,
-        )
-        for i in (0, 1)
-    ]
-    assert [o.single_turn_outputs[0].response_ids for o in outputs] == [[20], [21]]
-    assert [o.single_turn_outputs[0].reward_score for o in outputs] == [0.0, 1.0]
-    for output in outputs:
-        payload = output.single_turn_outputs[0].response_images
-        if capture:
-            assert payload["mrope_positions"].tolist() == [[0, 1]] * 3
-            assert len(payload["pixel_refs"]) == 1
-        else:
-            assert payload["processor_fingerprint"] == "saved-processor"
-            assert payload["mrope_sha256"] == "saved-positions"
-        assert payload["image_grid_thw"].tolist() == [[1, 2, 2]]
-    with pytest.raises(ValueError, match="different task"):
-        saved.load_episode(
-            {"task_id": 4},
-            candidate_id=0,
-            merge_prefix=True,
-            max_scored_tokens=8,
-            token_space=True,
-        )
-    altered = json.loads(manifest.read_text())
-    altered["records"][0]["task"]["task_id"] = 99
-    write(manifest, altered)
-    with pytest.raises(ValueError, match="Saved request differs"):
-        SavedRPentBatch(tmp_path, manifest, 0)
-
-
-# Stands in for RPent's ``robots.libero_rl.rl_episode``: it plans against the
+# Stands in for RPent's ``robots.rl.rl_episode``: it plans against the
 # worker's policy endpoint and writes the outcome, as the real process does.
 FAKE_EPISODE = """
 import argparse, json, os, urllib.error, urllib.request
@@ -362,7 +191,7 @@ def make_agent(tmp_path, monkeypatch):
     )
     # Builds the patched agentic tokenizer class that skips sglang's markers.
     qwen35_agentic_tokenizer(monkeypatch)
-    package = tmp_path / "fake-rpent" / "robots" / "libero_rl"
+    package = tmp_path / "fake-rpent" / "robots" / "rl"
     package.mkdir(parents=True)
     for init_file in (package.parent / "__init__.py", package / "__init__.py"):
         init_file.touch()
@@ -398,7 +227,15 @@ def make_agent(tmp_path, monkeypatch):
                 },
                 "algorithm": {
                     "recompute_logprobs": True,
-                    "sampling_params": {"max_new_tokens": 256},
+                    "sampling_params": {
+                        "max_new_tokens": 256,
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": -1,
+                        "min_p": 0.0,
+                        "presence_penalty": 0.0,
+                        "repetition_penalty": 1.0,
+                    },
                 },
                 "rollout": {
                     "return_logprobs": True,
@@ -420,9 +257,13 @@ def make_agent(tmp_path, monkeypatch):
                 },
                 "tools": {
                     "rpent": {
-                        "workflow": "libero_rl",
                         "python": sys.executable,
-                        "sam3_endpoint": "http://sam3",
+                        "repo_path": str(package.parents[1]),
+                        "remote_toolkit_endpoint": "http://simulator",
+                        "image_size": 1024,
+                        "max_actions_per_call": 3,
+                        "reasoning_history": -1,
+                        "image_history": -1,
                         "libero_type": "pro",
                         "max_episode_steps": 10,
                         "env_gpus": [0, 1],
@@ -597,7 +438,7 @@ def test_token_space_checks_exact_served_prompt_ids(make_agent, key):
         worker._check_generation(generated, [1, 2])
 
 
-def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
+def compose(overrides=(), config_name="train_qwen3.5_4b_episode_sync_ppo"):
     from hydra import compose, initialize_config_dir
 
     config_dir = Path(__file__).parents[2] / "examples/agent/rpent/config"
@@ -609,7 +450,6 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
         "data.train_data_paths": ["/test/tasks.jsonl"],
         "data.val_data_paths": ["/test/eval.jsonl"],
         "tools.rpent.python": "/test/env/bin/python",
-        "tools.rpent.libero_config_path": "/test/libero-config",
         "tools.rpent.remote_toolkit_endpoint": "http://127.0.0.1:28490",
         "tools.rpent.output_dir": "/test/episodes",
         "rollout.model.model_path": "/test/full-model",
@@ -640,19 +480,14 @@ def test_episode_recipes_distinguish_static_weights_from_actor_sync(
         {
             key: cfg.tools.rpent[key]
             for key in (
-                "workflow",
                 "remote_toolkit_endpoint",
-                "world_cord",
                 "image_size",
-                "action_mode",
                 "max_actions_per_call",
-                "perception_mode",
                 "reasoning_history",
                 "image_history",
             )
         }
     )
-    worker.cfg.tools.rpent.entrypoint = "robots.libero_rl.rl_episode"
     worker.cfg.algorithm.sampling_params.update(cfg.algorithm.sampling_params)
     generate = worker.generate
 
@@ -693,27 +528,24 @@ def test_request_budget_preserves_evaluation_and_training_limits(
 
     cfg = compose(
         config_name=(
-            "eval_qwen3.5_4b_libero_rl"
+            "eval_qwen3.5_4b_episode_sync"
             if evaluation
-            else "train_qwen3.5_4b_libero_rl_ppo"
+            else "train_qwen3.5_4b_episode_sync_ppo"
         )
     )
     cfg.agentloop.max_turns = turns
     if valid:
         validate_rpent_cfg(cfg)
     else:
-        with pytest.raises(ValueError, match="max_turns must be an integer"):
+        with pytest.raises(ValueError, match="max_turns must be at least"):
             validate_rpent_cfg(cfg)
 
 
 @pytest.mark.parametrize(
     "config_name",
     [
-        "train_qwen3.5_4b_libero_rl_ppo",
-        "eval_qwen3.5_4b_libero_rl",
-        "train_qwen3.5_4b_libero_rl_sao",
-        "train_qwen3.5_4b_libero_rl_sao_local",
-        "train_qwen3.5_4b_libero_rl_sao_3node",
+        "train_qwen3.5_4b_episode_sync_ppo",
+        "eval_qwen3.5_4b_episode_sync",
     ],
 )
 def test_example_configs_preserve_planner_and_training_contracts(config_name):
@@ -726,15 +558,13 @@ def test_example_configs_preserve_planner_and_training_contracts(config_name):
         assert sampling.repetition_penalty == 1.0
         assert cfg.agentloop.thinking_token_budget is None
         assert cfg.rollout.sglang.backend_type == "server"
-    else:
-        assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 0.95, 20)
-    assert sampling.max_new_tokens == 32768
-    assert cfg.agentloop.max_turns == 100
-    assert cfg.agentloop.observation_mode == "adaptive"
+        assert sampling.max_new_tokens == 32768
+    assert cfg.agentloop.max_turns == 80
     assert (
         cfg.rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
         == "rlinf.hybrid_engines.sglang.multimodal"
     )
+    assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 1.0, -1)
     if cfg.runner.task_type == "reasoning":
         for component in (cfg.actor, cfg.critic):
             assert not component.megatron.ckpt_convertor.hf_model_path.endswith("-text")
@@ -754,34 +584,6 @@ def test_example_configs_preserve_planner_and_training_contracts(config_name):
 
 
 @pytest.mark.parametrize(
-    "invalid,value",
-    [
-        (None, None),
-        ("algorithm.recompute_logprobs", False),
-        ("algorithm.importance_sampling_fix", False),
-        ("algorithm.importance_sampling_clip", float("inf")),
-        ("rollout.return_logprobs", False),
-        ("rollout.max_weight_staleness", None),
-        ("rollout.max_weight_staleness", -1),
-    ],
-)
-def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, value):
-    from rlinf.config import validate_async_agent_ppo_cfg
-
-    cfg = compose(config_name="train_qwen3.5_4b_libero_rl_sao")
-    cfg.algorithm.recompute_logprobs = True
-    cfg.algorithm.importance_sampling_fix = True
-    cfg.algorithm.importance_sampling_clip = 2.0
-    cfg.rollout.max_weight_staleness = 1
-    if invalid is None:
-        validate_async_agent_ppo_cfg(cfg, "RPent")
-    else:
-        OmegaConf.update(cfg, invalid, value)
-        with pytest.raises(ValueError, match="async|staleness"):
-            validate_async_agent_ppo_cfg(cfg, "RPent")
-
-
-@pytest.mark.parametrize(
     "mode,invalid,value,error",
     [
         ("eval", None, None, None),
@@ -792,7 +594,6 @@ def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, val
             None,
         ),
         ("ppo", None, None, None),
-        ("sao", None, None, None),
         ("eval", "tools.rpent.store_images_on_disk", False, "store_images_on_disk"),
         (
             "eval",
@@ -801,16 +602,16 @@ def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, val
             "Remove",
         ),
         ("ppo", "actor.model.pipeline_model_parallel_size", 2, "PP=1"),
-        ("sao", "critic.megatron.mbridge", False, "Megatron-Bridge"),
+        ("ppo", "critic.megatron.mbridge", False, "Megatron-Bridge"),
     ],
 )
 def test_token_space_validation_scopes_learner_checks(mode, invalid, value, error):
     from rlinf.config import validate_rpent_cfg
 
     name = (
-        "eval_qwen3.5_4b_libero_rl"
+        "eval_qwen3.5_4b_episode_sync"
         if mode == "eval"
-        else f"train_qwen3.5_4b_libero_rl_{mode}"
+        else "train_qwen3.5_4b_episode_sync_ppo"
     )
     cfg = compose(
         [
@@ -829,38 +630,7 @@ def test_token_space_validation_scopes_learner_checks(mode, invalid, value, erro
     else:
         validate_rpent_cfg(cfg)
         if mode == "eval":
-            assert "actor" not in cfg and "critic" not in cfg
-
-
-@pytest.mark.parametrize("mode", ["ppo", "sao", "eval"])
-def test_legacy_multimodal_config_reloads_with_the_same_mode(tmp_path, mode):
-    from rlinf.config import shared_multi_modal_processor_enabled, validate_rpent_cfg
-
-    name = (
-        "eval_qwen3.5_4b_libero_rl"
-        if mode == "eval"
-        else f"train_qwen3.5_4b_libero_rl_{mode}"
-    )
-    cfg = compose(
-        [
-            "++rollout.sglang.enable_shared_multi_modal_processor=true",
-            "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
-            "++tools.rpent.store_images_on_disk=true",
-            "tools.rpent.keep_episodes=all",
-        ],
-        config_name=name,
-    )
-    validate_rpent_cfg(cfg)
-    with open_dict(cfg.rollout.sglang):
-        cfg.rollout.sglang.enable_token_space_processor = cfg.rollout.sglang.pop(
-            "enable_shared_multi_modal_processor"
-        )
-    saved_config = tmp_path / "config.yaml"
-    OmegaConf.save(cfg, saved_config)
-    restored = OmegaConf.load(saved_config)
-    validate_rpent_cfg(restored)
-    assert shared_multi_modal_processor_enabled(restored.rollout.sglang) is True
-    assert OmegaConf.to_container(restored) == OmegaConf.to_container(cfg)
+            assert cfg.runner.task_type == "reasoning_eval"
 
 
 @pytest.mark.parametrize("field", ["cache_bytes", "prefetch_batches", "prefetch_bytes"])
@@ -1356,7 +1126,6 @@ def test_tokenspace_grouped_grpo_keeps_native_loss_scales_without_a_critic():
     assert cfg.data.sampling_batch_size == 40
     assert not cfg.critic.use_critic_model
     assert cfg.actor.megatron.mbridge
-    assert cfg.tools.rpent.entrypoint == "robots.rl.rl_episode"
 
 
 @pytest.fixture
@@ -1387,16 +1156,13 @@ def episode_launcher(tmp_path, monkeypatch):
                 "rpent": {
                     "python": sys.executable,
                     "repo_path": str(tmp_path),
-                    "workflow": "episode",
-                    "entrypoint": "episode_fixture",
                     "remote_toolkit_endpoint": "http://unused",
                     "image_size": 1024,
-                    "action_mode": "batch",
                     "max_actions_per_call": 3,
-                    "perception_mode": "single",
                     "reasoning_history": -1,
                     "image_history": -1,
                     "max_episode_steps": 10000,
+                    "libero_type": "pro",
                     "max_env_initializations_per_worker": 1,
                     "output_dir": str(tmp_path / "episodes"),
                     "keep_episodes": "none",
@@ -1405,10 +1171,18 @@ def episode_launcher(tmp_path, monkeypatch):
             },
         }
     )
-    return RPentEpisodeLauncher(cfg)
+    launcher = RPentEpisodeLauncher(cfg)
+    command = launcher.command
+
+    def fixture_command(output, gpu, *, task=None):
+        args = command(output, gpu, task=task)
+        return [args[0], "-m", "episode_fixture", *args[3:]]
+
+    monkeypatch.setattr(launcher, "command", fixture_command)
+    return launcher
 
 
-def test_episode_launcher_keeps_candidates_and_preserves_workflow(episode_launcher):
+def test_episode_launcher_keeps_candidates_and_cleans_process(episode_launcher):
     from rlinf.agents.rpent.episode import Episode
 
     launcher = episode_launcher
@@ -1469,55 +1243,20 @@ def test_episode_launcher_cancellation_reaps_child_and_releases_permit(
     ]
 
 
-def test_episode_units_preserve_grpo_and_explicit_thinking():
-    from rlinf.agents.rpent.config_validation import _validate_planner
-
-    cfg = compose(config_name="train_qwen3.5_4b_episode_sync_grpo")
-    assert cfg.tools.rpent.world_cord == "base"
-    assert cfg.tools.rpent.position_unit == "m"
-    cfg.tools.rpent.world_cord = "general"
-    cfg.tools.rpent.position_unit = "cm"
-    _validate_planner(cfg, cfg.tools.rpent)
-    assert cfg.tools.rpent.world_cord == "general"
-    assert cfg.tools.rpent.action_mode == "batch"
-    assert (
-        cfg.data.rollout_batch_size,
-        cfg.data.sampling_batch_size,
-        cfg.algorithm.group_size,
-    ) == (32, 40, 8)
-    assert cfg.algorithm.clip_ratio_high == 0.28
-    assert list(cfg.algorithm.loss_scales) == [
-        "group_level",
-        "agent_level",
-        "turn_level",
-    ]
-    assert not cfg.critic.use_critic_model
-    cfg.agentloop.chat_template_kwargs.enable_thinking = False
-    planner = RPentAgentLoopWorker._planner_options(
-        SimpleNamespace(cfg=cfg), "http://policy"
-    )
-    assert planner["thinking"] is False and planner["reasoning_effort"] == "none"
-    assert "no_images" not in planner
-    cfg.tools.rpent.position_unit = "mm"
-    with pytest.raises(ValueError, match="position_unit"):
-        _validate_planner(cfg, cfg.tools.rpent)
-
-
-def test_episode_launcher_carries_units_without_removed_cli_selectors(episode_launcher):
+def test_episode_launcher_routes_without_legacy_cli_selectors(episode_launcher):
     from rlinf.agents.rpent.episode import Episode
 
     launcher = episode_launcher
-    launcher.cfg.tools.rpent.workflow = "episode"
-    launcher.cfg.tools.rpent.world_cord = "general"
-    launcher.cfg.tools.rpent.position_unit = "cm"
     launcher.cfg.tools.rpent.remote_toolkit_endpoint = None
-    with pytest.raises(ValueError, match="remote_toolkit_endpoint"):
-        launcher.command(Path("/test/episode"), 0)
-    launcher.cfg.tools.rpent.remote_toolkit_endpoint = "http://simulator"
-    launcher.cfg.tools.rpent.sam3_endpoint = "http://shared-sam3"
+    with open_dict(launcher.cfg):
+        launcher.cfg.env = {"rpent": {"robotwin": {"endpoint": "http://robotwin"}}}
     result = asyncio.run(
         launcher.run(
-            Episode("general", {}, None),
+            Episode(
+                "general",
+                {"environment": "robotwin", "task_name": "adjust_bottle", "seed": 0},
+                None,
+            ),
             {"thinking": False},
             0,
             candidate={"cohort_id": "groups", "candidate_id": 1},
@@ -1529,16 +1268,17 @@ def test_episode_launcher_carries_units_without_removed_cli_selectors(episode_la
         "--prompt",
         "--observation-mode",
         "--perception-mode",
+        "--world-cord",
+        "--position-unit",
     ):
         assert removed not in command
-    assert command[command.index("--world-cord") + 1] == "general"
-    assert command[command.index("--position-unit") + 1] == "cm"
-    assert command[command.index("--remote-toolkit-endpoint") + 1] == "http://simulator"
+    assert command[command.index("--remote-toolkit-endpoint") + 1] == "http://robotwin"
     assert "--sam3-endpoint" not in command
     output = Path(launcher.cfg.tools.rpent.output_dir) / "general"
     assert json.loads((output / "request.json").read_text())["task"] == {
-        "world_cord": "general",
-        "position_unit": "cm",
+        "environment": "robotwin",
+        "task_name": "adjust_bottle",
+        "seed": 0,
     }
     assert (
         json.loads((output / "request.json").read_text())["planner"]["thinking"]
@@ -1557,14 +1297,9 @@ def test_episode_keeps_synchronous_version_checks_and_training_turns(
     worker = make_agent(fake)
     worker.cfg.tools.rpent.update(
         {
-            "workflow": "episode",
-            "entrypoint": "robots.libero_rl.rl_episode",
-            "world_cord": "general",
             "image_size": 1024,
-            "action_mode": "batch",
             "remote_toolkit_endpoint": "http://127.0.0.1:28490",
             "max_actions_per_call": 3,
-            "perception_mode": "single",
             "reasoning_history": -1,
             "image_history": -1,
         }

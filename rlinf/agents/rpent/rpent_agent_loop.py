@@ -20,7 +20,7 @@ import asyncio
 import json
 import math
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from uuid import uuid4
 
@@ -74,9 +74,8 @@ _MIN_RETRIED_EPISODES = 3
 class RPentAgentLoopWorker(MultiAgentLoopWorker):
     """Run RPent planner episodes and keep the turns they sample from the policy.
 
-    Each episode runs its configured planner entrypoint in a local process.
-    The current episode workflow delegates simulator/tools to a remote backend;
-    legacy entries keep their existing environment placement. The planner
+    Each episode runs its planner in a local process and delegates the
+    simulator and tools to the remote backend. The planner
     calls this worker's OpenAI endpoint, which
     samples each request from the rollout engine. A request that extends the previous turn is rendered as the
     previous turn's sampled tokens plus the new messages, so consecutive turns
@@ -103,7 +102,6 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             "truncated",
             "task",
             "init_state_id",
-            "memory_entries",
             "terminal",
             "termination_reason",
             "episode_id",
@@ -112,17 +110,18 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             "infra_retries",
             "infra_retry_errors",
         ]
-        # One slot per concurrent episode, naming the GPU its simulator renders on;
-        # workers start at different GPUs so that they spread over all of them.
+        # Mixed backends choose their own render GPUs when an agent starts an episode.
         rpent = cfg.tools.rpent
         self._env_slots = asyncio.Queue()
+        gpus = [None] if (cfg.get("env") or {}).get("rpent") else rpent.env_gpus
         for slot in range(rpent.episodes_per_worker):
-            index = self._rank + slot
-            self._env_slots.put_nowait(rpent.env_gpus[index % len(rpent.env_gpus)])
+            self._env_slots.put_nowait(gpus[(self._rank + slot) % len(gpus)])
         self._launcher = RPentEpisodeLauncher(cfg)
         # Loaded when view_env first returns images.
         self._image_processor = None
-        self._candidate_episode_paths: dict[tuple[str, int], list[Path]] = {}
+        self._candidate_attempts: dict[
+            tuple[str, int], list[tuple[str | None, Path]]
+        ] = {}
         # Episode processes run on this node and reach the endpoint locally.
         self._model_server = OpenAISessionServer(
             self._complete,
@@ -191,12 +190,15 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         self._check_planner_done(episode, outcome)
         return self._episode_output(episode, outcome)
 
-    async def _run_rpent(self, episode: Episode, base_url: str, gpu: int) -> dict:
+    async def _run_rpent(
+        self, episode: Episode, base_url: str, gpu: int | None
+    ) -> dict:
         candidate = self.rollout_candidate()
         if candidate is not None:
             key = (candidate["cohort_id"], candidate["candidate_id"])
             output = Path(self.cfg.tools.rpent.output_dir) / episode.episode_id
-            self._candidate_episode_paths.setdefault(key, []).append(output)
+            endpoint = self._launcher.endpoint(episode.task)
+            self._candidate_attempts.setdefault(key, []).append((endpoint, output))
         return await self._launcher.run(
             episode, self._planner_options(base_url), gpu, candidate=candidate
         )
@@ -204,39 +206,51 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
     async def finalize_rollout_candidates(self, records: list[dict]) -> None:
         """Keep each attempt and its disposition, including cancelled partial traces."""
         cohort_id = self._candidate_cohort["id"]
-        paths_by_candidate = {
-            record["candidate_id"]: self._candidate_episode_paths.get(
-                (cohort_id, record["candidate_id"]), []
-            )
-            for record in records
-        }
-        all_paths = [path for paths in paths_by_candidate.values() for path in paths]
-        endpoint = self.cfg.tools.rpent.get("remote_toolkit_endpoint")
-        receipt = None
-        cleanup_error = None
-        try:
-            if endpoint is not None and all_paths:
-                receipt = await self._release_remote_candidates(
-                    cohort_id, endpoint, [path.name for path in all_paths]
+        owners_by_endpoint = defaultdict(list)
+        for record in records:
+            for endpoint, path in self._candidate_attempts.get(
+                (cohort_id, record["candidate_id"]), ()
+            ):
+                if endpoint is not None:
+                    owners_by_endpoint[endpoint].append(path.name)
+
+        receipts = await asyncio.gather(
+            *(
+                self._release_remote_candidates(
+                    cohort_id
+                    if len(owners_by_endpoint) == 1
+                    else f"{cohort_id}-backend-{index}",
+                    endpoint,
+                    owner_ids,
                 )
-        except BaseException as error:
-            cleanup_error = repr(error)
-            raise
-        finally:
-            for record in records:
-                paths = paths_by_candidate[record["candidate_id"]]
-                record["episode_paths"] = [str(path) for path in paths]
-                record["remote_cleanup"] = receipt
-                record["cleanup_complete"] = cleanup_error is None
-                record["cleanup_error"] = cleanup_error
-                for path in paths:
+                for index, (endpoint, owner_ids) in enumerate(
+                    owners_by_endpoint.items()
+                )
+            ),
+            return_exceptions=True,
+        )
+        cleanup = dict(zip(owners_by_endpoint, receipts, strict=True))
+
+        for record in records:
+            key = (cohort_id, record["candidate_id"])
+            attempts = self._candidate_attempts.get(key, ())
+            receipt = cleanup.get(attempts[0][0]) if attempts else None
+            error = receipt if isinstance(receipt, BaseException) else None
+            record["episode_paths"] = [str(path) for _, path in attempts]
+            record["cleanup_complete"] = error is None
+            record["cleanup_error"] = repr(error) if error is not None else None
+            record["remote_cleanup"] = receipt if error is None else None
+            for _, path in attempts:
+                if path.is_dir():
                     (path / "sampling-selection.json").write_text(
                         json.dumps({**record, "cohort_id": cohort_id}, indent=2) + "\n"
                     )
-                if cleanup_error is None:
-                    self._candidate_episode_paths.pop(
-                        (cohort_id, record["candidate_id"]), None
-                    )
+            if error is None:
+                self._candidate_attempts.pop(key, None)
+
+        for receipt in receipts:
+            if isinstance(receipt, BaseException):
+                raise receipt
 
     async def _release_remote_candidates(
         self, cohort_id: str, endpoint: str, owner_ids: list[str]
@@ -295,30 +309,22 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             if compaction is None
             else OmegaConf.to_container(compaction, resolve=True),
         }
-        workflow = self.cfg.tools.rpent.get("workflow", "libero")
-        if workflow in {"libero_rl", "episode"}:
-            options.update(
-                observation_mode="adaptive", prompt=agentloop.get("prompt", "simple")
-            )
-            if workflow == "episode":
-                sampling = self.cfg.algorithm.sampling_params
-                options.update(
-                    thinking=agentloop.chat_template_kwargs.enable_thinking,
-                    reasoning_effort="none",
-                    sampling_params={
-                        name: sampling[name]
-                        for name in (
-                            "temperature",
-                            "top_p",
-                            "top_k",
-                            "min_p",
-                            "presence_penalty",
-                            "repetition_penalty",
-                        )
-                    },
+        sampling = self.cfg.algorithm.sampling_params
+        options.update(
+            thinking=agentloop.chat_template_kwargs.enable_thinking,
+            reasoning_effort="none",
+            sampling_params={
+                name: sampling[name]
+                for name in (
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "min_p",
+                    "presence_penalty",
+                    "repetition_penalty",
                 )
-        else:
-            options["no_images"] = True
+            },
+        )
         return options
 
     @staticmethod
@@ -477,9 +483,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 generated["prompt_token_ids"] = prompt_ids
         generated_at = time.perf_counter()
         self._check_generation(generated, prompt_ids)
-        if self.cfg.tools.rpent.get(
-            "workflow", "episode"
-        ) == "episode" and self.cfg.runner.get("synchronous", False):
+        if self.cfg.runner.get("synchronous", False):
             version = generated.get("version_start")
             if version is None or version != generated.get("version_end"):
                 raise ValueError(
@@ -516,31 +520,26 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 response_logprobs=generated.get("logprobs"),
                 response_weight_versions=generated.get("weight_versions"),
                 response_images=multimodal,
-                version_start=generated.get("version_start")
-                if self.cfg.tools.rpent.get("workflow") == "episode"
-                else None,
-                version_end=generated.get("version_end")
-                if self.cfg.tools.rpent.get("workflow") == "episode"
-                else None,
+                version_start=generated.get("version_start"),
+                version_end=generated.get("version_end"),
                 is_end=generated["finish_reason"] == "stop",
                 extra_fields=extra_fields,
             )
         )
-        if self.cfg.tools.rpent.get("workflow") == "episode":
-            await asyncio.to_thread(
-                write_training_turn,
-                self.cfg.tools.rpent.output_dir,
-                episode,
-                episode.turns[-1],
-                generated,
-                images,
-                started_at,
-                {
-                    "render_seconds": rendered_at - started,
-                    "generation_seconds": generated_at - rendered_at,
-                    "parse_seconds": time.perf_counter() - generated_at,
-                },
-            )
+        await asyncio.to_thread(
+            write_training_turn,
+            self.cfg.tools.rpent.output_dir,
+            episode,
+            episode.turns[-1],
+            generated,
+            images,
+            started_at,
+            {
+                "render_seconds": rendered_at - started,
+                "generation_seconds": generated_at - rendered_at,
+                "parse_seconds": time.perf_counter() - generated_at,
+            },
+        )
         if generated["finish_reason"] == "length":
             finish_reason = "length"
         else:

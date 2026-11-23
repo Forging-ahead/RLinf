@@ -9,7 +9,6 @@ tools:
   rpent:
     repo_path: ???
     python: ???
-    libero_config_path: ???
     remote_toolkit_endpoint: http://127.0.0.1:28490
     output_dir: ???
 rollout:

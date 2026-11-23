@@ -149,7 +149,6 @@ def episode_output(
         extra_fields={
             "success": status["success"],
             "init_state_id": status["init_state_id"],
-            "memory_entries": status["memory_entries"],
             "truncated": status["truncated"],
             "task": task,
             "terminal": status["terminal"],

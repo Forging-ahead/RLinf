@@ -12,7 +12,7 @@ if [ -n "${MEGATRON_PATH:-}" ]; then
 fi
 
 if [ -z "${1:-}" ]; then
-    CONFIG_NAME="train_qwen3.5_4b_ppo"
+    CONFIG_NAME="train_qwen3.5_4b_episode_sync_grpo"
 else
     CONFIG_NAME=$1
     shift

@@ -17,6 +17,7 @@
 import asyncio
 import json
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -33,6 +34,11 @@ class AgentPPORunner(AgentRunner):
     """Install each synchronous PPO or GRPO update before the next rollout."""
 
     def __init__(self, **kwargs: Any) -> None:
+        self.simulators = {}
+        if (kwargs["cfg"].get("env") or {}).get("rpent") is not None:
+            from rlinf.agents.rpent.simulators import mixed_simulators
+
+            self.simulators = mixed_simulators(kwargs["cfg"])
         super().__init__(**kwargs)
         placement = self.component_placement
         actor_gpus = set(placement.get_hardware_ranks("actor"))
@@ -54,10 +60,31 @@ class AgentPPORunner(AgentRunner):
             self.actor_rollout_channel = Channel.create("ActorRollout")
             self.rollout_output_channels.append(self.actor_rollout_channel)
         self.training_channel = Channel.create("PPOTraining")
-        if self._sampling_batch_size() > self.cfg.data.rollout_batch_size:
+        if self._uses_sampling_cohort():
             self.candidate_channel = Channel.create("SynchronousCandidates")
             if self.cfg.algorithm.group_size > 1:
                 self.candidate_result_channel = Channel.create("SelectedEpisodes")
+
+    def _build_dataloader(self, train_dataset, val_dataset, collate_fn=None):
+        sampler = None
+        if self.simulators:
+            from rlinf.agents.rpent.simulators import SimulatorBatchSampler
+
+            sampler = SimulatorBatchSampler(
+                [len(pool) for pool in train_dataset.datasets],
+                [entry.sampling_groups for entry in self.simulators.values()],
+                shuffle=self.cfg.data.shuffle,
+                seed=self.cfg.data.get("seed", 1),
+            )
+        super()._build_dataloader(
+            train_dataset, val_dataset, collate_fn, batch_sampler=sampler
+        )
+
+    def _uses_sampling_cohort(self) -> bool:
+        return (
+            bool(self.simulators)
+            or self._sampling_batch_size() > self.cfg.data.rollout_batch_size
+        )
 
     def _sampling_batch_size(self) -> int:
         from rlinf.config import sampling_batch_size
@@ -65,12 +92,26 @@ class AgentPPORunner(AgentRunner):
         return sampling_batch_size(self.cfg)
 
     def _put_batch(self, batch: dict, split_size: Optional[int] = None) -> None:
-        if self._sampling_batch_size() == self.cfg.data.rollout_batch_size:
+        if not self._uses_sampling_cohort():
             return super()._put_batch(batch, split_size)
         if self.solid_rollouts:
             raise ValueError(
                 "Synchronous oversampling requires one policy rollout group."
             )
+        if self.simulators:
+            from rlinf.agents.rpent.simulators import simulator_for_answer
+
+            self._cohort_simulators = [
+                simulator_for_answer(answer) for answer in batch["answer"]
+            ]
+            actual = Counter(self._cohort_simulators)
+            expected = {
+                name: entry.sampling_groups for name, entry in self.simulators.items()
+            }
+            if actual != expected:
+                raise ValueError(
+                    f"Mixed rollout expected task groups {expected}, got {dict(actual)}"
+                )
         requests = build_rollout_requests_from_batch(
             batch,
             group_size=self.cfg.algorithm.group_size,
@@ -96,7 +137,7 @@ class AgentPPORunner(AgentRunner):
         self._sampling_cohort_id = cohort_id
 
     def _start_rollout(self) -> Handle:
-        if self._sampling_batch_size() == self.cfg.data.rollout_batch_size:
+        if not self._uses_sampling_cohort():
             return super()._start_rollout()
         cohort_id = self._sampling_cohort_id
         candidate_channel = self.candidate_channel
@@ -106,6 +147,7 @@ class AgentPPORunner(AgentRunner):
         )
         selected = []
         selected_groups = []
+        selected_by_simulator = Counter()
         complete = {}
         group_size = self.cfg.algorithm.group_size
         expected_candidates = self._sampling_batch_size() * group_size
@@ -138,9 +180,18 @@ class AgentPPORunner(AgentRunner):
                 complete[candidate_id] = event
                 group_id = candidate_id // group_size
                 member_ids = range(group_id * group_size, (group_id + 1) * group_size)
-                if all(member_id in complete for member_id in member_ids):
-                    selected_groups.append(group_id)
-                    selected.extend(complete[member_id] for member_id in member_ids)
+                if not all(member_id in complete for member_id in member_ids):
+                    continue
+                if self.simulators:
+                    simulator = self._cohort_simulators[group_id]
+                    if (
+                        selected_by_simulator[simulator]
+                        == self.simulators[simulator].rollout_groups
+                    ):
+                        continue
+                    selected_by_simulator[simulator] += 1
+                selected_groups.append(group_id)
+                selected.extend(complete[member_id] for member_id in member_ids)
         except BaseException as error:
             selection_error = error
         finally:
@@ -219,6 +270,9 @@ class AgentPPORunner(AgentRunner):
                 "workers": cleanup,
                 "generation_cleanup": generation_cleanup,
             }
+            if self.simulators:
+                audit["group_simulators"] = self._cohort_simulators
+                audit["selected_groups_by_simulator"] = dict(selected_by_simulator)
             self._write_sampling_audit(audit)
         if selection_error is not None:
             self.agent_loop.admit_rollout_candidates(cohort_id, None).wait()

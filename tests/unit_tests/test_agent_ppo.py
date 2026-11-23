@@ -125,6 +125,7 @@ def test_megatron_valid_token_scale_matches_unsplit_gradient(
                 "rollout": {"model": {"model_path": "/test/model"}},
                 "tools": {},
                 "critic": {},
+                "actor": {"model": {}},
                 "algorithm": {
                     "loss_type": "actor",
                     "use_valid_token_scale": False,
@@ -385,7 +386,21 @@ def test_qwen35_convertor_preserves_bf16_gdn_norm_offset():
     centered = torch.tensor([1 / 256, -1 / 512, 1 / 1024], dtype=torch.bfloat16)
     original = centered.clone()
     converted = Qwen35Convertor(
-        SimpleNamespace(reshard_tp_size=1, model_config=SimpleNamespace()), strict=True
+        SimpleNamespace(
+            reshard_tp_size=1,
+            rollout_vision_tp_size=1,
+            model_config=SimpleNamespace(
+                num_attention_heads=2,
+                num_query_groups=1,
+                linear_num_key_heads=2,
+                linear_num_value_heads=2,
+                ffn_hidden_size=8,
+            ),
+            vision_config=SimpleNamespace(
+                num_heads=2, intermediate_size=8, hidden_size=4, spatial_merge_size=2
+            ),
+        ),
+        strict=True,
     ).convert(
         {"language_model.decoder.layers.0.self_attention.out_norm.weight": centered}
     )
@@ -705,21 +720,26 @@ def test_grpo_hierarchical_scales_keep_action_masks_and_weight_variable_turns():
 
 
 @pytest.mark.parametrize("failure", [None, "candidate", "cleanup"])
-@pytest.mark.parametrize("group_size", [1, 8])
+@pytest.mark.parametrize("group_size,mixed", [(1, False), (8, False), (2, True)])
 def test_sync_runner_selects_first_complete_candidates_and_admits_only_after_cleanup(
-    tmp_path, monkeypatch, failure, group_size
+    tmp_path, monkeypatch, failure, group_size, mixed
 ):
     from omegaconf import OmegaConf
 
+    from rlinf.agents.rpent.simulators import Simulator
     from rlinf.runners.agent_ppo_runner import AgentPPORunner
 
     monkeypatch.setattr(Channel, "create", lambda *_args, **_kwargs: _local_channel())
     order = []
     selected_ids = []
+    completed_groups = (2, 0, 3, 4) if mixed else (2, 0, 4)
+    chosen_groups = (2, 3, 4) if mixed else completed_groups
     records = [
         {
             "candidate_id": i,
-            "status": "complete" if i // group_size in (2, 0, 4) else "cancelled",
+            "status": "complete"
+            if i // group_size in completed_groups
+            else "cancelled",
             "cleanup_complete": True,
         }
         for i in range(5 * group_size)
@@ -741,6 +761,19 @@ def test_sync_runner_selects_first_complete_candidates_and_admits_only_after_cle
             "rollout": {"rollout_backend": "sglang"},
         }
     )
+    runner.simulators = {}
+    if mixed:
+        runner.simulators = {
+            name: Simulator("http://backend", name, 1, candidates)
+            for name, candidates in (("libero", 2), ("robocasa", 2), ("robodojo", 1))
+        }
+        runner._cohort_simulators = [
+            "libero",
+            "robocasa",
+            "libero",
+            "robocasa",
+            "robodojo",
+        ]
     runner.global_steps = 2
     runner._sampling_cohort_id = "cpu-cohort"
     runner.candidate_channel = _local_channel()
@@ -759,7 +792,7 @@ def test_sync_runner_selects_first_complete_candidates_and_admits_only_after_cle
         for candidate_id in (
             group * group_size + member
             for member in range(group_size)
-            for group in (2, 0, 4)
+            for group in completed_groups
         ):
             result = DynamicRolloutResult(
                 num_sequence=1,
@@ -827,7 +860,7 @@ def test_sync_runner_selects_first_complete_candidates_and_admits_only_after_cle
         runner._start_rollout()
         assert selected_ids == [
             group * group_size + member
-            for group in (2, 0, 4)
+            for group in chosen_groups
             for member in range(group_size)
         ]
         admitted = [learner.get() for _ in range(3)]
@@ -855,7 +888,13 @@ def test_sync_runner_selects_first_complete_candidates_and_admits_only_after_cle
     assert audit["status"] == ("passed" if failure is None else "failed")
     assert audit["selected_ids"] == [
         group * group_size + member
-        for group in (2, 0, 4)
+        for group in chosen_groups
         for member in range(group_size)
     ]
-    assert audit["selected_group_ids"] == [2, 0, 4]
+    assert audit["selected_group_ids"] == list(chosen_groups)
+    if mixed:
+        assert audit["selected_groups_by_simulator"] == {
+            "libero": 1,
+            "robocasa": 1,
+            "robodojo": 1,
+        }

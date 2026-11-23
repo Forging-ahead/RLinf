@@ -39,11 +39,18 @@ class RPentEpisodeLauncher:
             cfg.tools.rpent.get("max_env_initializations_per_worker", 8)
         )
 
+    def endpoint(self, task: dict) -> str | None:
+        """Return the toolkit that owns this task's scene."""
+        simulators = (self.cfg.get("env") or {}).get("rpent")
+        if simulators is not None:
+            return simulators[task["environment"]].endpoint
+        return self.cfg.tools.rpent.get("remote_toolkit_endpoint")
+
     async def run(
         self,
         episode: Episode,
         planner: dict,
-        gpu: int,
+        gpu: int | None,
         *,
         candidate: dict | None = None,
     ) -> dict:
@@ -55,15 +62,11 @@ class RPentEpisodeLauncher:
             (output / "sampling-candidate.json").write_text(
                 json.dumps({**candidate, "episode_id": episode.episode_id}) + "\n"
             )
-        task = dict(episode.task)
-        if rpent.get("workflow") == "episode":
-            task.update(
-                world_cord=rpent.get("world_cord", "base"),
-                position_unit=rpent.get("position_unit", "m"),
-            )
-        request = {"task": task, "planner": planner}
-        (output / "request.json").write_text(json.dumps(request))
-        command = self.command(output, gpu)
+        task = episode.task
+        (output / "request.json").write_text(
+            json.dumps({"task": task, "planner": planner})
+        )
+        command = self.command(output, gpu, task=task)
         log = output / "episode.log"
         with log.open("wb") as log_file:
             await self._env_initializations.acquire()
@@ -167,12 +170,6 @@ class RPentEpisodeLauncher:
         env = dict(os.environ)
         env.pop("MUJOCO_EGL_DEVICE_ID", None)
         env.pop("EGL_DEVICE_ID", None)
-        config_path = self.cfg.tools.rpent.get("libero_config_path")
-        if (
-            config_path is not None
-            and self.cfg.tools.rpent.get("workflow") != "episode"
-        ):
-            env["LIBERO_CONFIG_PATH"] = str(config_path)
         repo_path = self.cfg.tools.rpent.get("repo_path")
         if repo_path is not None:
             env["PYTHONPATH"] = os.pathsep.join(
@@ -180,75 +177,43 @@ class RPentEpisodeLauncher:
             ).rstrip(os.pathsep)
         return env
 
-    def command(self, output: Path, gpu: int) -> list[str]:
+    def command(
+        self, output: Path, gpu: int | None, *, task: dict | None = None
+    ) -> list[str]:
         """Command line of an episode process writing to ``output``."""
         rpent = self.cfg.tools.rpent
-        workflow = rpent.get("workflow", "libero")
+        task = task or {}
         command = [
             rpent.python,
             "-m",
-            rpent.get("entrypoint", f"robots.{workflow}.rl_episode"),
+            "robots.rl.rl_episode",
             "--output-dir",
             str(output),
             "--request",
             str(output / "request.json"),
-        ]
-        if workflow in {"libero_rl", "episode"}:
-            if workflow == "episode" and rpent.get("record_api_trace", False):
-                command.append("--record-api-trace")
-            if workflow == "libero_rl":
-                command += [
-                    "--observation-mode",
-                    "adaptive",
-                    "--prompt",
-                    self.cfg.agentloop.get("prompt", "simple"),
-                ]
-            endpoint = rpent.get("remote_toolkit_endpoint")
-            if workflow == "episode" and not endpoint:
-                raise ValueError(
-                    "episode requires tools.rpent.remote_toolkit_endpoint."
-                )
-            if endpoint:
-                command += ["--remote-toolkit-endpoint", endpoint]
-            elif rpent.get("sam3_endpoint") is not None:
-                command += ["--sam3-endpoint", rpent.sam3_endpoint]
-            if rpent.get("libero_type") is not None:
-                command += ["--libero-type", rpent.libero_type]
-            if workflow == "episode":
-                command += [
-                    "--world-cord",
-                    rpent.get("world_cord", "base"),
-                    "--position-unit",
-                    rpent.get("position_unit", "m"),
-                    "--image_size",
-                    str(rpent.image_size),
-                ]
-                for name in (
-                    "action_mode",
-                    "max_actions_per_call",
-                    "reasoning_history",
-                    "image_history",
-                ):
-                    command += ["--" + name.replace("_", "-"), str(rpent[name])]
-        else:
-            command += [
-                "--vla-endpoint",
-                rpent.vla_endpoint,
-                "--sam3-endpoint",
-                rpent.sam3_endpoint,
-                "--libero-type",
-                rpent.libero_type,
-            ]
-        command += [
+            "--remote-toolkit-endpoint",
+            self.endpoint(task),
             "--max-episode-steps",
             str(rpent.max_episode_steps),
-            "--cuda-device",
-            str(gpu),
             "--tokenizer-path",
             self.cfg.rollout.model.model_path,
         ]
-        if workflow == "libero" and rpent.get("frozen_memory_dir") is not None:
-            command += ["--frozen-memory-dir", rpent.frozen_memory_dir]
+        if task.get("environment", "libero") == "libero":
+            command += ["--libero-type", rpent.libero_type]
+        for option in (
+            "image_size",
+            "max_actions_per_call",
+            "reasoning_history",
+            "image_history",
+        ):
+            flag = (
+                "--image_size"
+                if option == "image_size"
+                else "--" + option.replace("_", "-")
+            )
+            command += [flag, str(rpent[option])]
+        if gpu is not None:
+            command += ["--cuda-device", str(gpu)]
         return command
 
     @staticmethod

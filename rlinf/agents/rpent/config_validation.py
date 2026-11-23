@@ -17,24 +17,27 @@
 
 from omegaconf import DictConfig, OmegaConf, open_dict
 
+from rlinf.agents.rpent.simulators import mixed_simulators
+
 
 def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
     """Validate RPent resources, planner inputs and the selected RL algorithm."""
     rpent = cfg.get("tools", {}).get("rpent")
     if rpent is None:
         return cfg
-    _validate_resources(rpent)
+    simulators = mixed_simulators(cfg)
+    _validate_resources(rpent, mixed=bool(simulators))
     _validate_multimodal(cfg, rpent)
-    _validate_planner(cfg, rpent)
+    _validate_planner(cfg, rpent, mixed=bool(simulators))
     _validate_training(cfg, rpent)
     return cfg
 
 
-def _validate_resources(rpent: DictConfig) -> None:
-    if not rpent.env_gpus or rpent.episodes_per_worker < 1:
+def _validate_resources(rpent: DictConfig, *, mixed: bool = False) -> None:
+    if (not mixed and not rpent.get("env_gpus")) or rpent.episodes_per_worker < 1:
         raise ValueError(
             "tools.rpent needs at least one env GPU and one episode per worker, got "
-            f"env_gpus={list(rpent.env_gpus)} and "
+            f"env_gpus={list(rpent.get('env_gpus', []))} and "
             f"episodes_per_worker={rpent.episodes_per_worker}."
         )
     initializations = rpent.get("max_env_initializations_per_worker", 8)
@@ -53,8 +56,6 @@ def _validate_resources(rpent: DictConfig) -> None:
             "tools.rpent.store_images_on_disk requires keep_episodes=all; "
             "training and checkpoint recovery still reference episode images."
         )
-    if type(rpent.get("record_api_trace", False)) is not bool:
-        raise ValueError("tools.rpent.record_api_trace must be a boolean.")
 
 
 def _validate_multimodal(cfg: DictConfig, rpent: DictConfig) -> None:
@@ -124,7 +125,9 @@ def _validate_multimodal(cfg: DictConfig, rpent: DictConfig) -> None:
                     OmegaConf.update(cfg, target, rpent[legacy], force_add=True)
 
 
-def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
+def _validate_planner(
+    cfg: DictConfig, rpent: DictConfig, *, mixed: bool = False
+) -> None:
     agentloop = cfg.agentloop
     thinking_budget = agentloop.get("thinking_token_budget")
     if thinking_budget is not None:
@@ -171,98 +174,39 @@ def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
             f"{agentloop.max_infra_retries} and {agentloop.max_infra_retry_rate}."
         )
 
-    workflow = rpent.get("workflow", "libero")
-    world_cord = rpent.get("world_cord", "base")
-    if rpent.get("position_unit", "m") not in {"m", "cm"}:
-        raise ValueError("tools.rpent.position_unit must be m or cm")
-    if workflow == "episode" and agentloop.get("prompt", "simple") != "simple":
-        raise ValueError("episode uses a fixed prompt per simulator")
-    if world_cord not in {"base", "general"}:
-        raise ValueError("tools.rpent.world_cord must be base or general")
-    if world_cord != "base" and workflow != "episode":
-        raise ValueError("general coordinates require the episode interface")
-    if workflow not in ("libero", "libero_rl", "episode"):
+    template = agentloop.get("chat_template_kwargs", {})
+    if not isinstance(template.get("enable_thinking", True), bool):
         raise ValueError(
-            f"tools.rpent.workflow must be libero, libero_rl or episode, got {workflow!r}."
+            "agentloop.chat_template_kwargs.enable_thinking must be a boolean"
         )
-    if workflow in {"libero_rl", "episode"}:
-        mode = agentloop.get("observation_mode", "adaptive")
-        if mode != "adaptive":
-            raise ValueError(
-                f"agentloop.observation_mode must be adaptive, got {mode!r}."
-            )
-        prompt = agentloop.get("prompt", "simple")
-        if prompt not in (
-            "simple",
-            "simple_brief",
-            "base",
-            "base_gripper",
-            "base_gripper_camera",
-        ):
-            raise ValueError(
-                "agentloop.prompt must be simple, simple_brief, base, base_gripper or "
-                f"base_gripper_camera, got {prompt!r}."
-            )
-        template_kwargs = agentloop.get("chat_template_kwargs") or {}
-        if not isinstance(template_kwargs.get("enable_thinking", True), bool):
-            raise ValueError(
-                "agentloop.chat_template_kwargs.enable_thinking must be a boolean."
-            )
-        minimum_turns = 25 if cfg.runner.task_type == "reasoning" else 1
-        if type(agentloop.max_turns) is not int or agentloop.max_turns < minimum_turns:
-            raise ValueError(
-                f"agentloop.max_turns must be an integer >= {minimum_turns} for "
-                f"{cfg.runner.task_type}, got {agentloop.max_turns!r}."
-            )
-        compaction = agentloop.get("history_compaction")
-        if compaction is not None and not (
-            "target_tokens" in compaction or "max_messages" in compaction
-        ):
-            raise ValueError(
-                "agentloop.history_compaction needs target_tokens (image-aware tiers) "
-                "or max_messages (message window)."
-            )
-        if workflow == "episode":
-            if rpent.get("entrypoint") != "robots.rl.rl_episode":
-                raise ValueError(
-                    "episode requires tools.rpent.entrypoint=robots.rl.rl_episode."
-                )
-            if not rpent.get("remote_toolkit_endpoint"):
-                raise ValueError(
-                    "episode requires tools.rpent.remote_toolkit_endpoint."
-                )
-            if rpent.get("action_mode") != "batch":
-                raise ValueError("episode uses batch actions through execute_actions.")
-            if (
-                type(rpent.get("max_actions_per_call")) is not int
-                or not 1 <= rpent.max_actions_per_call <= 3
-            ):
-                raise ValueError(
-                    "episode max_actions_per_call must be an integer from 1 through 3."
-                )
-            if rpent.get("perception_mode") != "single":
-                raise ValueError(
-                    "episode uses explicit view_env, segment and back_project calls."
-                )
-            if rpent.get("image_size") not in {256, 512, 1024}:
-                raise ValueError("episode image_size must be 256, 512 or 1024.")
-            for name in ("reasoning_history", "image_history"):
-                if type(rpent.get(name)) is not int or rpent[name] < -1:
-                    raise ValueError(f"episode {name} must be an integer >= -1.")
-            if agentloop.minimum_output_tokens != max_new_tokens:
-                raise ValueError(
-                    "episode must reserve the full configured max_new_tokens."
-                )
-            if compaction is not None and cfg.algorithm.adv_type == "gae_dynamic":
-                raise ValueError(
-                    "compressed episode histories require chronological actor_gae, not gae_dynamic."
-                )
+    minimum_turns = 25 if cfg.runner.task_type == "reasoning" else 1
+    if type(agentloop.max_turns) is not int or agentloop.max_turns < minimum_turns:
+        raise ValueError(f"agentloop.max_turns must be at least {minimum_turns}")
+    compaction = agentloop.get("history_compaction")
+    if compaction is not None:
+        if "target_tokens" not in compaction and "max_messages" not in compaction:
+            raise ValueError("history_compaction needs target_tokens or max_messages")
+        if cfg.algorithm.adv_type == "gae_dynamic":
+            raise ValueError("Compacted histories require chronological actor_gae")
+    if not mixed and not rpent.get("remote_toolkit_endpoint"):
+        raise ValueError("Set tools.rpent.remote_toolkit_endpoint")
+    if (
+        type(rpent.max_actions_per_call) is not int
+        or not 1 <= rpent.max_actions_per_call <= 3
+    ):
+        raise ValueError("tools.rpent.max_actions_per_call must be between 1 and 3")
+    if rpent.image_size not in {256, 512, 1024}:
+        raise ValueError("tools.rpent.image_size must be 256, 512 or 1024")
+    for option in ("reasoning_history", "image_history"):
+        if type(rpent[option]) is not int or rpent[option] < -1:
+            raise ValueError(f"tools.rpent.{option} must be an integer >= -1")
+    if agentloop.minimum_output_tokens != max_new_tokens:
+        raise ValueError("RPent reserves the full configured max_new_tokens")
 
 
 def _validate_training(cfg: DictConfig, rpent: DictConfig) -> None:
     from rlinf.config import validate_agent_ppo_cfg, validate_async_agent_ppo_cfg
 
-    workflow = rpent.get("workflow", "libero")
     if cfg.runner.task_type == "reasoning":
         if not cfg.critic.get("use_critic_model", False):
             if (
@@ -299,9 +243,8 @@ def _validate_training(cfg: DictConfig, rpent: DictConfig) -> None:
                 "RPent without algorithm.recompute_logprobs needs "
                 "rollout.return_logprobs=True."
             )
-        if workflow in {"libero_rl", "episode"} and (
-            cfg.actor.get("pack_traj", True)
-            or not cfg.actor.get("expect_multi_modal_inputs", False)
+        if cfg.actor.get("pack_traj", True) or not cfg.actor.get(
+            "expect_multi_modal_inputs", False
         ):
             raise ValueError(
                 "adaptive RPent requires actor.pack_traj=False and "

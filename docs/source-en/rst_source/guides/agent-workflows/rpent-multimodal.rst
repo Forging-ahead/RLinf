@@ -1,28 +1,7 @@
 Configure RPent Multimodal Training
 ===================================
 
-Use these options after completing :doc:`the single-node smoke <../../examples/agentic/rpent_libero_rl>`.
-
-Enable Logprob Recalculation and TIS
----------------------------------------------
-
-To test SAO with training-side logprobs and truncated importance sampling (TIS), add these settings to the SAO config. The default SAO recipe leaves both options disabled.
-
-.. code-block:: yaml
-
-   algorithm:
-     recompute_logprobs: true
-     importance_sampling_fix: true
-     importance_sampling_clip: 2.0
-   rollout:
-     return_logprobs: true
-     max_weight_staleness: 1
-
-Each batch retains its sampling logprobs and per-token policy versions. Before the actor update, the learner recalculates logprobs with the current actor weights. TIS limits how much backend differences and policy lag can affect an update. The DIS loss uses the actor weights used for recalculation as the reference when filtering tokens by probability ratio. With these settings, an episode is discarded if any token was sampled with weights more than one update behind the latest published version. Its task is then retried.
-
-.. warning::
-
-   Enabling these options changes how SAO computes its loss and adds an actor forward pass. Check TIS weight clipping, effective sample size and policy lag during a small run before scaling. Optimizer updates, weight synchronization and checkpoint recovery with these options have not been validated. Logprob recalculation and TIS do not establish numerical agreement between SGLang and Megatron.
+Use these options after completing :doc:`the single-node smoke <../../examples/agentic/rpent_episode_sync>`.
 
 Replay Qwen3.5 Image Inputs
 ---------------------------
@@ -90,7 +69,6 @@ Optional Runtime Settings
 
 Training and evaluation set ``rollout.sglang.disable_overlap_schedule=true`` so presence penalties and optional thinking limits read the current CPU token history. Validate sampling logprobs and forced-token alignment on the deployed SGLang version before changing it.
 
-Set ``agentloop.chat_template_kwargs.enable_thinking=false`` to disable thinking, or ``agentloop.prompt=simple_brief`` for prompt guidance toward about 256 reasoning tokens per decision. The prompt does not enforce a decoder limit. Compare native success and cost from fresh episodes with fixed models and seeds; do not remove thinking tokens or behavior logprobs from recorded trajectories.
 
 To cap the first thinking span already opened by the chat template, set ``agentloop.thinking_token_budget=512`` and ``rollout.sglang.enable_custom_logit_processor=true``, keeping ``enable_thinking=true`` and ``rollout.sglang.disable_overlap_schedule=true``. Configuration validation rejects a budget with overlap enabled because its CPU token history can lag decoding. The default budget is ``null``. The engine records which closing token it forces; that token has zero training mask, while a naturally generated closing token remains trainable. A later reopened thinking span is not capped by this option. Keep the returned IDs, behavior logprobs, forced-token flags and weight versions together through trajectory assembly.
 
