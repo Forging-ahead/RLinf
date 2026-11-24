@@ -5155,6 +5155,25 @@ class _FakeManiskillEnv:
     pass
 
 
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize("reward_type", [torch.tensor, float, bool])
+def test_maniskill_raw_rewards(relative, reward_type):
+    pytest.importorskip("mani_skill")
+    from rlinf.envs.sim.maniskill.maniskill_env import ManiskillEnv
+
+    env = object.__new__(ManiskillEnv)
+    env.cfg = SimpleNamespace(reward_mode="raw")
+    env.use_rel_reward = relative
+    env.env = SimpleNamespace(unwrapped=SimpleNamespace(device="cpu", num_envs=1))
+    env.prev_step_reward = torch.zeros(1)
+    rewards = [
+        env._calc_step_reward(reward_type(value), {})
+        for value in [False, True, True, False]
+    ]
+    expected = [0.0, 1.0, 0.0, -1.0] if relative else [0.0, 1.0, 1.0, 0.0]
+    torch.testing.assert_close(torch.cat(rewards), torch.tensor(expected))
+
+
 def _load_maniskill_offload_module(monkeypatch):
     repo_root = Path(__file__).resolve().parents[2]
     module_path = (

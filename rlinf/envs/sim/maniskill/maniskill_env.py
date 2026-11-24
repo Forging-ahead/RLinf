@@ -220,6 +220,9 @@ class ManiskillEnv(gym.Env):
             reward += info["is_src_obj_grasped"] * 0.1
             reward += info["consecutive_grasp"] * 0.1
             reward += (info["success"] & info["is_src_obj_grasped"]) * 1.0
+        reward = torch.as_tensor(
+            reward, dtype=torch.float32, device=self.device
+        ).expand(self.num_envs)
         # diff
         reward_diff = reward - self.prev_step_reward
         self.prev_step_reward = reward
