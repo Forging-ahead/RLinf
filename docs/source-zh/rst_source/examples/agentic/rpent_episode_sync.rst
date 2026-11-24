@@ -68,12 +68,14 @@ ManiSkill 任务池、PPO 与评估
 ``mani_skill.utils.registration.REGISTERED_ENVS``。每个注册任务按指定的 reset
 种子生成一行，清单记录该任务的官方步数上限。仿真端在 reset 后读取本回合的任务指令。
 
+重复传入 ``--task-name`` 可以选择机械臂动作已适配的任务。省略该参数会列出整个注册表，包括没有对应动作的机器人。
+
 .. code-block:: bash
 
    python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split train --seeds 0
+     --environment maniskill --output-dir "$TASK_DIR" --split train --seeds 0 --task-name PickCube-v1 --task-name DrawTriangle-v1
    python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split eval --seeds 1
+     --environment maniskill --output-dir "$TASK_DIR" --split eval --seeds 1 --task-name PickCube-v1 --task-name DrawTriangle-v1
 
 在训练主机上，将 ``MANISKILL_ENDPOINT`` 设为可访问的 ManiSkill 工具服务地址。
 示例在训练节点的 GPU 2、3 上运行模型，仿真端从自己的 GPU 槽位分配资源。PPO 每收齐两条规划轨迹更新一次。规划器的回合轮数预算与仿真任务注册的步数上限分别生效。
@@ -94,5 +96,5 @@ ManiSkill 任务池、PPO 与评估
      "${shared[@]}" "tools.rpent.output_dir=$RUN_DIR/eval-episodes" \
      "data.val_data_paths=$TASK_DIR/eval.jsonl"
 
-PPO 使用每条轨迹的原生奖励之和。评估使用 MODEL_PATH 指定的权重按任务统计轨迹回报，成功率的分母只包含仿真器提供
+PPO 和 LIBERO 一样，成功计 1，失败计 0。没有原生成功判据的任务使用原生累计回报，轨迹会记录奖励来源。评估使用 MODEL_PATH 指定的权重按任务统计轨迹回报，成功率的分母只包含仿真器提供
 ``success`` 的轨迹。在评估运行目录的 ``eval_results.json`` 中可以查看每个任务的统计以及每条轨迹的终止标志。

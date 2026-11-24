@@ -115,7 +115,12 @@ def write_maniskill_tasks(args: argparse.Namespace) -> None:
         raise ValueError("ManiSkill resets take RNG seeds. Specify a seed or range.")
     seeds = parse_seeds(args.seeds)
     tasks, rows = [], []
-    for env_id, spec in sorted(REGISTERED_ENVS.items()):
+    selected = set(args.task_name or REGISTERED_ENVS)
+    missing = selected.difference(REGISTERED_ENVS)
+    if missing:
+        raise ValueError(f"Unknown ManiSkill task IDs: {sorted(missing)}")
+    for env_id in sorted(selected):
+        spec = REGISTERED_ENVS[env_id]
         tasks.append({"task_name": env_id, "max_episode_steps": spec.max_episode_steps})
         for seed in seeds:
             task = {"environment": "maniskill", "task_name": env_id, "seed": seed}
@@ -167,6 +172,11 @@ def parse_seeds(value: str) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--task-name",
+        action="append",
+        help="Registered ManiSkill task to include; repeat for a policy-compatible task pool.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--environment", choices=("libero", "maniskill"), default="libero"
@@ -181,6 +191,8 @@ def main() -> None:
         "--split", choices=("train", "dev", "test", "eval"), default="train"
     )
     args = parser.parse_args()
+    if args.task_name and args.environment != "maniskill":
+        parser.error("--task-name selects a ManiSkill registry entry")
     if args.environment == "maniskill":
         args.seeds = args.seeds or "0"
         write_maniskill_tasks(args)

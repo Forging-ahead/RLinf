@@ -147,9 +147,13 @@ def episode_output(
         native_metrics = {
             k: status[k] for k in ("episode_return", "terminated", "fail")
         }
+    if native_metrics and status["success"] is None:
         reward = float(native_metrics["episode_return"])
+        native_metrics["reward_source"] = "episode_return"
     else:
         reward = float(status["success"])
+        if native_metrics:
+            native_metrics["reward_source"] = "success"
     if not math.isfinite(reward):
         raise ValueError(f"Non-finite reward in RPent episode {episode_id}: {reward}")
     for turn in turns:

@@ -99,16 +99,16 @@ ManiSkill task pool, PPO and evaluation
 ---------------------------------------
 
 In the simulation environment, build a pool from the installed
-``mani_skill.utils.registration.REGISTERED_ENVS``. Each registered task gets
+``mani_skill.utils.registration.REGISTERED_ENVS``. Use repeated ``--task-name`` options to select tasks for the available arm tools. Omitting this option enumerates the entire registry, including unsupported embodiments. Each selected task gets
 one row per requested reset seed. The manifest records the official horizon
 for each task. The toolkit obtains the task instruction after reset.
 
 .. code-block:: bash
 
    python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split train --seeds 0
+     --environment maniskill --output-dir "$TASK_DIR" --split train --seeds 0 --task-name PickCube-v1 --task-name DrawTriangle-v1
    python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split eval --seeds 1
+     --environment maniskill --output-dir "$TASK_DIR" --split eval --seeds 1 --task-name PickCube-v1 --task-name DrawTriangle-v1
 
 Run PPO and evaluation on the training host with a reachable ManiSkill
 toolkit. This example uses training GPUs 2 and 3. The toolkit assigns simulation
@@ -132,7 +132,7 @@ registered step limit are independent.
      "${shared[@]}" "tools.rpent.output_dir=$RUN_DIR/eval-episodes" \
      "data.val_data_paths=$TASK_DIR/eval.jsonl"
 
-PPO uses the sum of the native rewards for each episode. Evaluation reports
+PPO scores a native success as one and failure as zero, as in LIBERO. For tasks without a success criterion it uses the native return. The trajectory records the score source. Evaluation reports
 that return for every task using the weights at MODEL_PATH and counts only episodes with a native
 ``success`` value in the success rate. Open ``eval_results.json`` in the
 evaluation run directory for each task's scores and termination flags.

@@ -100,6 +100,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         self.extra_keys_traj = [
             "success",
             "episode_return",
+            "reward_source",
             "terminated",
             "fail",
             "truncated",

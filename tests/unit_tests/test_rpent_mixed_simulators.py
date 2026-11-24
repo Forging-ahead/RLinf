@@ -59,7 +59,9 @@ def test_maniskill_registry_task_pool_and_routing(tmp_path, monkeypatch):
     }
     for module in (package, package.envs, package.utils, package.utils.registration):
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    args = SimpleNamespace(output_dir=tmp_path, split="eval", seeds="3-4,3")
+    args = SimpleNamespace(
+        output_dir=tmp_path, split="eval", seeds="3-4,3", task_name=None
+    )
     write_maniskill_tasks(args)
     rows = [
         json.loads(line) for line in (tmp_path / "eval.jsonl").read_text().splitlines()
@@ -77,6 +79,16 @@ def test_maniskill_registry_task_pool_and_routing(tmp_path, monkeypatch):
     assert [t["max_episode_steps"] for t in manifest["tasks"]] == [50, 1000]
     simulators = mixed_simulators(mixed_config(("maniskill", "libero")))
     assert simulators["maniskill"].train_data_paths == "/tasks/maniskill.jsonl"
+
+    args.task_name = ["Pick-v1"]
+    write_maniskill_tasks(args)
+    entries = (tmp_path / "eval.jsonl").read_text().splitlines()
+    assert [
+        json.loads(json.loads(line)["answer"])["task_name"] for line in entries
+    ] == ["Pick-v1", "Pick-v1"]
+    args.task_name = ["missing-v1"]
+    with pytest.raises(ValueError, match="missing-v1"):
+        write_maniskill_tasks(args)
 
 
 def test_mixed_quotas_count_full_groups():

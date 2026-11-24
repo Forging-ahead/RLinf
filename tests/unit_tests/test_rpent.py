@@ -67,7 +67,9 @@ def test_episode_failure_survives_ray_exception_serialization():
 @pytest.mark.parametrize(
     ("success", "episode_return"), [(None, -2.5), (True, 4.0), (False, 0.0)]
 )
-def test_maniskill_training_uses_native_return(success, episode_return):
+def test_maniskill_scores_success_and_preserves_unscored_task_return(
+    success, episode_return
+):
     turn = AgentLoopOutput(prompt_ids=[1], response_ids=[2])
     result = episode_output(
         [turn],
@@ -87,7 +89,12 @@ def test_maniskill_training_uses_native_return(success, episode_return):
             "termination_reason": "environment",
         },
     )
-    assert result.single_turn_outputs[0].reward_score == episode_return
+    assert result.single_turn_outputs[0].reward_score == (
+        episode_return if success is None else float(success)
+    )
+    assert result.extra_fields["reward_source"] == (
+        "episode_return" if success is None else "success"
+    )
     assert result.extra_fields["success"] is success
     assert result.extra_fields["episode_return"] == episode_return
 
