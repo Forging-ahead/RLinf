@@ -15,7 +15,9 @@
 
 import asyncio
 import json
+import sys
 from copy import deepcopy
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
@@ -42,6 +44,39 @@ def mixed_config(names=("libero", "robotwin", "robocasa", "robodojo")):
             },
         }
     )
+
+
+def test_maniskill_registry_task_pool_and_routing(tmp_path, monkeypatch):
+    from examples.agent.rpent.prepare_tasks import write_maniskill_tasks
+
+    package = ModuleType("mani_skill")
+    package.envs = ModuleType("mani_skill.envs")
+    package.utils = ModuleType("mani_skill.utils")
+    package.utils.registration = ModuleType("mani_skill.utils.registration")
+    package.utils.registration.REGISTERED_ENVS = {
+        "Stand-v1": SimpleNamespace(max_episode_steps=1000),
+        "Pick-v1": SimpleNamespace(max_episode_steps=50),
+    }
+    for module in (package, package.envs, package.utils, package.utils.registration):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    args = SimpleNamespace(output_dir=tmp_path, split="eval", seeds="3-4,3")
+    write_maniskill_tasks(args)
+    rows = [
+        json.loads(line) for line in (tmp_path / "eval.jsonl").read_text().splitlines()
+    ]
+    tasks = [json.loads(row["answer"]) for row in rows]
+    assert [(t["task_name"], t["seed"]) for t in tasks] == [
+        ("Pick-v1", 3),
+        ("Pick-v1", 4),
+        ("Stand-v1", 3),
+        ("Stand-v1", 4),
+    ]
+    assert all(t["environment"] == "maniskill" for t in tasks)
+    assert len({row["query_id"] for row in rows}) == len(rows)
+    manifest = json.loads((tmp_path / "eval-manifest.json").read_text())
+    assert [t["max_episode_steps"] for t in manifest["tasks"]] == [50, 1000]
+    simulators = mixed_simulators(mixed_config(("maniskill", "libero")))
+    assert simulators["maniskill"].train_data_paths == "/tasks/maniskill.jsonl"
 
 
 def test_mixed_quotas_count_full_groups():

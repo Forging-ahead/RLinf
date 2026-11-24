@@ -298,7 +298,8 @@ def aggregate_agent_metrics(metrics_list: list[dict]) -> dict:
 
     Keys prefixed with `__sum__/`, `__max__/` or `__min__/` merge directly
     across the dicts; `__mean__/` values are (numerator, denominator) pairs
-    whose sums are divided; keys without one of these prefixes are dropped.
+    whose sums are divided. A mean with no observations across the batch is
+    omitted. Keys without one of these prefixes are dropped.
     An empty list aggregates to an empty dict.
 
     Args:
@@ -330,6 +331,8 @@ def aggregate_agent_metrics(metrics_list: list[dict]) -> dict:
             stat_key, real_key = None, None
         if stat_key is not None:
             values = [metric_dict[key] for metric_dict in metrics_list]
+            if stat_key == "__mean__/" and not any(denom for _, denom in values):
+                continue
             aggregated[real_key] = stat_methods[stat_key](values)
 
     return aggregated

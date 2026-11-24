@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field, replace
 
@@ -141,13 +142,24 @@ def episode_output(
     max_scored_tokens: int,
 ) -> MultiAgentLoopOutput:
     """Score sampled turns and retain their chronological episode identity."""
+    native_metrics = {}
+    if task.get("environment") == "maniskill":
+        native_metrics = {
+            k: status[k] for k in ("episode_return", "terminated", "fail")
+        }
+        reward = float(native_metrics["episode_return"])
+    else:
+        reward = float(status["success"])
+    if not math.isfinite(reward):
+        raise ValueError(f"Non-finite reward in RPent episode {episode_id}: {reward}")
     for turn in turns:
-        turn.reward_score = float(status["success"])
+        turn.reward_score = reward
     output_turns = merge_prefix_turns(turns, max_scored_tokens) if merge else turns
     return MultiAgentLoopOutput(
         single_turn_outputs=output_turns,
         extra_fields={
             "success": status["success"],
+            **native_metrics,
             "init_state_id": status["init_state_id"],
             "truncated": status["truncated"],
             "task": task,

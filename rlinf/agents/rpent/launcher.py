@@ -145,7 +145,8 @@ class RPentEpisodeLauncher:
             )
         outcome = json.loads((output / "outcome.json").read_text())
         keep = rpent.keep_episodes == "all" or (
-            rpent.keep_episodes == "failures" and not outcome["success"]
+            rpent.keep_episodes == "failures"
+            and (outcome["success"] is False or outcome.get("fail") is True)
         )
         if not keep and candidate is None:
             shutil.rmtree(output)

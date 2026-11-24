@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Write a LIBERO episode task pool or fixed evaluation manifest."""
+"""Write a native simulator task pool or fixed evaluation manifest."""
 
 import argparse
 import hashlib
@@ -93,15 +93,52 @@ def write_episode_tasks(args: argparse.Namespace) -> None:
                         "query_id": f"{suite}-t{task}-state{entry['init_state_id']}",
                     }
                 )
+    write_pool(
+        args,
+        rows,
+        {
+            "libero_type": args.libero_type,
+            "suites": EPISODE_SUITES,
+            "tasks": tasks,
+            "seeds": args.seeds,
+            "eval_is_training_pool_regression": True,
+        },
+    )
+
+
+def write_maniskill_tasks(args: argparse.Namespace) -> None:
+    """Generate one task per official registry entry and requested reset seed."""
+    import mani_skill.envs  # noqa: F401 -- imports and registers all official tasks
+    from mani_skill.utils.registration import REGISTERED_ENVS
+
+    if args.seeds == "all":
+        raise ValueError("ManiSkill resets take RNG seeds. Specify a seed or range.")
+    seeds = parse_seeds(args.seeds)
+    tasks, rows = [], []
+    for env_id, spec in sorted(REGISTERED_ENVS.items()):
+        tasks.append({"task_name": env_id, "max_episode_steps": spec.max_episode_steps})
+        for seed in seeds:
+            task = {"environment": "maniskill", "task_name": env_id, "seed": seed}
+            rows.append(
+                {
+                    "prompt": env_id,
+                    "answer": json.dumps(task, sort_keys=True),
+                    "query_id": f"maniskill-{env_id}-seed{seed}",
+                }
+            )
+    if not tasks:
+        raise ValueError(
+            "The ManiSkill registry is empty after importing mani_skill.envs."
+        )
+    write_pool(args, rows, {"environment": "maniskill", "tasks": tasks, "seeds": seeds})
+
+
+def write_pool(args: argparse.Namespace, rows: list[dict], metadata: dict) -> None:
     payload = "".join(json.dumps(row) + "\n" for row in rows).encode()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / f"{args.split}.jsonl").write_bytes(payload)
     manifest = {
-        "libero_type": args.libero_type,
-        "suites": EPISODE_SUITES,
-        "tasks": tasks,
-        "seeds": args.seeds,
-        "eval_is_training_pool_regression": True,
+        **metadata,
         "files": {
             args.split: {
                 "rows": len(rows),
@@ -131,15 +168,25 @@ def parse_seeds(value: str) -> list[int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--environment", choices=("libero", "maniskill"), default="libero"
+    )
     parser.add_argument("--libero-type", choices=("standard", "pro"), default="pro")
     parser.add_argument("--libero-config-path", type=Path)
     parser.add_argument(
-        "--seeds", default="all", help="Native seeds or ranges, e.g. 0-1"
+        "--seeds",
+        help="Native seed IDs or ranges, e.g. 0-1 (LIBERO: all; ManiSkill: 0)",
     )
     parser.add_argument(
         "--split", choices=("train", "dev", "test", "eval"), default="train"
     )
-    write_episode_tasks(parser.parse_args())
+    args = parser.parse_args()
+    if args.environment == "maniskill":
+        args.seeds = args.seeds or "0"
+        write_maniskill_tasks(args)
+    else:
+        args.seeds = args.seeds or "all"
+        write_episode_tasks(args)
 
 
 if __name__ == "__main__":

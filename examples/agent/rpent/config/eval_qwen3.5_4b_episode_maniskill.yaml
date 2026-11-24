@@ -1,0 +1,17 @@
+defaults:
+  - train_qwen3.5_4b_episode_maniskill_ppo
+  - _self_
+
+runner:
+  experiment_name: rpent-maniskill-qwen3.5-4b-eval
+  task_type: reasoning_eval
+  synchronous: false
+
+data:
+  train_data_paths: null
+  val_data_paths: ???
+  val_rollout_batch_size: 2
+
+rollout:
+  return_logprobs: false
+  validate_weight_first_sync: false

@@ -2,13 +2,30 @@ defaults:
   - train_qwen3.5_4b_episode_sync_ppo
   - _self_
 
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 2-3
+    critic: 2-3
+    rollout: 2-3
+    reward: 2-3
+    agentloop: 2-3
+
 runner:
   experiment_name: rpent-episode-qwen3.5-4b-maniskill-ppo
+  max_epochs: 1
+  max_steps: -1
 
-agentloop:
-  max_turns: 50
-  minimum_output_tokens: 16384
+data:
+  rollout_batch_size: 2
 
-algorithm:
-  sampling_params:
-    max_new_tokens: 16384
+tools:
+  rpent:
+    # The toolkit bounds each episode by the registered task horizon.
+    max_episode_steps: 200000
+    # Let the remote toolkit choose among its configured --gpu-slots.
+    env_gpus: [null]
+    episodes_per_worker: 1
+
+rollout:
+  gpu_memory_utilization: 0.55

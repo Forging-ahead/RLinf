@@ -29,7 +29,11 @@ import torch
 from _qwen35_chat import Qwen35ToyTokenizer, qwen35_agentic_tokenizer
 from omegaconf import OmegaConf, open_dict
 
-from rlinf.agents.rpent.episode import RPentEpisodeError, merge_prefix_turns
+from rlinf.agents.rpent.episode import (
+    RPentEpisodeError,
+    episode_output,
+    merge_prefix_turns,
+)
 from rlinf.agents.rpent.history import (
     AppendOnlyHistory,
 )
@@ -58,6 +62,84 @@ def test_episode_failure_survives_ray_exception_serialization():
     assert type(restored) is RPentEpisodeError
     assert str(restored) == str(error)
     assert restored.kind == "startup"
+
+
+@pytest.mark.parametrize(
+    ("success", "episode_return"), [(None, -2.5), (True, 4.0), (False, 0.0)]
+)
+def test_maniskill_training_uses_native_return(success, episode_return):
+    turn = AgentLoopOutput(prompt_ids=[1], response_ids=[2])
+    result = episode_output(
+        [turn],
+        task={"environment": "maniskill", "task_name": "native", "seed": 4},
+        episode_id="native",
+        elapsed_s=1,
+        merge=True,
+        max_scored_tokens=16,
+        status={
+            "success": success,
+            "fail": None,
+            "terminated": success is True,
+            "truncated": success is not True,
+            "terminal": True,
+            "episode_return": episode_return,
+            "init_state_id": 4,
+            "termination_reason": "environment",
+        },
+    )
+    assert result.single_turn_outputs[0].reward_score == episode_return
+    assert result.extra_fields["success"] is success
+    assert result.extra_fields["episode_return"] == episode_return
+
+
+def test_maniskill_and_legacy_metrics():
+    from rlinf.agents.rpent.eval_runner import summarize_episodes
+    from rlinf.utils.metric_utils import aggregate_agent_metrics
+
+    episodes = [
+        {"task": {"suite": "libero_goal"}, "success": True},
+        {
+            "task": {"environment": "maniskill", "task_name": "stand"},
+            "success": None,
+            "episode_return": -0.5,
+        },
+        {
+            "task": {"environment": "maniskill", "task_name": "pick"},
+            "success": False,
+            "episode_return": 2.5,
+        },
+    ]
+    summary = summarize_episodes(episodes)
+    assert summary["suites"]["libero_goal"]["success_rate"] == 1
+    assert summary["tasks"]["maniskill/stand"] == {
+        "episodes": 1,
+        "episodes_with_success_metric": 0,
+        "mean_episode_return": -0.5,
+    }
+    assert summary["success_rate"] == 0.5
+    assert summary["mean_episode_return"] == 1.0
+    assert summary["episodes_with_success_metric"] == 2
+
+    groups = [
+        RPentAgentLoopWorker.get_rollout_metrics(
+            None,
+            SimpleNamespace(
+                extra_fields_traj={
+                    "success": [e["success"]],
+                    "episode_return": [e.get("episode_return")],
+                    "infra_retry_errors": [[]],
+                    "turns": [1],
+                },
+                num_sequence=1,
+            ),
+        )
+        for e in episodes
+    ]
+    assert "rpent/success_rate" not in aggregate_agent_metrics([groups[1]])
+    assert "rpent/episode_return" not in aggregate_agent_metrics([groups[0]])
+    mixed = aggregate_agent_metrics(groups)
+    assert mixed["rpent/success_rate"] == 0.5
+    assert mixed["rpent/episode_return"] == 1.0
 
 
 def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():

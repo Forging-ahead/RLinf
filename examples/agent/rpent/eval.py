@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluate a served RPent planner on fixed LIBERO tasks."""
+"""Evaluate a served RPent planner on fixed simulator tasks."""
 
 import json
 
