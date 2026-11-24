@@ -1,0 +1,14 @@
+defaults:
+  - train_qwen3.5_4b_episode_sync_ppo
+  - _self_
+
+runner:
+  experiment_name: rpent-episode-qwen3.5-4b-maniskill-ppo
+
+agentloop:
+  max_turns: 50
+  minimum_output_tokens: 16384
+
+algorithm:
+  sampling_params:
+    max_new_tokens: 16384

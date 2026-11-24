@@ -1,0 +1,4 @@
+{"prompt":"Move the red cube to the goal.","answer":"{\"environment\":\"maniskill\",\"task_name\":\"pick_cube\",\"seed\":0}"}
+{"prompt":"Move the red cube to the goal.","answer":"{\"environment\":\"maniskill\",\"task_name\":\"pick_cube\",\"seed\":1}"}
+{"prompt":"Move the red cube to the goal.","answer":"{\"environment\":\"maniskill\",\"task_name\":\"pick_cube\",\"seed\":2}"}
+{"prompt":"Move the red cube to the goal.","answer":"{\"environment\":\"maniskill\",\"task_name\":\"pick_cube\",\"seed\":3}"}
