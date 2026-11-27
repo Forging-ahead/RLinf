@@ -64,6 +64,10 @@ def summarize_episodes(episodes: list[dict]) -> dict:
     summary["suites"] = {key: _metrics(rows) for key, rows in sorted(suites.items())}
     if tasks:
         summary["tasks"] = {key: _metrics(rows) for key, rows in sorted(tasks.items())}
+        unscored = [key for key, metrics in summary["tasks"].items()
+                    if not metrics["episodes_with_success_metric"]]
+        if unscored:
+            summary["tasks_without_success_metric"] = unscored
     return summary
 
 

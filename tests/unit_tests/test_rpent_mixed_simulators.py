@@ -54,8 +54,9 @@ def test_maniskill_registry_task_pool_and_routing(tmp_path, monkeypatch):
     package.utils = ModuleType("mani_skill.utils")
     package.utils.registration = ModuleType("mani_skill.utils.registration")
     package.utils.registration.REGISTERED_ENVS = {
-        "Stand-v1": SimpleNamespace(max_episode_steps=1000),
-        "Pick-v1": SimpleNamespace(max_episode_steps=50),
+        "Empty-v1": SimpleNamespace(max_episode_steps=200000),
+        "UnitreeG1Stand-v1": SimpleNamespace(max_episode_steps=1000),
+        "PickCube-v1": SimpleNamespace(max_episode_steps=50),
     }
     for module in (package, package.envs, package.utils, package.utils.registration):
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -68,26 +69,26 @@ def test_maniskill_registry_task_pool_and_routing(tmp_path, monkeypatch):
     ]
     tasks = [json.loads(row["answer"]) for row in rows]
     assert [(t["task_name"], t["seed"]) for t in tasks] == [
-        ("Pick-v1", 3),
-        ("Pick-v1", 4),
-        ("Stand-v1", 3),
-        ("Stand-v1", 4),
+        ("Empty-v1", 3),
+        ("Empty-v1", 4),
+        ("PickCube-v1", 3),
+        ("PickCube-v1", 4),
     ]
     assert all(t["environment"] == "maniskill" for t in tasks)
     assert len({row["query_id"] for row in rows}) == len(rows)
     manifest = json.loads((tmp_path / "eval-manifest.json").read_text())
-    assert [t["max_episode_steps"] for t in manifest["tasks"]] == [50, 1000]
+    assert [t["max_episode_steps"] for t in manifest["tasks"]] == [200000, 50]
     simulators = mixed_simulators(mixed_config(("maniskill", "libero")))
     assert simulators["maniskill"].train_data_paths == "/tasks/maniskill.jsonl"
 
-    args.task_name = ["Pick-v1"]
+    args.task_name = ["PickCube-v1"]
     write_maniskill_tasks(args)
     entries = (tmp_path / "eval.jsonl").read_text().splitlines()
     assert [
         json.loads(json.loads(line)["answer"])["task_name"] for line in entries
-    ] == ["Pick-v1", "Pick-v1"]
-    args.task_name = ["missing-v1"]
-    with pytest.raises(ValueError, match="missing-v1"):
+    ] == ["PickCube-v1", "PickCube-v1"]
+    args.task_name = ["UnitreeG1Stand-v1"]
+    with pytest.raises(ValueError, match="UnitreeG1Stand-v1"):
         write_maniskill_tasks(args)
 
 

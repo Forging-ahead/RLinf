@@ -107,7 +107,7 @@ def write_episode_tasks(args: argparse.Namespace) -> None:
 
 
 def write_maniskill_tasks(args: argparse.Namespace) -> None:
-    """Generate one task per official registry entry and requested reset seed."""
+    """Generate one task per selected pose environment and requested reset seed."""
     import mani_skill.envs  # noqa: F401 -- imports and registers all official tasks
     from mani_skill.utils.registration import REGISTERED_ENVS
 
@@ -115,7 +115,17 @@ def write_maniskill_tasks(args: argparse.Namespace) -> None:
         raise ValueError("ManiSkill resets take RNG seeds. Specify a seed or range.")
     seeds = parse_seeds(args.seeds)
     tasks, rows = [], []
-    selected = set(args.task_name or REGISTERED_ENVS)
+    from rlinf.agents.rpent.maniskill_tasks import (
+        CARTESIAN_TASKS, EVALUATED_POSE_TASKS, UNSCORED_POSE_TASKS,
+    )
+
+    default_tasks = EVALUATED_POSE_TASKS
+    if args.split != "train":
+        default_tasks = default_tasks | UNSCORED_POSE_TASKS
+    selected = set(args.task_name or (default_tasks & REGISTERED_ENVS.keys()))
+    unsupported = selected - CARTESIAN_TASKS
+    if unsupported:
+        raise ValueError(f"Unsupported ManiSkill pose tasks: {sorted(unsupported)}")
     missing = selected.difference(REGISTERED_ENVS)
     if missing:
         raise ValueError(f"Unknown ManiSkill task IDs: {sorted(missing)}")

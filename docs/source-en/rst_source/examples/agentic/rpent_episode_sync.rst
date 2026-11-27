@@ -99,7 +99,7 @@ ManiSkill task pool, PPO and evaluation
 ---------------------------------------
 
 In the simulation environment, build a pool from the installed
-``mani_skill.utils.registration.REGISTERED_ENVS``. Use repeated ``--task-name`` options to select tasks for the available arm tools. Omitting this option enumerates the entire registry, including unsupported embodiments. Each selected task gets
+``mani_skill.utils.registration.REGISTERED_ENVS``. Use repeated ``--task-name`` options to select tasks for the available arm tools. Training defaults to 29 scored pose tasks. Evaluation also includes 12 pose environments without a native success criterion, listed separately and excluded from the success-rate denominator. Five additional pose tasks can be selected explicitly after installing their assets. Each selected task gets
 one row per requested reset seed. The manifest records the official horizon
 for each task. The toolkit obtains the task instruction after reset.
 

@@ -123,6 +123,7 @@ def test_maniskill_and_legacy_metrics():
         "episodes_with_success_metric": 0,
         "mean_episode_return": -0.5,
     }
+    assert summary["tasks_without_success_metric"] == ["maniskill/stand"]
     assert summary["success_rate"] == 0.5
     assert summary["mean_episode_return"] == 1.0
     assert summary["episodes_with_success_metric"] == 2

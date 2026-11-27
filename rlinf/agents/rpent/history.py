@@ -69,14 +69,16 @@ def message_images(messages: list[dict]) -> list[bytes]:
     return images
 
 
-def template_messages(messages: list[dict]) -> list[dict]:
+def template_messages(
+    messages: list[dict], *, images: list[bytes] | None = None
+) -> list[dict]:
     """Return messages in the form the chat template accepts.
 
     Tool-call arguments become mappings; calls whose arguments are not a JSON
     object are kept as text in the message content. Image parts keep their
     content list so the chat template can place a vision marker for each one.
     """
-    messages = copy.deepcopy(messages)
+    messages = [dict(message) for message in messages]
     for message in messages:
         # The planner omits empty reasoning when it echoes an assistant reply.
         if (
@@ -99,7 +101,10 @@ def template_messages(messages: list[dict]) -> list[dict]:
                         f"unsupported content part {part!r}; RPent prompts carry "
                         "text and base64 image_url parts"
                     )
-                _image_bytes(part) if kind == "image_url" else None
+                if kind == "image_url":
+                    image = _image_bytes(part)
+                    if images is not None:
+                        images.append(image)
             continue
         calls, malformed = [], []
         for call in message.get("tool_calls", []):
@@ -110,12 +115,13 @@ def template_messages(messages: list[dict]) -> list[dict]:
                 except json.JSONDecodeError:
                     pass
             if isinstance(arguments, dict):
-                call["function"]["arguments"] = arguments
-                calls.append(call)
+                function = {**call["function"], "arguments": arguments}
+                calls.append({**call, "function": function})
             else:
                 malformed.append(json.dumps(call, ensure_ascii=False))
         if malformed:
             message["content"] += "\n" + "\n".join(malformed)
+        if message.get("tool_calls"):
             message["tool_calls"] = calls
     return messages
 
@@ -167,9 +173,14 @@ class ImagePrompt:
 
 def render_prompt(tokenizer: AgenticTokenizer, request: dict) -> list[int]:
     """Render a whole chat request with the model's chat template."""
+    messages = template_messages(request["messages"])
+    return _text_ids(tokenizer, messages, request.get("tools"))
+
+
+def _text_ids(tokenizer: AgenticTokenizer, messages: list[dict], tools) -> list[int]:
     text = tokenizer.apply_chat_template(
-        template_messages(request["messages"]),
-        tools=request.get("tools"),
+        messages,
+        tools=tools,
         tokenize=False,
         add_generation_prompt=True,
     )
@@ -197,8 +208,8 @@ def render_image_prompt(
     """
     from PIL import Image
 
-    messages = template_messages(request["messages"])
-    images = message_images(messages)
+    images = []
+    messages = template_messages(request["messages"], images=images)
     if not images:
         raise TemplateMessageError("render_image_prompt needs at least one image")
     text = tokenizer.apply_chat_template(
@@ -218,6 +229,8 @@ def render_image_increment(
     tokenizer: AgenticTokenizer,
     new_messages: list[dict],
     processor: Any,
+    *,
+    images: list[bytes] | None = None,
 ) -> ImagePrompt:
     """Render only the appended messages of a continuing turn, images expanded.
 
@@ -229,7 +242,8 @@ def render_image_increment(
     from PIL import Image
 
     text = tokenizer.render_incremental_text(new_messages)
-    images = message_images(new_messages)
+    if images is None:
+        images = message_images(new_messages)
     if not images:
         ids = tokenizer.tokenizer(text, add_special_tokens=False)["input_ids"]
         return ImagePrompt(input_ids=ids)
@@ -340,8 +354,13 @@ class AppendOnlyHistory:
             self._begin_chain()
             self._image_prompt = render_image_prompt(self.tokenizer, request, processor)
             return self._image_prompt
-        new_messages = template_messages(request["messages"][len(self._messages) + 1 :])
-        increment = render_image_increment(self.tokenizer, new_messages, processor)
+        images = []
+        new_messages = template_messages(
+            request["messages"][len(self._messages) + 1 :], images=images
+        )
+        increment = render_image_increment(
+            self.tokenizer, new_messages, processor, images=images
+        )
         prompt_ids = self.tokenizer.join_increment(self._ids, increment.input_ids)
         self._image_prompt = _extend_image_prompt(
             self._image_prompt, increment, prompt_ids
@@ -351,10 +370,12 @@ class AppendOnlyHistory:
     def render_token_space(self, request: dict) -> ImagePrompt:
         """Append compact image markers without processing images on the agent."""
         continues = self._continues(request)
+        images = []
         messages = template_messages(
             request["messages"][len(self._messages) + 1 :]
             if continues
-            else request["messages"]
+            else request["messages"],
+            images=images,
         )
         # The serving API locates media by special tokens. Literal markers must
         # not acquire image semantics, including in tool schemas or responses.
@@ -379,7 +400,6 @@ class AppendOnlyHistory:
             raise TemplateMessageError(
                 "Literal vision markers are unsupported in token-space chats"
             )
-        images = message_images(messages)
         if continues:
             increment = self.tokenizer.render_incremental(messages)
             ids = self.tokenizer.join_increment(self._ids, increment)
@@ -390,7 +410,7 @@ class AppendOnlyHistory:
             prefix_length = len(self._ids)
         else:
             self._begin_chain()
-            ids = render_prompt(self.tokenizer, request)
+            ids = _text_ids(self.tokenizer, messages, request.get("tools"))
             increment, offset = ids, 0
             old_images, old_spans, prefix_length = [], [], 0
         image_id = self.tokenizer.tokenizer.convert_tokens_to_ids("<|image_pad|>")
@@ -435,5 +455,5 @@ class AppendOnlyHistory:
         """Make a sampled turn the base of the next request."""
         self._messages = copy.deepcopy(request["messages"])
         self._tools = copy.deepcopy(request.get("tools"))
-        self._assistant_message = template_messages([assistant_message])[0]
+        self._assistant_message = template_messages([copy.deepcopy(assistant_message)])[0]
         self._ids = [*prompt_ids, *response_ids]
