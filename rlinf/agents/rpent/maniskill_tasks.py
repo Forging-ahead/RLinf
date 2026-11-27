@@ -1,3 +1,6 @@
+# Copyright 2026 The RLinf Authors.
+# SPDX-License-Identifier: Apache-2.0
+
 """ManiSkill tasks with a spatial manipulation goal and a controllable tool pose."""
 
 EVALUATED_POSE_TASKS = frozenset(
