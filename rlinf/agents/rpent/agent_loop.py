@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import struct
 import time
@@ -177,9 +178,11 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
 
     async def _open_session(
         self, client: httpx.AsyncClient, endpoint: str, task: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], list[bytes]]:
         """Open a simulator session, falling back across ``fallback_seeds`` if needed."""
         rpent = self.cfg.tools.rpent
+        raw_image_size = rpent.get("image_size", None)
+        image_size = None if raw_image_size is None else int(raw_image_size)
         base_seed = task.get("seed", task.get("init_state_id"))
         seeds = [base_seed, *(task.get("fallback_seeds") or ())]
         last_error: Exception | None = None
@@ -196,17 +199,19 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                         "task": attempt_task,
                         "cohort_id": self._generation_cohort_id,
                         "max_episode_steps": int(rpent.get("max_episode_steps", 10000)),
-                        "image_size": int(rpent.get("image_size", 1024)),
+                        "image_size": image_size,
                         "max_actions_per_call": int(
                             rpent.get("max_actions_per_call", 3)
                         ),
                         "reasoning": self._thinking_enabled,
+                        "include_jaw_mm": bool(rpent.get("include_jaw_mm", False)),
                         "record_artifacts": bool(rpent.get("record_artifacts", False)),
                         "output_dir": str(rpent.get("output_dir"))
                         if rpent.get("record_artifacts", False)
                         and rpent.get("output_dir")
                         else None,
                     },
+                    headers={"Accept": _BINARY_EXECUTE_MEDIA_TYPE},
                 )
                 if resp.status_code >= 400:
                     raise httpx.HTTPStatusError(
@@ -214,8 +219,14 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                         request=resp.request,
                         response=resp,
                     )
-                return resp.json()
-            except (httpx.HTTPError, OSError) as exc:
+                if _BINARY_EXECUTE_MEDIA_TYPE in resp.headers.get("content-type", ""):
+                    return _unpack_execute_response(resp.content)
+                opened = resp.json()
+                images = [
+                    base64.b64decode(b64) for b64 in opened.get("images_b64") or ()
+                ]
+                return opened, images
+            except (httpx.HTTPError, OSError, ValueError) as exc:
                 last_error = exc
         raise RPentEpisodeError(
             f"SimPoolServer open failed for {task.get('task_name') or task.get('suite')}: {last_error}",
@@ -427,7 +438,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         async with (
             self._episode_sem if self._episode_sem is not None else nullcontext()
         ):
-            opened = await self._open_session(client, endpoint, task)
+            opened, initial_images = await self._open_session(client, endpoint, task)
             sid = opened["session_id"]
             conv = EpisodeConversation(
                 system_prompt=opened["system_prompt"],
@@ -436,6 +447,8 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 tools=opened["tools"],
                 environment=opened["environment"],
                 compaction=self._compaction,
+                initial_images=initial_images,
+                initial_image_cameras=opened.get("image_cameras") or (),
             )
             history = AppendOnlyHistory(self.agentic_tokenizer)
             turns: list[AgentLoopOutput] = []

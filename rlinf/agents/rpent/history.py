@@ -24,7 +24,7 @@ import math
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 from PIL import Image
@@ -55,13 +55,13 @@ def _argument_hint(name: str, environment: str) -> str:
         "move_to",
         "set_gripper",
     }:
-        return "Use move_to with xyz only (fixed wrist orientation) or set_gripper with opening 0..1 in execute_actions."
+        return "Use move_to with xyz only (fixed wrist orientation) or set_gripper with opening 0..1 in execute_actions; optional observe must be none, all, or a declared camera."
     if environment in {"robotwin", "robodojo"} and name in {
         "execute_actions",
         "move_to",
         "set_gripper",
     }:
-        return "Follow the declared native action fields and orientation convention; include the selected arm where required."
+        return "Follow the declared native action fields and orientation convention; include the selected arm where required and use none, all, or a declared camera for observe."
     if environment == "robocasa" and name in {"move_to", "set_gripper"}:
         return (
             "Follow the declared move_to/set_gripper fields and orientation convention."
@@ -72,7 +72,7 @@ def _argument_hint(name: str, environment: str) -> str:
         "move_to": "Supply xyz, orientation_rpy, or both as three finite numbers.",
         "move_base": "Supply bounded local velocities vx/vy/yaw_rate and duration_s within the declared limits.",
         "move_lift": "Supply delta_m within +/-0.25 and duration_s within 0.1..5.",
-        "execute_actions": "Supply a non-empty actions list within K; each item must be move_to with a target or set_gripper with opening 0..1.",
+        "execute_actions": "Supply a non-empty actions list within K; each item must be move_to with a target or set_gripper with opening 0..1, and optional observe must be none, all, or a declared camera.",
     }.get(name, "Follow the declared required fields and value ranges.")
 
 
@@ -93,7 +93,7 @@ class LogicalMessage:
 
 @dataclass(frozen=True)
 class CompactionConfig:
-    """Sliding-window compaction settings matching RPent RequestAwareSlidingWindow."""
+    """History compaction settings mirroring RPent base/dynamic compaction."""
 
     max_messages: int | None = 80
     keep_messages: int = 10
@@ -101,11 +101,18 @@ class CompactionConfig:
     max_fraction: float | None = 0.7
     max_tokens: int | None = None
     preserve_first_user_message: bool = True
+    strategy: Literal["base", "dynamic"] = "base"
+    keep_recent_images: int = 4
+    keep_recent_thinking: int = 4
+    preserve_opening_images: bool = True
 
     @classmethod
     def from_cfg(cls, cfg: Mapping[str, Any] | None) -> CompactionConfig | None:
         if cfg is None:
             return None
+        strategy = str(cfg.get("strategy", "base"))
+        if strategy not in {"base", "dynamic"}:
+            raise ValueError(f"Unsupported compaction strategy: {strategy!r}")
         return cls(
             max_messages=cfg.get("max_messages", 80),
             keep_messages=int(cfg.get("keep_messages", 10)),
@@ -115,6 +122,10 @@ class CompactionConfig:
             preserve_first_user_message=bool(
                 cfg.get("preserve_first_user_message", True)
             ),
+            strategy=strategy,  # type: ignore[arg-type]
+            keep_recent_images=int(cfg.get("keep_recent_images", 4)),
+            keep_recent_thinking=int(cfg.get("keep_recent_thinking", 4)),
+            preserve_opening_images=bool(cfg.get("preserve_opening_images", True)),
         )
 
     @property
@@ -124,6 +135,66 @@ class CompactionConfig:
         if self.max_fraction is not None and self.context_window is not None:
             return int(self.context_window * self.max_fraction)
         return None
+
+
+def _parse_opening_cameras(
+    initial_observation_text: str, count: int, explicit: Sequence[str] = ()
+) -> list[str]:
+    if len(explicit) == count:
+        return [str(c) for c in explicit]
+    try:
+        parsed = json.loads(initial_observation_text)
+        imgs = parsed.get("images")
+        if isinstance(imgs, list) and len(imgs) == count:
+            return [str(item.get("camera", f"cam_{i}")) for i, item in enumerate(imgs)]
+    except Exception:
+        pass
+    return [f"cam_{i}" for i in range(count)]
+
+
+def _strip_message_images(msg: LogicalMessage) -> LogicalMessage:
+    """Return a new LogicalMessage replacing every image_url part with [image omitted]."""
+    if not msg.images:
+        return msg
+    new_wire: list[dict[str, Any]] = []
+    for item in msg.wire:
+        content = item.get("content")
+        if not isinstance(content, list):
+            new_wire.append(dict(item))
+            continue
+        new_parts: list[dict[str, Any]] = []
+        for part in content:
+            if part.get("type") == "image_url":
+                new_parts.append({"type": "text", "text": "[image omitted]"})
+            else:
+                new_parts.append(dict(part))
+        new_wire.append({**item, "content": new_parts})
+    return LogicalMessage(
+        kind=msg.kind,
+        wire=tuple(new_wire),
+        tool_call_ids=msg.tool_call_ids,
+        images=(),
+        image_tokens=0,
+    )
+
+
+def _strip_message_thinking(msg: LogicalMessage) -> LogicalMessage:
+    """Return a new LogicalMessage with assistant reasoning_content removed."""
+    if msg.kind != "assistant" or not any(
+        item.get("reasoning_content") is not None for item in msg.wire
+    ):
+        return msg
+    new_wire = tuple(
+        {k: v for k, v in item.items() if k != "reasoning_content"}
+        for item in msg.wire
+    )
+    return LogicalMessage(
+        kind=msg.kind,
+        wire=new_wire,
+        tool_call_ids=msg.tool_call_ids,
+        images=msg.images,
+        image_tokens=msg.image_tokens,
+    )
 
 
 def find_safe_cutoff(messages: Sequence[LogicalMessage], keep_messages: int) -> int:
@@ -160,6 +231,8 @@ class EpisodeConversation:
     environment: str
     compaction: CompactionConfig | None = None
     max_output_retries: int = 1
+    initial_images: Sequence[bytes] = ()
+    initial_image_cameras: Sequence[str] = ()
     messages: list[LogicalMessage] = field(default_factory=list)
     output_retries: int = 0
 
@@ -170,18 +243,55 @@ class EpisodeConversation:
             if t.get("type") == "function"
         }
         if not self.messages:
-            self.messages = [
-                LogicalMessage(
-                    kind="opening",
-                    wire=(
-                        {"role": "system", "content": self.system_prompt},
-                        {
-                            "role": "user",
-                            "content": f"{self.user_message}\n\n{self.initial_observation_text}",
-                        },
-                    ),
+            opening_text = f"{self.user_message}\n\n{self.initial_observation_text}"
+            if not self.initial_images:
+                self.messages = [
+                    LogicalMessage(
+                        kind="opening",
+                        wire=(
+                            {"role": "system", "content": self.system_prompt},
+                            {"role": "user", "content": opening_text},
+                        ),
+                    )
+                ]
+            else:
+                raw_images = tuple(bytes(img) for img in self.initial_images)
+                fids = [hashlib.sha1(img).hexdigest()[:6] for img in raw_images]
+                cameras = _parse_opening_cameras(
+                    self.initial_observation_text,
+                    len(raw_images),
+                    self.initial_image_cameras,
                 )
-            ]
+                parts: list[dict[str, Any]] = [
+                    {"type": "text", "text": f"{opening_text}\n"}
+                ]
+                img_toks = 0
+                for img, fid, cam in zip(raw_images, fids, cameras, strict=True):
+                    img_toks += _image_tokens(img)
+                    parts.extend(
+                        [
+                            {
+                                "type": "text",
+                                "text": f'<observation step="0" camera="{cam}" file_id="{fid}">',
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"{IMAGE_PLACEHOLDER_PREFIX}{fid}"},
+                            },
+                            {"type": "text", "text": "</observation>"},
+                        ]
+                    )
+                self.messages = [
+                    LogicalMessage(
+                        kind="opening",
+                        wire=(
+                            {"role": "system", "content": self.system_prompt},
+                            {"role": "user", "content": parts},
+                        ),
+                        images=raw_images,
+                        image_tokens=img_toks,
+                    )
+                ]
 
     def wire_messages(self) -> list[dict[str, Any]]:
         """Return lightweight template message dicts (no Base64 payloads)."""
@@ -210,23 +320,7 @@ class EpisodeConversation:
                     chars += len(json.dumps(wire["tool_calls"], ensure_ascii=False))
         return math.ceil(chars / 4) + self.total_image_tokens()
 
-    def maybe_compact(self, current_tokens: int | None = None) -> bool:
-        cfg = self.compaction
-        if cfg is None:
-            return False
-        over_msgs = (
-            cfg.max_messages is not None and len(self.messages) > cfg.max_messages
-        )
-        limit = cfg.token_trigger
-        if not over_msgs and limit is not None:
-            tokens = (
-                self.estimate_tokens() if current_tokens is None else current_tokens
-            )
-            over_toks = tokens > limit
-        else:
-            over_toks = False
-        if not (over_msgs or over_toks):
-            return False
+    def _compact_base(self, cfg: CompactionConfig) -> bool:
         cutoff = find_safe_cutoff(self.messages, cfg.keep_messages)
         if cutoff <= 0:
             return False
@@ -235,8 +329,88 @@ class EpisodeConversation:
             not trimmed or trimmed[0] is not self.messages[0]
         ):
             trimmed = [self.messages[0], *trimmed]
+        if trimmed == self.messages:
+            return False
         self.messages = trimmed
         return True
+
+    def _compact_dynamic(
+        self,
+        cfg: CompactionConfig,
+        *,
+        current_tokens: int | None,
+        over_msgs: bool,
+    ) -> bool:
+        est_before = self.estimate_tokens()
+        start_img_idx = 1 if cfg.preserve_opening_images else 0
+        image_indices = [
+            i for i in range(start_img_idx, len(self.messages)) if self.messages[i].images
+        ]
+        keep_img = max(0, cfg.keep_recent_images)
+        drop_img_set = (
+            set(image_indices[:-keep_img]) if keep_img > 0 else set(image_indices)
+        )
+
+        think_indices = [
+            i
+            for i in range(1, len(self.messages))
+            if self.messages[i].kind == "assistant"
+            and any(w.get("reasoning_content") is not None for w in self.messages[i].wire)
+        ]
+        keep_think = max(0, cfg.keep_recent_thinking)
+        drop_think_set = (
+            set(think_indices[:-keep_think]) if keep_think > 0 else set(think_indices)
+        )
+
+        changed = False
+        updated: list[LogicalMessage] = []
+        for idx, msg in enumerate(self.messages):
+            new_msg = msg
+            if idx in drop_img_set:
+                new_msg = _strip_message_images(new_msg)
+            if idx in drop_think_set:
+                new_msg = _strip_message_thinking(new_msg)
+            if new_msg is not msg:
+                changed = True
+            updated.append(new_msg)
+
+        if changed:
+            self.messages = updated
+
+        limit = cfg.token_trigger
+        est_after = self.estimate_tokens()
+        saved = max(0, est_before - est_after)
+        effective_after = (
+            max(0, current_tokens - saved) if current_tokens is not None else est_after
+        )
+        still_over_tokens = limit is not None and effective_after > limit
+        if not changed or still_over_tokens or over_msgs:
+            fell_back = self._compact_base(cfg)
+            return changed or fell_back
+        return True
+
+    def maybe_compact(self, current_tokens: int | None = None) -> bool:
+        cfg = self.compaction
+        if cfg is None:
+            return False
+        over_msgs = (
+            cfg.max_messages is not None and len(self.messages) > cfg.max_messages
+        )
+        limit = cfg.token_trigger
+        if limit is not None:
+            tokens = (
+                self.estimate_tokens() if current_tokens is None else current_tokens
+            )
+            over_toks = tokens > limit
+        else:
+            over_toks = False
+        if not (over_msgs or over_toks):
+            return False
+        if cfg.strategy == "dynamic":
+            return self._compact_dynamic(
+                cfg, current_tokens=current_tokens, over_msgs=over_msgs
+            )
+        return self._compact_base(cfg)
 
     def append_assistant(
         self,

@@ -45,9 +45,13 @@ This example trains a 4B Vision-Language-Action reasoning model (Qwen3.5-4B) wit
 3. **Deferred simulator rendering**:
    - Training runs with `tools.rpent.record_artifacts: false`, disabling per-physics-step offscreen RGB-D rendering in LIBERO and RoboTwin while preserving `record_artifacts: true` for evaluation video capture.
 4. **End-to-end zero-Base64 image pipeline**:
-   - Binary `/execute` HTTP framing streams raw PNG bytes from RPent to `RPentAgentLoopWorker`.
+   - Binary `/sessions/open` and `/sessions/{sid}/execute` HTTP framing streams raw PNG bytes (including `step=0` opening images and `execute_actions(..., observe=...)` captures) from RPent to `RPentAgentLoopWorker`.
    - `EpisodeConversation` and `AppendOnlyHistory` keep lightweight `rpent-image://<fid>` placeholders and reuse raw `bytes` by reference without deep copies.
    - `stage_local_images()` stages each unique PNG once by content hash to local tmpfs (`/tmp/rlinf-mm-imgs-<pid>/`) so SGLang receives file paths instead of repeated multi-megabyte Base64 JSON payloads.
+5. **Harness v2 joint 5-env support (`train_qwen3.5_4b_rpent_grpo_5env.yaml`)**:
+   - `tools.rpent.image_size: null` applies per-environment defaults (`libero`/`robocasa`/`metaworld`: `512×512`, `robolab`: `768×432`, `robotwin`/`robodojo`: native) while keeping native RGB-D for SAM3 and back-projection.
+   - `tools.rpent.include_jaw_mm: true|false` toggles physical inner-pad gripper clearance (`jaw_mm`) across all 6 simulators.
+   - `agentloop.history_compaction.strategy: dynamic` preserves opening images and full tool/action text while pruning older intermediate images and older `reasoning_content` in a single batch (triggering a clean `AppendOnlyHistory` `chain_id` transition with RadixCache reuse thereafter).
 
 ## Quick Start
 

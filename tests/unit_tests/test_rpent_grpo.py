@@ -1004,3 +1004,300 @@ def test_robolab_episode_uses_native_outcome(mixed_robolab_cfg, outcome) -> None
         ]
 
     asyncio.run(run())
+
+
+def test_harness_v2_rlinf_rpent_parity_and_chain_switch() -> None:
+    """Verify RLinf history.py matches RPent conversation.py on opening images and dynamic compaction."""
+    import io
+
+    from PIL import Image
+
+    from rlinf.agents.rpent.history import (
+        AppendOnlyHistory,
+        CompactionConfig,
+        EpisodeConversation,
+    )
+
+    def _png(rgb: tuple[int, int, int]) -> bytes:
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64), rgb).save(buf, format="PNG")
+        return buf.getvalue()
+
+    class _FakeInnerTok:
+        def convert_tokens_to_ids(self, tok: str) -> int:
+            return 999 if tok == "<|image_pad|>" else 1
+
+        def __call__(self, text: str, add_special_tokens: bool = False):
+            return {
+                "input_ids": [
+                    999 if "<|image_pad|>" in part else (abs(hash(part)) % 100 + 10)
+                    for part in text.split()
+                ]
+            }
+
+    class _FakeAgenticTok:
+        def __init__(self):
+            self.tokenizer = _FakeInnerTok()
+
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=True
+        ):
+            chunks = []
+            for m in messages:
+                if m.get("reasoning_content"):
+                    chunks.append(f"<think>{m['reasoning_content']}</think>")
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    for part in c:
+                        chunks.append(
+                            "<|image_pad|>"
+                            if part.get("type") == "image_url"
+                            else part.get("text", "")
+                        )
+                else:
+                    chunks.append(str(c))
+            return " ".join(chunks)
+
+        def render_incremental(self, delta_msgs):
+            return self.tokenizer(self.apply_chat_template(delta_msgs))["input_ids"]
+
+        def join_increment(self, prefix_ids, increment):
+            return [*prefix_ids, *increment]
+
+    png_open_0 = _png((10, 20, 30))
+    png_open_1 = _png((40, 50, 60))
+    step_imgs = [_png((100 + i * 20, 10, 10)) for i in range(5)]
+
+    cfg = CompactionConfig.from_cfg(
+        {
+            "strategy": "dynamic",
+            "max_messages": None,
+            "max_tokens": 200,
+            "keep_messages": 4,
+            "keep_recent_images": 2,
+            "keep_recent_thinking": 2,
+            "preserve_opening_images": True,
+        }
+    )
+    conv = EpisodeConversation(
+        system_prompt="SYS",
+        user_message="TASK",
+        initial_observation_text='{"step": 0}',
+        tools=[],
+        environment="libero",
+        compaction=cfg,
+        initial_images=[png_open_0, png_open_1],
+        initial_image_cameras=["agentview", "wrist"],
+    )
+    hist = AppendOnlyHistory(_FakeAgenticTok())
+
+    # Turn 0: opening message carries 2 step=0 images with prefix_length=0
+    r0 = hist.render_turn(conv.wire_messages(), conv.tools, conv.images())
+    assert r0.prefix_length == 0
+    assert r0.images == [png_open_0, png_open_1]
+    assert len(r0.image_spans) == 2
+    assert hist.chain_id == 1
+
+    # Simulate accept_capture expanding <|image_pad|> tokens on Turn 0
+    expanded_ids = list(r0.input_ids)
+    captured = {
+        "prompt_token_ids": expanded_ids,
+        "image_spans": r0.image_spans,
+    }
+    assert hist.accept_capture(captured) == expanded_ids
+    hist.image_history = {"length": len(expanded_ids), "images": ["img0", "img1"]}
+
+    # Run 5 turns adding images & thinking without compacting yet
+    last_wire = conv.wire_messages()
+    last_ids = expanded_ids
+    for i, img in enumerate(step_imgs):
+        asst = {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": f"think {i} " + ("z" * 120),
+            "tool_calls": [
+                {
+                    "id": f"c{i}",
+                    "type": "function",
+                    "function": {"name": "execute_actions", "arguments": "{}"},
+                }
+            ],
+        }
+        hist.record(last_wire, conv.tools, last_ids, [50 + i], asst)
+        conv.append_assistant(asst)
+        conv.append_tool_result(
+            tool_name="execute_actions",
+            tool_call_id=f"c{i}",
+            text=f'{{"step": {i + 1}}}',
+            images=[img],
+        )
+        last_wire = conv.wire_messages()
+        rendered = hist.render_turn(last_wire, conv.tools, conv.images())
+        assert hist.chain_id == 1
+        assert len(rendered.image_spans) == len(rendered.images) == 2 + i + 1
+        last_ids = rendered.input_ids
+
+    # Snapshot pre-compaction wire messages stored in AppendOnlyHistory
+    saved_history_msgs = list(hist._messages)  # type: ignore[arg-type]
+    saved_len = len(saved_history_msgs)
+
+    # Trigger dynamic compaction
+    assert conv.maybe_compact(current_tokens=1000) is True
+    # Opening images (2) + last 2 intermediate images = 4 images total
+    assert conv.images() == [png_open_0, png_open_1, step_imgs[-2], step_imgs[-1]]
+    # AppendOnlyHistory's saved prefix must not have been mutated
+    assert len(hist._messages) == saved_len  # type: ignore[arg-type]
+    # Next render_turn must detect prefix break, increment chain_id, and reset image_history
+    assert hist._continues(conv.wire_messages(), conv.tools) is False
+    r_after = hist.render_turn(conv.wire_messages(), conv.tools, conv.images())
+    assert hist.chain_id == 2
+    assert hist.image_history is None
+    assert r_after.prefix_length == 0
+    assert len(r_after.image_spans) == len(r_after.images) == 4
+
+    # Cross-repo parity check against RPent EpisodeConversation if RPent is importable
+    try:
+        from robots.rl.conversation import (
+            CompactionConfig as RPentCompactionConfig,
+            EpisodeConversation as RPentEpisodeConversation,
+        )
+    except ImportError:
+        return
+    rpent_conv = RPentEpisodeConversation(
+        system_prompt="SYS",
+        user_message="TASK",
+        initial_observation_text='{"step": 0}',
+        tools=[],
+        environment="libero",
+        compaction=RPentCompactionConfig(
+            strategy="dynamic",
+            max_messages=None,
+            max_tokens=200,
+            keep_messages=4,
+            keep_recent_images=2,
+            keep_recent_thinking=2,
+            preserve_opening_images=True,
+        ),
+        initial_images=[png_open_0, png_open_1],
+        initial_image_cameras=["agentview", "wrist"],
+    )
+    for i, img in enumerate(step_imgs):
+        rpent_conv.append_assistant(
+            content=None,
+            reasoning_content=f"think {i} " + ("z" * 120),
+            tool_calls=[
+                {
+                    "id": f"c{i}",
+                    "type": "function",
+                    "function": {"name": "execute_actions", "arguments": "{}"},
+                }
+            ],
+        )
+        rpent_conv.append_tool_result(
+            tool_name="execute_actions",
+            tool_call_id=f"c{i}",
+            text=f'{{"step": {i + 1}}}',
+            images=[img],
+        )
+    assert rpent_conv.maybe_compact(current_tokens=1000) is True
+    assert rpent_conv.wire_messages() == conv.wire_messages()
+    assert rpent_conv.images() == conv.images()
+
+
+def test_harness_v2_5env_mixed_simulators_and_binary_open() -> None:
+    """Verify 5-env joint RL quota validation and binary /sessions/open unpacking."""
+    import asyncio
+    import struct
+
+    import httpx
+
+    from rlinf.agents.rpent.agent_loop import (
+        _BINARY_EXECUTE_MEDIA_TYPE,
+        RPentAgentLoopWorker,
+    )
+
+    cfg = OmegaConf.create(
+        {
+            "algorithm": {"group_size": 8},
+            "data": {"rollout_batch_size": 5, "sampling_batch_size": 10},
+            "env": {
+                "rpent": {
+                    env_name: {
+                        "endpoint": f"http://{env_name}.invalid:28560",
+                        "train_data_paths": f"/tmp/{env_name}.jsonl",
+                        "rollout_episodes": 8,
+                        "sampling_episodes": 16,
+                    }
+                    for env_name in (
+                        "libero",
+                        "robotwin",
+                        "robodojo",
+                        "robolab",
+                        "metaworld",
+                    )
+                }
+            },
+            "tools": {
+                "rpent": {
+                    "max_episode_steps": 10000,
+                    "max_actions_per_call": 3,
+                    "image_size": None,
+                    "include_jaw_mm": True,
+                    "record_artifacts": False,
+                }
+            },
+        }
+    )
+    sims = mixed_simulators(cfg)
+    assert set(sims) == {"libero", "robotwin", "robodojo", "robolab", "metaworld"}
+    assert all(s.rollout_groups == 1 and s.sampling_groups == 2 for s in sims.values())
+
+    png_bytes = b"\x89PNG\r\n\x1a\nstep0"
+    seen_payload: dict = {}
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("accept") == _BINARY_EXECUTE_MEDIA_TYPE
+        seen_payload.update(json.loads(request.content))
+        meta = {
+            "session_id": "sid-bin-0",
+            "environment": "metaworld",
+            "system_prompt": "SYS",
+            "user_message": "USR",
+            "initial_observation": "{}",
+            "image_cameras": ["corner2"],
+            "tools": [],
+            "done": False,
+            "success": False,
+            "truncated": False,
+        }
+        meta_b = json.dumps(meta).encode("utf-8")
+        body = (
+            struct.pack("!I", len(meta_b))
+            + meta_b
+            + struct.pack("!I", 1)
+            + struct.pack("!I", len(png_bytes))
+            + png_bytes
+        )
+        return httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": _BINARY_EXECUTE_MEDIA_TYPE},
+        )
+
+    async def _run() -> None:
+        worker = object.__new__(RPentAgentLoopWorker)
+        worker.cfg = cfg
+        worker._thinking_enabled = True
+        worker._generation_cohort_id = "coh-1"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(serve)) as client:
+            opened, imgs = await worker._open_session(
+                client,
+                "http://metaworld.invalid:28560",
+                {"environment": "metaworld", "task_name": "reach-v3", "seed": 0},
+            )
+            assert opened["session_id"] == "sid-bin-0"
+            assert imgs == [png_bytes]
+            assert seen_payload["image_size"] is None
+            assert seen_payload["include_jaw_mm"] is True
+
+    asyncio.run(_run())

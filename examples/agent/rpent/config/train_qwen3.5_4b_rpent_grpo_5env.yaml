@@ -1,0 +1,72 @@
+defaults:
+  - train_qwen3.5_4b_rpent_grpo
+  - _self_
+
+runner:
+  experiment_name: rpent-qwen3.5-4b-grpo-5env-v2
+  max_steps: 100
+
+algorithm:
+  group_size: 8
+
+data:
+  rollout_batch_size: 5
+  sampling_batch_size: 10
+
+env:
+  rpent: ${five_env_pools}
+
+five_env_pools:
+  libero:
+    endpoint: ${oc.env:LIBERO_POOL_URL,http://127.0.0.1:28561}
+    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/libero/train.jsonl
+    rollout_episodes: 8
+    sampling_episodes: 16
+  robotwin:
+    endpoint: ${oc.env:ROBOTWIN_POOL_URL,http://127.0.0.1:28562}
+    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robotwin/train.jsonl
+    rollout_episodes: 8
+    sampling_episodes: 16
+  robodojo:
+    endpoint: ${oc.env:ROBODOJO_POOL_URL,http://127.0.0.1:28563}
+    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robodojo/train.jsonl
+    rollout_episodes: 8
+    sampling_episodes: 16
+  robolab:
+    endpoint: ${oc.env:ROBOLAB_POOL_URL,http://127.0.0.1:28564}
+    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robolab/train.jsonl
+    rollout_episodes: 8
+    sampling_episodes: 16
+  metaworld:
+    endpoint: ${oc.env:METAWORLD_POOL_URL,http://127.0.0.1:28565}
+    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/metaworld/ml45-train.jsonl
+    rollout_episodes: 8
+    sampling_episodes: 16
+
+agentloop:
+  max_turns: 50
+  history_compaction:
+    strategy: dynamic
+    max_messages: null
+    keep_messages: 10
+    keep_recent_images: 4
+    keep_recent_thinking: 4
+    preserve_opening_images: true
+    context_window: 262144
+    max_tokens: 48000
+    max_fraction: 0.2
+    preserve_first_user_message: true
+
+tools:
+  rpent:
+    max_actions_per_call: 3
+    image_size: null  # libero/metaworld=512x512, robolab=768x432, robotwin=320x240, robodojo=640x480
+    include_jaw_mm: true
+    sleep_sim_pools_during_training: true
+
+rollout:
+  enforce_eager: true
+  sglang:
+    enable_memory_saver: true
+  env_vars:
+    SGLANG_MM_BUFFER_SIZE_MB: "0"

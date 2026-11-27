@@ -42,7 +42,8 @@ agentloop:
 
 tools:
   rpent:
-    image_size: 512
+    image_size: null  # robolab defaults to 768x432, robotwin keeps native 320x240
+    include_jaw_mm: false
     sleep_sim_pools_during_training: true
 
 rollout:

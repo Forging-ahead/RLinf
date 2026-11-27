@@ -109,9 +109,14 @@ agentloop:
   episode_timeout_s: 7200
   merge_prefix_turns: true
   history_compaction:
-    max_messages: 80
+    strategy: dynamic
+    max_messages: null
     keep_messages: 10
+    keep_recent_images: 4
+    keep_recent_thinking: 4
+    preserve_opening_images: true
     context_window: 262144
+    max_tokens: 48000
     max_fraction: 0.25
     preserve_first_user_message: true
     receipts: false
@@ -136,7 +141,8 @@ tools:
     sleep_sim_pools_during_training: false
     remote_toolkit_endpoint: http://${oc.env:RPENT_SIM_HOST,127.0.0.1}:28551
     max_actions_per_call: 3
-    image_size: 1024
+    image_size: null
+    include_jaw_mm: false
     tool_timeout_s: 1800
 
 rollout:
