@@ -564,9 +564,15 @@ class AsyncAgentRunner(AgentRunner):
                     "dropped_groups"
                 ]
                 for key, value in buffer_metrics.items():
-                    # Per-reason drop counts arrive as dropped_{reason};
-                    # the aggregate above already covered dropped_groups.
-                    if key.startswith("dropped_") and key != "dropped_groups":
+                    # Per-reason drop counts arrive as dropped_{reason}, and
+                    # multi-task buffer metrics arrive as batch_task_count/<env>,
+                    # size/<env>, and inflight/<env>.
+                    if (
+                        key.startswith(
+                            ("dropped_", "batch_task_count/", "size/", "inflight/")
+                        )
+                        and key != "dropped_groups"
+                    ):
                         rollout_metrics[f"rollout/buffer/{key}"] = value
                 rollout_metrics["rollout/buffer/repeatedly_dropped_prompts"] = (
                     buffer_metrics["repeatedly_dropped_prompts"]

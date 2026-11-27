@@ -194,11 +194,17 @@ def initialize_megatron(cfg: DictConfig):
     # # Random seeds for reproducibility.
     _set_random_seed(cfg.seed, cfg.megatron.data_parallel_random_init)
 
+    dp_size = mpu.get_data_parallel_world_size()
+    init_gbs = cfg.global_batch_size
+    denom = cfg.micro_batch_size * dp_size
+    if cfg.get("enable_dp_load_balance", False) and init_gbs % denom != 0:
+        init_gbs = ((init_gbs + denom - 1) // denom) * denom
+
     init_num_microbatches_calculator(
         rank=torch.distributed.get_rank(),
-        global_batch_size=cfg.global_batch_size,
+        global_batch_size=init_gbs,
         micro_batch_size=cfg.micro_batch_size,
-        data_parallel_size=mpu.get_data_parallel_world_size(),
+        data_parallel_size=dp_size,
         rampup_batch_size=None,
     )
 

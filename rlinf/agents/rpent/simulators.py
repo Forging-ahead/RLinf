@@ -54,13 +54,22 @@ def simulator_for_answer(answer: str | list[str]) -> str:
 
 
 def mixed_simulators(cfg: DictConfig) -> dict[str, SimulatorSpec]:
-    """Parse ``env.rpent`` simulator pools and validate rollout/sampling group quotas."""
+    """Parse ``env.rpent`` simulator pools and validate rollout/sampling group quotas.
+
+    In synchronous mode, ``rollout_episodes`` sums to ``rollout_batch_size * group_size``
+    and ``sampling_episodes`` sums to ``sampling_batch_size * group_size``.
+    In asynchronous mode (``runner.async_mode=true``), ``rollout_episodes`` specifies the
+    per-environment minimum floor per training batch (``sum <= rollout_batch_size * group_size``,
+    leaving remaining batch slots to first-come-first-served completion across all environments)
+    and ``sampling_episodes`` specifies the per-environment max in-flight episode capacity.
+    """
     settings = (cfg.get("env") or {}).get("rpent")
     if not settings:
         return {}
     group_size = int(cfg.algorithm.group_size)
     rollout_total = int(cfg.data.rollout_batch_size)
     sampling_total = int(cfg.data.get("sampling_batch_size", rollout_total))
+    async_mode = bool((cfg.get("runner") or {}).get("async_mode", False))
 
     quotas: dict[str, list[int]] = {}
     for field_name, total_groups in (
@@ -79,7 +88,19 @@ def mixed_simulators(cfg: DictConfig) -> dict[str, SimulatorSpec]:
             raise ValueError(
                 f"Each env.rpent.{field_name} must be a positive multiple of group_size={group_size}"
             )
-        if sum(values) != total_groups * group_size:
+        if async_mode and field_name == "rollout_episodes":
+            if sum(values) > total_groups * group_size:
+                raise ValueError(
+                    f"env.rpent.{field_name} floor total {sum(values)} exceeds "
+                    f"rollout_batch_size * group_size = {total_groups * group_size}"
+                )
+        elif async_mode and field_name == "sampling_episodes":
+            if sum(values) < rollout_total * group_size:
+                raise ValueError(
+                    f"env.rpent.{field_name} total {sum(values)} must be at least "
+                    f"{rollout_total * group_size} episodes in async mode"
+                )
+        elif sum(values) != total_groups * group_size:
             raise ValueError(
                 f"env.rpent.{field_name} must total {total_groups * group_size} episodes"
             )

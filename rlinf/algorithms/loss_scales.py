@@ -197,11 +197,17 @@ def restore_source_dp_normalization(
     """Retain source-DP loss weights after group redistribution and folding."""
     if "group_level" not in context["folding_scale"] or "extra:source_dp" not in batch:
         return
+    world_size = torch.distributed.get_world_size(dp_group)
     sources = batch["extra:source_dp"].long()
-    counts = torch.bincount(
-        sources, minlength=torch.distributed.get_world_size(dp_group)
-    ).to(device)
+    counts = torch.bincount(sources, minlength=world_size).to(device)
     torch.distributed.all_reduce(counts, group=dp_group)
+    if context.get("uneven_dp_groups", False):
+        # When rollout_batch_size is not divisible by dp_world_size, source DP
+        # ranks pull ceil(G/DP) vs floor(G/DP) groups; normalize uniformly by
+        # the global sequence count so all groups carry identical weight.
+        ratio = counts.sum().float().item() / (world_size * len(sources))
+        batch["advantages"] = [row * ratio for row in batch["advantages"]]
+        return
     ratios = counts.cpu()[sources].float() / len(sources)
     batch["advantages"] = [
         row * ratio for row, ratio in zip(batch["advantages"], ratios)

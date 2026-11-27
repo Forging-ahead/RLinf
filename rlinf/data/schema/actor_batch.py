@@ -53,11 +53,14 @@ def pad_actor_batch_rows(
     divisor: int,
     dp_group: torch.distributed.ProcessGroup,
     device: torch.device | str,
+    min_row_len: int = 1,
 ) -> DynamicActorBatch:
     """Align DP row counts to a multiple of the minibatch/microbatch schedule.
 
     Every column shares the divisible row count before splitting. Added rows
-    have one attention token and no loss tokens. Input columns are not changed.
+    have ``min_row_len`` attention tokens (at least ``tp * cp * 2`` when
+    context parallelism is active so packed-sequence CP slicing never sees an
+    empty shard) and no loss tokens. Input columns are not changed.
     """
     batch = {
         key: value.copy() if isinstance(value, list) else value
@@ -69,6 +72,7 @@ def pad_actor_batch_rows(
     )
     target = (count.item() + divisor - 1) // divisor * divisor
     missing = target - len(batch["input_ids"])
+    row_len = max(1, int(min_row_len))
     for key, value in batch.items():
         if key == "idx_to_traj":
             value.extend([0] * missing)
@@ -76,7 +80,7 @@ def pad_actor_batch_rows(
             value.extend([None] * missing)
         elif isinstance(value, list):
             for _ in range(missing):
-                row = value[0].new_zeros((1, *value[0].shape[1:]))
+                row = value[0].new_zeros((row_len, *value[0].shape[1:]))
                 if key == "attention_mask":
                     row.fill_(True)
                 value.append(row)

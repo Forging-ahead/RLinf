@@ -82,9 +82,30 @@ def balance_rollout_groups(
     local_costs = [sum(map(len, result.input_ids)) for result in results]
     costs = [None] * world_size
     torch.distributed.all_gather_object(costs, local_costs, group=dp_group)
-    partitions = get_seqlen_balanced_partitions(
-        sum(costs, []), k_partitions=world_size, equal_size=True
-    )
+    all_costs = sum(costs, [])
+    if len(all_costs) % world_size == 0:
+        partitions = get_seqlen_balanced_partitions(
+            all_costs, k_partitions=world_size, equal_size=True
+        )
+    else:
+        # Greedy LPT with guaranteed non-empty partitions when group count is not
+        # divisible by DP world size (e.g. 16 groups across 6 DP ranks).
+        if len(all_costs) < world_size:
+            raise ValueError(
+                f"Cannot balance {len(all_costs)} groups across {world_size} DP ranks"
+            )
+        order = sorted(range(len(all_costs)), key=lambda i: (-all_costs[i], i))
+        partitions = [[] for _ in range(world_size)]
+        loads = [0] * world_size
+        # Seed every partition with one of the heaviest groups so none is empty.
+        for rank_idx, item_idx in enumerate(order[:world_size]):
+            partitions[rank_idx].append(item_idx)
+            loads[rank_idx] += all_costs[item_idx]
+        for item_idx in order[world_size:]:
+            target = min(range(world_size), key=lambda r: (loads[r], len(partitions[r]), r))
+            partitions[target].append(item_idx)
+            loads[target] += all_costs[item_idx]
+        partitions = [sorted(part) for part in partitions]
     start_idx = sum(len(rank_costs) for rank_costs in costs[:rank])
     destination = {
         idx: target for target, part in enumerate(partitions) for idx in part

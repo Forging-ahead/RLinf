@@ -20,7 +20,7 @@ from typing import Any, Optional
 import torch
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
-from torch.utils.data import Dataset, RandomSampler, SequentialSampler
+from torch.utils.data import ConcatDataset, Dataset, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.data.schema.reasoning_requests import build_rollout_requests_from_batch
@@ -64,9 +64,15 @@ class RolloutBuffer:
         self.rollout_batch_size = cfg.data.rollout_batch_size
         self.max_inflight_groups = cfg.rollout_buffer.max_inflight_groups
         self.max_buffered_groups = cfg.rollout_buffer.max_buffered_groups
+        self.min_groups_per_task: dict[str, int] = {}
+        self.max_inflight_per_task: dict[str, int] = {}
+        self.task_names_order: list[str] = []
+        self._init_task_quotas(cfg)
         # Per-task state, keyed by task name; a task's dict is created at
-        # its first issued group.
+        # its first issued group (or pre-initialized for required quota tasks).
         self.tasks: dict[str, dict[str, Any]] = {}
+        for task_name in self.task_names_order:
+            self._task(task_name)
         # Task name of every issued but not-yet-released group, so a
         # result, discard, or release finds the owning task without
         # trusting the producer's task stamp.
@@ -88,6 +94,7 @@ class RolloutBuffer:
         self._ongoing_wait_reason: Optional[str] = None
         self._step_batch_issue_versions = 0
         self._step_batch_oldest_issue_version_ratio = 0.0
+        self._step_batch_task_counts: dict[str, int] = {}
         self._metrics_window_start = time.monotonic()
         self._admission_event = asyncio.Event()
         self._admission_event.set()
@@ -102,7 +109,54 @@ class RolloutBuffer:
         # Version of the release request waiting for a full batch.
         self.pending_release_version: Optional[int] = None
         self.next_group_id = 0
+        self._arrival_seq = 0
+        self._rr_cursor = 0
+        self.task_dataloaders: dict[str, StatefulDataLoader] = {}
         self._build_dataloader(cfg, train_dataset)
+
+    def _init_task_quotas(self, cfg: DictConfig) -> None:
+        raw_min = cfg.rollout_buffer.get("min_groups_per_task", None)
+        raw_max_inf = cfg.rollout_buffer.get("max_inflight_per_task", None)
+        if raw_min is not None:
+            raw_min = OmegaConf.to_container(raw_min, resolve=True)
+            self.min_groups_per_task = {str(k): int(v) for k, v in raw_min.items()}
+        if raw_max_inf is not None:
+            raw_max_inf = OmegaConf.to_container(raw_max_inf, resolve=True)
+            self.max_inflight_per_task = {str(k): int(v) for k, v in raw_max_inf.items()}
+
+        rpent_envs = OmegaConf.select(cfg, "env.rpent", default=None)
+        if rpent_envs:
+            from rlinf.agents.rpent.simulators import mixed_simulators
+
+            sims = mixed_simulators(cfg)
+            self.task_names_order = list(sims.keys())
+            if not self.min_groups_per_task:
+                self.min_groups_per_task = {
+                    name: spec.rollout_groups for name, spec in sims.items()
+                }
+            if not self.max_inflight_per_task:
+                self.max_inflight_per_task = {
+                    name: spec.sampling_groups for name, spec in sims.items()
+                }
+        elif self.min_groups_per_task or self.max_inflight_per_task:
+            seen: list[str] = []
+            for k in (*self.min_groups_per_task.keys(), *self.max_inflight_per_task.keys()):
+                if k not in seen:
+                    seen.append(k)
+            self.task_names_order = seen
+
+        if any(v < 0 for v in self.min_groups_per_task.values()):
+            raise ValueError("rollout_buffer.min_groups_per_task values must be >= 0")
+        if sum(self.min_groups_per_task.values()) > self.rollout_batch_size:
+            raise ValueError(
+                f"sum(min_groups_per_task)={sum(self.min_groups_per_task.values())} "
+                f"exceeds rollout_batch_size={self.rollout_batch_size}"
+            )
+        if sum(self.min_groups_per_task.values()) > self.max_buffered_groups:
+            raise ValueError(
+                f"sum(min_groups_per_task)={sum(self.min_groups_per_task.values())} "
+                f"exceeds max_buffered_groups={self.max_buffered_groups}"
+            )
 
     def _task(self, task_name: Optional[str]) -> dict[str, Any]:
         """The per-task state dict, created at the task's first issued
@@ -126,6 +180,8 @@ class RolloutBuffer:
                 # None with the session server, where the payload sits
                 # in its channel behind the metadata's payload ref.
                 "buffer": {},
+                # Monotonic completion arrival order for FCFS surplus fill.
+                "arrival_order": {},
                 # Loaded version at issue time of every not-yet-released
                 # group.
                 "issue_versions": {},
@@ -143,13 +199,42 @@ class RolloutBuffer:
         )
 
     def _build_dataloader(self, cfg: DictConfig, train_dataset: Dataset):
-        """Create the dataloader behind the buffer.
+        """Create the dataloader(s) behind the buffer.
 
-        Mirrors `ReasoningRunner._build_dataloader` (same sampler, seed,
-        batch size and collate) so the checkpoint states stay
-        interchangeable with the synchronous runner's.
+        When multi-task quotas are paired with a ``ConcatDataset`` whose
+        sub-datasets align with ``task_names_order``, builds one independent
+        per-task dataloader so admission can guarantee every task's minimum
+        floor without deadlocking behind faster tasks.
         """
         from rlinf.data.datasets.reasoning import collate_fn
+
+        if (
+            self.task_names_order
+            and isinstance(train_dataset, ConcatDataset)
+            and len(train_dataset.datasets) == len(self.task_names_order)
+        ):
+            base_seed = int(cfg.data.get("seed", 1))
+            for idx, (task_name, sub_ds) in enumerate(
+                zip(self.task_names_order, train_dataset.datasets, strict=True)
+            ):
+                if cfg.data.shuffle:
+                    generator = torch.Generator()
+                    generator.manual_seed(base_seed + idx)
+                    sampler = RandomSampler(data_source=sub_ds, generator=generator)
+                else:
+                    sampler = SequentialSampler(data_source=sub_ds)
+                dl = StatefulDataLoader(
+                    dataset=sub_ds,
+                    batch_size=1,
+                    num_workers=cfg.data.num_workers,
+                    drop_last=False,
+                    collate_fn=collate_fn,
+                    sampler=sampler,
+                )
+                assert len(dl) >= 1, f"Train dataloader for task {task_name!r} is empty!"
+                self.task_dataloaders[task_name] = dl
+            self.dataloader = None
+            return
 
         if cfg.data.shuffle:
             generator = torch.Generator()
@@ -264,6 +349,101 @@ class RolloutBuffer:
             task["issue_versions"][group_id] = issue_version
         return group_id, issue_version
 
+    def _task_inflight(self, task_name: str) -> int:
+        task = self._task(task_name)
+        return task["num_issued_groups"] - task["num_finished_groups"]
+
+    def _task_buffered(self, task_name: str) -> int:
+        return len(self._task(task_name)["buffer"])
+
+    def select_next_task(self) -> tuple[Optional[str], Optional[str]]:
+        """Choose the next eligible task for multi-task admission, or block reason.
+
+        Guarantees deadlock-free floor satisfaction:
+        1. Respects global ``max_inflight_groups`` and ``max_buffered_groups``.
+        2. Respects per-task ``max_inflight_per_task`` caps when configured.
+        3. Reserves buffer capacity for tasks still below ``min_groups_per_task``
+           so faster tasks cannot fill the buffer and starve slower tasks.
+        4. Prioritizes tasks with remaining floor deficit; once all floors are
+           covered in-flight or buffered, balances remaining capacity across all
+           tasks so whichever finishes first fills the FCFS batch slots.
+        """
+        global_block = self._admission_block_reason()
+        if global_block is not None:
+            return None, global_block
+
+        free_buf = self.max_buffered_groups - (
+            self.inflight_groups() + self._buffered_groups()
+        )
+        ordered = self.task_names_order
+        n = len(ordered)
+        rotated = [ordered[(self._rr_cursor + i) % n] for i in range(n)]
+
+        floor_candidates: list[tuple[int, int, int, str]] = []
+        surplus_candidates: list[tuple[int, float, int, str]] = []
+        blocked_by_buffer = False
+
+        for rr_idx, task_name in enumerate(rotated):
+            inf = self._task_inflight(task_name)
+            buf = self._task_buffered(task_name)
+            cap = self.max_inflight_per_task.get(task_name)
+            if cap is not None and inf >= cap:
+                continue
+
+            req = self.min_groups_per_task.get(task_name, 0)
+            total_t = inf + buf
+            if total_t < req:
+                deficit = req - total_t
+                floor_candidates.append((-deficit, total_t, rr_idx, task_name))
+                continue
+
+            # Reserve enough buffer slots for every other task to meet its floor.
+            reserved_others = sum(
+                max(
+                    0,
+                    other_req
+                    - (self._task_buffered(other) + self._task_inflight(other)),
+                )
+                for other, other_req in self.min_groups_per_task.items()
+                if other != task_name
+            )
+            if free_buf <= reserved_others:
+                blocked_by_buffer = True
+                continue
+
+            load_ratio = inf / max(cap, 1) if cap is not None else float(inf)
+            surplus_candidates.append((total_t, load_ratio, rr_idx, task_name))
+
+        if floor_candidates:
+            floor_candidates.sort()
+            chosen = floor_candidates[0][-1]
+            self._rr_cursor = (ordered.index(chosen) + 1) % n
+            return chosen, None
+        if surplus_candidates:
+            surplus_candidates.sort()
+            chosen = surplus_candidates[0][-1]
+            self._rr_cursor = (ordered.index(chosen) + 1) % n
+            return chosen, None
+        return None, ("buffer_full" if blocked_by_buffer else "inflight_limit")
+
+    async def wait_for_next_admissible_task(self) -> str:
+        """Suspend until a task is eligible for multi-task admission."""
+        while True:
+            task_name, reason = self.select_next_task()
+            if task_name is not None:
+                return task_name
+            self._admission_event.clear()
+            wait_start = time.monotonic()
+            self._ongoing_wait_start = wait_start
+            self._ongoing_wait_reason = reason
+            await self._admission_event.wait()
+            now = time.monotonic()
+            self._ongoing_wait_start = None
+            self._ongoing_wait_reason = None
+            self._step_admission_wait[reason] += now - max(
+                wait_start, self._metrics_window_start
+            )
+
     def record_result(self, result: Any, metadata: GroupMetadata) -> int:
         """Buffer one finished group and return its group id.
 
@@ -288,7 +468,9 @@ class RolloutBuffer:
                 "already returned. This is a producer bug."
             ) from None
         task = self._task(task_name)
+        self._arrival_seq += 1
         task["buffer"][group_id] = (metadata, result)
+        task["arrival_order"][group_id] = self._arrival_seq
         task["num_finished_groups"] += 1
         self._admission_event.set()
         return group_id
@@ -324,6 +506,7 @@ class RolloutBuffer:
         task = self._task(task_name)
         if already_buffered:
             task["buffer"].pop(group_id, None)
+            task["arrival_order"].pop(group_id, None)
         else:
             task["num_finished_groups"] += 1
         num_dropped = task["num_dropped_groups"]
@@ -355,7 +538,12 @@ class RolloutBuffer:
             )
 
     def can_release(self) -> bool:
-        return self._buffered_groups() >= self.rollout_batch_size
+        if self._buffered_groups() < self.rollout_batch_size:
+            return False
+        for task_name, min_count in self.min_groups_per_task.items():
+            if len(self._task(task_name)["buffer"]) < min_count:
+                return False
+        return True
 
     def stale_group_ids(
         self, task: dict[str, Any], version: int, max_staleness: int
@@ -376,23 +564,63 @@ class RolloutBuffer:
         return stale
 
     def release_groups(self) -> list[tuple[GroupMetadata, Any]]:
-        """Take the oldest `rollout_batch_size` groups out of the buffer.
+        """Take `rollout_batch_size` groups out of the buffer.
+
+        When ``min_groups_per_task`` is configured, first takes the earliest
+        ``min_count`` completed groups per required task (guaranteed per-env
+        floor), then fills the remaining batch slots first-come-first-served
+        by completion arrival order across all tasks. Otherwise takes the
+        oldest ``rollout_batch_size`` groups by group_id.
 
         Also clears the drops-since-release window of every task: the
         caller counts drops between consecutive releases.
         """
-        buffered = sorted(
-            (group_id, task_name)
-            for task_name, task in self.tasks.items()
-            for group_id in task["buffer"]
-        )[: self.rollout_batch_size]
+        if self.min_groups_per_task:
+            buffered: list[tuple[int, str]] = []
+            picked_ids: set[int] = set()
+            for task_name, min_count in self.min_groups_per_task.items():
+                if min_count <= 0:
+                    continue
+                task = self._task(task_name)
+                ordered_gids = sorted(
+                    task["buffer"],
+                    key=lambda gid: (task["arrival_order"].get(gid, gid), gid),
+                )
+                for gid in ordered_gids[:min_count]:
+                    buffered.append((gid, task_name))
+                    picked_ids.add(gid)
+            remaining = self.rollout_batch_size - len(buffered)
+            if remaining > 0:
+                surplus = sorted(
+                    (
+                        task["arrival_order"].get(gid, gid),
+                        gid,
+                        task_name,
+                    )
+                    for task_name, task in self.tasks.items()
+                    for gid in task["buffer"]
+                    if gid not in picked_ids
+                )[:remaining]
+                for _, gid, task_name in surplus:
+                    buffered.append((gid, task_name))
+        else:
+            buffered = sorted(
+                (group_id, task_name)
+                for task_name, task in self.tasks.items()
+                for group_id in task["buffer"]
+            )[: self.rollout_batch_size]
         entries = []
         issue_versions = []
+        task_counts: dict[str, int] = {}
         for group_id, task_name in buffered:
             task = self.tasks[task_name]
             entries.append(task["buffer"].pop(group_id))
+            task["arrival_order"].pop(group_id, None)
             task["group_sample_indices"].pop(group_id, None)
             issue_versions.append(task["issue_versions"].pop(group_id, None))
+            if task_name is not None:
+                task_counts[task_name] = task_counts.get(task_name, 0) + 1
+        self._step_batch_task_counts = task_counts
         known = [version for version in issue_versions if version is not None]
         if known:
             self._step_batch_issue_versions = len(set(known))
@@ -444,9 +672,17 @@ class RolloutBuffer:
         }
         for reason, count in self._step_dropped_by_reason.items():
             metrics[f"dropped_{reason}"] = count
+        if self.task_names_order:
+            for task_name in self.task_names_order:
+                metrics[f"batch_task_count/{task_name}"] = self._step_batch_task_counts.get(
+                    task_name, 0
+                )
+                metrics[f"size/{task_name}"] = self._task_buffered(task_name)
+                metrics[f"inflight/{task_name}"] = self._task_inflight(task_name)
         self._step_issued_groups = 0
         self._step_dropped_groups = 0
         self._step_dropped_by_reason = {}
+        self._step_batch_task_counts = {}
         self._step_admission_wait = {
             "buffer_full": 0.0,
             "inflight_limit": 0.0,
@@ -491,6 +727,7 @@ class RolloutBufferWorker(Worker):
         self.task_name = OmegaConf.select(cfg, "agentloop.task_name", default=None)
         self._resident_task: Optional[asyncio.Task] = None
         self._data_iter = None
+        self._task_data_iters: dict[str, Any] = {}
         self._rollout_channel: Optional[Channel] = None
         # Payload channels behind the metadata this worker buffers, set by
         # run_continuously; payloads are released through these.
@@ -574,7 +811,40 @@ class RolloutBufferWorker(Worker):
             if self._pending_fetch is future:
                 self._pending_fetch = None
 
+    async def _next_task_batch(self, task_name: str) -> Any:
+        """Pull one prompt from ``task_name``'s dataloader without blocking the loop."""
+        dl = self.buffer.task_dataloaders[task_name]
+        if task_name not in self._task_data_iters:
+            self._task_data_iters[task_name] = iter(dl)
+
+        def _next():
+            return next(self._task_data_iters[task_name], None)
+
+        batch = await self._run_fetch(_next)
+        if batch is None:
+            self._task_data_iters[task_name] = iter(dl)
+            batch = await self._run_fetch(_next)
+        return batch
+
     async def _run_admission(self, dataloader_channel: Channel):
+        if self.buffer.task_dataloaders:
+            while True:
+                task_name = await self.buffer.wait_for_next_admissible_task()
+                batch = await self._next_task_batch(task_name)
+                sample_indices = batch["idx"].tolist()
+                self.buffer.num_samples_fetched += len(sample_indices)
+                requests = build_rollout_requests_from_batch(
+                    batch,
+                    group_size=self.cfg.algorithm.group_size,
+                    split_size=len(batch["prompt"]),
+                )
+                for request, sample_idx in zip(requests, sample_indices):
+                    group_id, _ = self.buffer.issue_group(sample_idx, task_name)
+                    request.group_ids = [group_id]
+                    request.task_names = [task_name]
+                    await dataloader_channel.put(request, async_op=True).async_wait()
+            return
+
         while True:
             batch = await self._next_batch()
             sample_indices = batch["idx"].tolist()
@@ -752,7 +1022,15 @@ class RolloutBufferWorker(Worker):
         """Write the dataloader state to `path/data.pt` atomically."""
         if self._pending_fetch is not None:
             await self._pending_fetch
-        state_dict = self.buffer.dataloader.state_dict()
+        if self.buffer.task_dataloaders:
+            state_dict = {
+                "multi_task_dataloaders": {
+                    name: dl.state_dict()
+                    for name, dl in self.buffer.task_dataloaders.items()
+                }
+            }
+        else:
+            state_dict = self.buffer.dataloader.state_dict()
         dropped = sum(
             sum(task["num_dropped_groups"].values())
             for task in self.buffer.tasks.values()
@@ -801,7 +1079,19 @@ class RolloutBufferWorker(Worker):
             )
             return
         state_dict = torch.load(local_path, weights_only=False)
-        self.buffer.dataloader.load_state_dict(state_dict)
+        if self.buffer.task_dataloaders:
+            multi = state_dict.get("multi_task_dataloaders")
+            if isinstance(multi, dict):
+                for name, dl in self.buffer.task_dataloaders.items():
+                    if name in multi:
+                        dl.load_state_dict(multi[name])
+            else:
+                self.log_warning(
+                    f"Checkpoint {local_path} lacks multi_task_dataloaders state; "
+                    "per-task dataloaders start from the beginning."
+                )
+        else:
+            self.buffer.dataloader.load_state_dict(state_dict)
 
     async def stop(self):
         """Cancel the resident coroutines; in-flight prompts are dropped."""

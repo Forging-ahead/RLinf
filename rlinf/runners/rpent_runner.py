@@ -678,10 +678,18 @@ class RPentAsyncGRPORunner(AsyncAgentRunner):
     def _validate_sim_pool_capacity(self) -> None:
         rpent = (self.cfg.get("tools") or {}).get("rpent") or {}
         ep_limit = rpent.get("episodes_per_worker")
+        max_inflight = int(self.cfg.rollout_buffer.max_inflight_groups)
+        if self.simulators:
+            # In async mode each simulator's sampling_groups reflects its own
+            # max_inflight_per_task capacity (validated per-pool inside
+            # validate_sim_pool_capacity).
+            sampling_groups = sum(spec.sampling_groups for spec in self.simulators.values())
+        else:
+            sampling_groups = max_inflight
         validate_sim_pool_capacity(
             simulators=self.simulators,
             default_endpoint=rpent.get("remote_toolkit_endpoint"),
-            sampling_groups=int(self.cfg.rollout_buffer.max_inflight_groups),
+            sampling_groups=sampling_groups,
             group_size=int(self.cfg.algorithm.group_size),
             num_agent_workers=len(
                 self.component_placement.get_hardware_ranks("agentloop")

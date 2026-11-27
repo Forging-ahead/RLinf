@@ -1563,3 +1563,176 @@ def test_real_length_groups_keep_versions_through_buffer_release():
         assert actual.task_name == "searchr1"
         assert actual.group_metadata().earliest_version == actual.version_start[0]
         assert list(map(len, actual.to_actor_batch()["advantages"])) == [3, 6]
+
+
+class TestMultiTaskMinQuotaAndFCFS:
+    """5-env async GRPO: guaranteed per-env floor (e.g. 2x5=10) + FCFS fill (6) = 16."""
+
+    def _five_env_cfg(
+        self,
+        rollout_batch_size: int = 16,
+        max_inflight_groups: int = 24,
+        max_buffered_groups: int = 32,
+        min_per_env: int = 2,
+        max_inflight_per_env: int | None = 6,
+    ):
+        envs = ("libero", "robotwin", "robodojo", "robolab", "metaworld")
+        cfg = _cfg(
+            rollout_batch_size=rollout_batch_size,
+            max_inflight_groups=max_inflight_groups,
+            max_buffered_groups=max_buffered_groups,
+        )
+        with open_dict(cfg):
+            cfg.rollout_buffer.min_groups_per_task = {e: min_per_env for e in envs}
+            if max_inflight_per_env is not None:
+                cfg.rollout_buffer.max_inflight_per_task = {
+                    e: max_inflight_per_env for e in envs
+                }
+        return cfg, envs
+
+    def test_can_release_waits_for_every_env_floor_and_fills_fcfs(self):
+        from torch.utils.data import ConcatDataset
+
+        cfg, envs = self._five_env_cfg(
+            rollout_batch_size=16, max_inflight_groups=40, max_buffered_groups=40
+        )
+        ds = ConcatDataset([_ToyDataset(32) for _ in envs])
+        buf = RolloutBuffer(cfg, ds)
+
+        # Issue 6 groups per env (30 total)
+        issued: dict[str, list[int]] = {e: [] for e in envs}
+        for e in envs:
+            for s in range(6):
+                gid, _ = buf.issue_group(s, e)
+                issued[e].append(gid)
+
+        # Fast envs (metaworld, libero, robotwin) finish 6+5+5 = 16 groups first.
+        # Even though total buffered == 16, robolab & robodojo have 0 < 2 -> MUST NOT release!
+        arrival_log: list[tuple[str, int]] = []
+        for e, n in (("metaworld", 6), ("libero", 5), ("robotwin", 5)):
+            for gid in issued[e][:n]:
+                buf.record_result(None, _ref_result(gid, earliest_version=0))
+                arrival_log.append((e, gid))
+        assert buf._buffered_groups() == 16
+        assert not buf.can_release()
+
+        # Robodojo finishes 2, robolab finishes 1 -> still cannot release (robolab < 2)
+        for gid in issued["robodojo"][:2]:
+            buf.record_result(None, _ref_result(gid, earliest_version=0))
+        buf.record_result(None, _ref_result(issued["robolab"][0], earliest_version=0))
+        assert not buf.can_release()
+
+        # Robolab finishes its 2nd group -> NOW can release!
+        buf.record_result(None, _ref_result(issued["robolab"][1], earliest_version=0))
+        assert buf.can_release()
+
+        released = buf.release_groups()
+        assert len(released) == 16
+        # Verify exact floor (>=2 per env) + FCFS for the remaining 6 slots:
+        # Since metaworld finished 6 groups first, its 4 surplus groups arrive earliest,
+        # followed by libero's first 2 surplus groups (total 6 surplus).
+        released_ids = {m.group_id for m, _ in released}
+        env_counts = {
+            e: sum(1 for gid in issued[e] if gid in released_ids) for e in envs
+        }
+        assert all(c >= 2 for c in env_counts.values()), env_counts
+        assert sum(env_counts.values()) == 16
+        assert env_counts == {
+            "metaworld": 6,  # 2 floor + 4 earliest FCFS
+            "libero": 4,     # 2 floor + 2 next earliest FCFS
+            "robotwin": 2,   # 2 floor
+            "robodojo": 2,   # 2 floor
+            "robolab": 2,    # 2 floor
+        }
+        metrics = buf.get_step_metrics()
+        for e, expected in env_counts.items():
+            assert metrics[f"batch_task_count/{e}"] == expected
+
+    def test_anti_starvation_reserves_buffer_for_slow_envs(self):
+        from torch.utils.data import ConcatDataset
+
+        # Tight max_buffered_groups == rollout_batch_size == 16 with 5x2=10 floor
+        cfg, envs = self._five_env_cfg(
+            rollout_batch_size=16,
+            max_inflight_groups=16,
+            max_buffered_groups=16,
+            min_per_env=2,
+            max_inflight_per_env=6,
+        )
+        ds = ConcatDataset([_ToyDataset(32) for _ in envs])
+        buf = RolloutBuffer(cfg, ds)
+
+        # Simulate admission picking 16 groups while nothing has finished yet:
+        # First 10 picks MUST cover every env's floor of 2 before any env gets a 3rd!
+        first_10: list[str] = []
+        for idx in range(10):
+            task, reason = buf.select_next_task()
+            assert reason is None and task is not None
+            buf.issue_group(idx, task)
+            first_10.append(task)
+        for e in envs:
+            assert first_10.count(e) == 2
+
+        # Next 6 picks fill the remaining 6 slots up to 16 without violating caps
+        for idx in range(10, 16):
+            task, reason = buf.select_next_task()
+            assert reason is None and task is not None
+            buf.issue_group(idx, task)
+
+        # Now if metaworld finishes all its groups while robolab still has 0 buffered
+        # and 0 inflight (suppose robolab's 2 were dropped as stale/error),
+        # buffer reservation MUST prevent metaworld from stealing robolab's 2 floor slots!
+        for gid in list(buf.group_tasks):
+            if buf.group_tasks[gid] == "robolab":
+                buf.drop_group(gid, "error", max_dropped=100, already_buffered=False)
+        # Next 2 admissions MUST be robolab!
+        for _ in range(2):
+            task, reason = buf.select_next_task()
+            assert reason is None and task == "robolab"
+            buf.issue_group(99, task)
+
+    def test_multi_task_worker_admission_and_checkpoint_roundtrip(self):
+        from torch.utils.data import ConcatDataset
+
+        cfg, envs = self._five_env_cfg(
+            rollout_batch_size=10,
+            max_inflight_groups=10,
+            max_buffered_groups=10,
+            min_per_env=2,
+            max_inflight_per_env=4,
+        )
+        ds = ConcatDataset([_ToyDataset(16) for _ in envs])
+
+        async def run():
+            with mock.patch.object(Worker, "__init__", return_value=None):
+                worker = RolloutBufferWorker(cfg, ds)
+            worker.log_info = lambda *a, **kw: None
+            worker.log_warning = lambda *a, **kw: None
+            dl_ch = _QueueChannel()
+            out_ch = _QueueChannel()
+            rollout_ch = _QueueChannel()
+            resident = asyncio.create_task(
+                worker.run_continuously(out_ch, dl_ch, rollout_ch)
+            )
+            try:
+                issued_tasks = []
+                for _ in range(10):
+                    req = await asyncio.wait_for(dl_ch._queue.get(), timeout=5)
+                    assert len(req.task_names) == 1
+                    issued_tasks.append(req.task_names[0])
+                for e in envs:
+                    assert issued_tasks.count(e) == 2
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    await worker.save_checkpoint(tmp)
+                    assert os.path.exists(os.path.join(tmp, "data.pt"))
+                    with mock.patch.object(Worker, "__init__", return_value=None):
+                        worker2 = RolloutBufferWorker(cfg, ds)
+                    worker2.log_info = lambda *a, **kw: None
+                    worker2.log_warning = lambda *a, **kw: None
+                    await worker2.load_checkpoint(tmp, start_step=1)
+            finally:
+                await worker.stop()
+                await asyncio.wait_for(resident, timeout=5)
+
+        asyncio.run(run())

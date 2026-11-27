@@ -516,6 +516,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             rollout_metrics.update(staleness_metrics)
 
         # pack traj
+        dp_world_size = parallel_state.get_data_parallel_world_size()
         scale_context = {
             "folding_scale": [],
             "enable_scale_of_group": False,
@@ -524,7 +525,8 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 * self.cfg.algorithm.get("group_size", 1)
                 / self.cfg.algorithm.n_minibatches
             ),
-            "data_parallel_world_size": parallel_state.get_data_parallel_world_size(),
+            "data_parallel_world_size": dp_world_size,
+            "uneven_dp_groups": self.cfg.data.rollout_batch_size % dp_world_size != 0,
         }
         for loss_scale_fn in self.loss_scale_fns:
             batch = loss_scale_fn(scale_context, batch)

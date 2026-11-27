@@ -2574,14 +2574,20 @@ def _validate_async_agent_cfg(
         )
     if cfg.data.get("rollout_batch_size", None) is not None:
         actor_dp_size = component_placement.actor_dp_size
-        if cfg.data.rollout_batch_size % actor_dp_size != 0:
+        allow_uneven_dp = (
+            cfg.actor.get("enable_dp_load_balance", False)
+            and OmegaConf.select(
+                cfg, "agentloop.is_dynamic_rollout_batch", default=False
+            )
+            and cfg.data.rollout_batch_size >= actor_dp_size
+        )
+        if not allow_uneven_dp and cfg.data.rollout_batch_size % actor_dp_size != 0:
             raise ValueError(
                 f"data.rollout_batch_size ({cfg.data.rollout_batch_size}) "
                 f"must be divisible by the actor data-parallel size "
-                f"({actor_dp_size}): each DP rank takes "
-                f"rollout_batch_size // {actor_dp_size} groups per step, "
-                "and a remainder would leave groups behind in "
-                "rollout_channel to be picked up by the next step."
+                f"({actor_dp_size}) unless actor.enable_dp_load_balance and "
+                "agentloop.is_dynamic_rollout_batch are enabled with "
+                "rollout_batch_size >= actor_dp_size."
             )
     if cfg.rollout.pause_mode == "in_place":
         logging.warning(

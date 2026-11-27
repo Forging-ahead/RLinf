@@ -1301,3 +1301,176 @@ def test_harness_v2_5env_mixed_simulators_and_binary_open() -> None:
             assert seen_payload["include_jaw_mm"] is True
 
     asyncio.run(_run())
+
+
+def test_uneven_dp_pad_rows_balance_and_loss_normalization(monkeypatch) -> None:
+    """Verify uneven-DP group balancing, CP>1 dummy row padding, and unbiased scaling."""
+    import torch
+
+    from rlinf.algorithms.loss_scales import restore_source_dp_normalization
+    from rlinf.data.schema.actor_batch import pad_actor_batch_rows
+    from rlinf.utils.distributed import balance_rollout_groups
+
+    # 1. pad_actor_batch_rows with CP>1 min_row_len = tp * cp * 2 = 16
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: tensor.fill_(4),
+    )
+    batch = {
+        "input_ids": [torch.tensor([1, 2, 3]), torch.tensor([4, 5])],
+        "attention_mask": [
+            torch.tensor([True, True, True]),
+            torch.tensor([True, True]),
+        ],
+        "response_mask": [
+            torch.tensor([False, True, True]),
+            torch.tensor([False, True]),
+        ],
+        "advantages": [
+            torch.tensor([0.0, 1.0, 1.0]),
+            torch.tensor([0.0, -1.0]),
+        ],
+        "loss_scales": [
+            torch.tensor([0.0, 0.5, 0.5]),
+            torch.tensor([0.0, 1.0]),
+        ],
+        "idx_to_traj": [0, 1],
+        "multi_modal_inputs": [{"pixel_values": torch.zeros(1)}, None],
+        "rewards": torch.tensor([1.0, 0.0]),
+    }
+    padded = pad_actor_batch_rows(batch, divisor=2, dp_group=None, device="cpu", min_row_len=16)
+    assert len(padded["input_ids"]) == 4
+    assert len(padded["multi_modal_inputs"]) == 4
+    assert padded["multi_modal_inputs"][2:] == [None, None]
+    assert padded["idx_to_traj"][2:] == [0, 0]
+    assert padded["rewards"].tolist() == [1.0, 0.0, 0.0, 0.0]
+    for dummy_idx in (2, 3):
+        assert padded["input_ids"][dummy_idx].shape == (16,)
+        assert padded["attention_mask"][dummy_idx].shape == (16,)
+        assert padded["attention_mask"][dummy_idx].all()
+        assert not padded["response_mask"][dummy_idx].any()
+        assert padded["advantages"][dummy_idx].abs().sum().item() == 0.0
+        assert padded["loss_scales"][dummy_idx].abs().sum().item() == 0.0
+
+    # 2. balance_rollout_groups with 16 groups across 6 DP ranks (uneven: 3,3,3,3,2,2)
+    world_size = 6
+    per_rank_costs = [
+        [1000, 900, 100],
+        [800, 700, 200],
+        [600, 500, 300],
+        [450, 400, 350],
+        [250, 150],
+        [120, 80],
+    ]
+    # Simulate all 6 ranks in-process with a shared in-memory all_to_all buffer
+    # First pass: collect outgoing payloads from each rank
+    sent_payloads: list[list[bytes]] = [[b""] * world_size for _ in range(world_size)]
+    rank_results = [
+        [SimpleNamespace(input_ids=[list(range(c))], tag=(r, i)) for i, c in enumerate(costs)]
+        for r, costs in enumerate(per_rank_costs)
+    ]
+
+    def _run_balance_all_ranks():
+        # Run a two-phase simulation: capture sends from all ranks, then deliver receives
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda g=None: world_size)
+        monkeypatch.setattr(torch.distributed, "get_backend", lambda g=None: "gloo")
+
+        def _fake_all_gather_obj(out, obj, group=None):
+            for idx, rank_costs in enumerate(per_rank_costs):
+                out[idx] = rank_costs
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", _fake_all_gather_obj)
+
+        # Phase A: capture outgoing sizes & byte payloads from each rank
+        send_chunks: list[list[bytes]] = [[b""] * world_size for _ in range(world_size)]
+        for r in range(world_size):
+            monkeypatch.setattr(torch.distributed, "get_rank", lambda g=None, _r=r: _r)
+            sizes_seen: list[list[int]] = []
+
+            def _capture_a2a(output, input, output_split_sizes=None, input_split_sizes=None, group=None, _r=r):
+                if input_split_sizes is None:
+                    sizes_seen.append(input.tolist())
+                    output.zero_()
+                else:
+                    raw = input.numpy().tobytes()
+                    off = 0
+                    for dst, sz in enumerate(input_split_sizes):
+                        send_chunks[_r][dst] = raw[off : off + sz]
+                        off += sz
+
+            monkeypatch.setattr(torch.distributed, "all_to_all_single", _capture_a2a)
+            try:
+                balance_rollout_groups(rank_results[r], dp_group=None)
+            except KeyError:
+                pass  # Expected in capture phase when recv is empty
+
+        # Phase B: deliver real all-to-all payloads and collect final balanced buckets
+        balanced_buckets = []
+        for r in range(world_size):
+            monkeypatch.setattr(torch.distributed, "get_rank", lambda g=None, _r=r: _r)
+
+            def _deliver_a2a(output, input, output_split_sizes=None, input_split_sizes=None, group=None, _r=r):
+                if input_split_sizes is None:
+                    for src in range(world_size):
+                        output[src] = len(send_chunks[src][_r])
+                else:
+                    joined = b"".join(send_chunks[src][_r] for src in range(world_size))
+                    if joined:
+                        output.copy_(torch.frombuffer(bytearray(joined), dtype=torch.uint8))
+
+            monkeypatch.setattr(torch.distributed, "all_to_all_single", _deliver_a2a)
+            balanced_buckets.append(balance_rollout_groups(rank_results[r], dp_group=None))
+        return balanced_buckets
+
+    balanced = _run_balance_all_ranks()
+    assert len(balanced) == world_size
+    assert all(len(bucket) >= 1 for bucket in balanced)
+    all_tags = [item.tag for bucket in balanced for item in bucket]
+    assert len(all_tags) == 16
+    assert len(set(all_tags)) == 16
+
+    # 3. restore_source_dp_normalization with uneven_dp_groups=True normalizes uniformly
+    # Suppose global total sequences = 64 across world_size = 6, local rank holds 8 sequences.
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda g=None: 6)
+    global_counts = torch.tensor([12, 12, 12, 12, 8, 8], dtype=torch.long)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: tensor.copy_(global_counts),
+    )
+    norm_batch = {
+        "extra:source_dp": torch.tensor([0, 0, 1, 2, 3, 4, 5, 5], dtype=torch.long),
+        "advantages": [torch.tensor([1.0]) for _ in range(8)],
+    }
+    ctx = {"folding_scale": ["group_level"], "uneven_dp_groups": True}
+    restore_source_dp_normalization(norm_batch, ctx, dp_group=None, device="cpu")
+    expected_ratio = 64.0 / (6 * 8)
+    for adv in norm_batch["advantages"]:
+        assert adv.item() == pytest.approx(expected_ratio)
+
+
+def test_aggregate_agent_metrics_handles_sparse_per_env_keys() -> None:
+    """Verify multi-env async agent metrics tolerate keys absent on some workers."""
+    from rlinf.utils.metric_utils import aggregate_agent_metrics
+
+    agg = aggregate_agent_metrics(
+        [
+            {
+                "__mean__/rpent/success_rate": (1, 2),
+                "__mean__/rpent/libero/success_rate": (1, 2),
+                "__sum__/rpent/episodes": 2,
+            },
+            {
+                "__mean__/rpent/success_rate": (2, 2),
+                "__mean__/rpent/robolab/success_rate": (2, 2),
+                "__sum__/rpent/episodes": 2,
+                "__max__/rpent/max_turns": 6,
+            },
+        ]
+    )
+    assert agg["rpent/success_rate"] == pytest.approx(0.75)
+    assert agg["rpent/libero/success_rate"] == pytest.approx(0.5)
+    assert agg["rpent/robolab/success_rate"] == pytest.approx(1.0)
+    assert agg["rpent/episodes"] == pytest.approx(4.0)
+    assert agg["rpent/max_turns"] == pytest.approx(6.0)

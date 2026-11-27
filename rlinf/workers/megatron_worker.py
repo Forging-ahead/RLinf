@@ -168,15 +168,18 @@ class MegatronWorker(MegatronModelManager, Worker):
             and parallel_state.get_context_parallel_rank() == 0
             and parallel_state.get_pipeline_model_parallel_rank() == 0
         )
-        assert (
-            self.cfg.data.rollout_batch_size * self.cfg.algorithm.group_size
-        ) % parallel_state.get_data_parallel_world_size() == 0, (
-            f"rollout_batch_size * group_size must be divisible by {role} data parallel size."
+        dp_size = parallel_state.get_data_parallel_world_size()
+        dynamic_balanced = self.enable_dp_load_balance and bool(
+            self.cfg.get("agentloop", {}).get("is_dynamic_rollout_batch", False)
         )
+        if not dynamic_balanced:
+            assert (
+                self.cfg.data.rollout_batch_size * self.cfg.algorithm.group_size
+            ) % dp_size == 0, (
+                f"rollout_batch_size * group_size must be divisible by {role} data parallel size."
+            )
         self.total_batch_size_per_dp = (
-            self.cfg.data.rollout_batch_size
-            * self.cfg.algorithm.group_size
-            // parallel_state.get_data_parallel_world_size()
+            self.cfg.data.rollout_batch_size * self.cfg.algorithm.group_size // dp_size
         )
         self.do_down_sampling = (
             self.cfg.algorithm.get("down_sampling", False)
@@ -968,20 +971,23 @@ class MegatronWorker(MegatronModelManager, Worker):
     def calc_num_microbatches(self):
         if not self.is_running:
             return
+        dp_size = parallel_state.get_data_parallel_world_size()
+        gbs = self.role_cfg.global_batch_size
+        denom = self.role_cfg.micro_batch_size * dp_size
+        if self.enable_dp_load_balance and gbs % denom != 0:
+            gbs = ((gbs + denom - 1) // denom) * denom
         configure_batch_sizes(
             rank=torch.distributed.get_rank(),
             mbs=self.role_cfg.micro_batch_size,
-            gbs=self.role_cfg.global_batch_size,
-            dp=parallel_state.get_data_parallel_world_size(),
+            gbs=gbs,
+            dp=dp_size,
         )
         self.total_batch_size_per_dp = (
-            self.cfg.data.rollout_batch_size
-            * self.cfg.algorithm.group_size
-            // parallel_state.get_data_parallel_world_size()
+            self.cfg.data.rollout_batch_size * self.cfg.algorithm.group_size // dp_size
         )
         if self._rank == 0:
             self.log_info(
-                f"run_training_pipeline: mbs={self.role_cfg.micro_batch_size}, gbs={self.role_cfg.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()}, self.total_batch_size_per_dp={self.total_batch_size_per_dp}"
+                f"run_training_pipeline: mbs={self.role_cfg.micro_batch_size}, gbs={gbs}, dp={dp_size}, self.total_batch_size_per_dp={self.total_batch_size_per_dp}"
             )
 
     def init_trainer_resharding(self, first_world_size: int = -1):
@@ -1469,14 +1475,16 @@ class DynamicMegatronBatchMixin:
         """
         groups = self.cfg.data.rollout_batch_size
         dp_size = parallel_state.get_data_parallel_world_size()
+        dp_rank = parallel_state.get_data_parallel_rank()
         count, remainder = divmod(groups, dp_size)
-        if not count or remainder:
+        if not count or (remainder and not self.enable_dp_load_balance):
             raise ValueError(
                 f"rollout_batch_size={groups} must divide evenly across {dp_size} data-parallel ranks"
             )
+        local_count = count + (1 if dp_rank < remainder else 0)
         results = None
         if channel.is_local or self.is_data_io_rank:
-            results = [self._receive_rollout_result(channel) for _ in range(count)]
+            results = [self._receive_rollout_result(channel) for _ in range(local_count)]
             if not channel.is_local:
                 for result in results:
                     result.extra_fields_train["source_dp"] = [
@@ -1510,6 +1518,12 @@ class DynamicMegatronBatchMixin:
         )
         return batch, results
 
+    def _dummy_row_len(self) -> int:
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size <= 1:
+            return 1
+        return parallel_state.get_tensor_model_parallel_world_size() * cp_size * 2
+
     def _pad_ragged_rows(self, batch: DynamicActorBatch) -> DynamicActorBatch:
         """Align every column with the minibatch and microbatch schedule."""
         return pad_actor_batch_rows(
@@ -1517,6 +1531,7 @@ class DynamicMegatronBatchMixin:
             self.num_train_steps * self.role_cfg.micro_batch_size,
             parallel_state.get_data_parallel_group(),
             self.torch_platform.current_device(),
+            min_row_len=self._dummy_row_len(),
         )
 
     def _get_num_microbatches(
@@ -1551,6 +1566,7 @@ class DynamicMegatronBatchMixin:
                 divisor,
                 parallel_state.get_data_parallel_group(),
                 self.torch_platform.current_device(),
+                min_row_len=self._dummy_row_len(),
             )
         if self.enable_dynamic_batch_size:
             alignment = parallel_state.get_tensor_model_parallel_world_size() * (
