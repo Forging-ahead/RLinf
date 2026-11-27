@@ -23,7 +23,7 @@ environment. Install each simulator on its own host using the
    uv pip install --python "$VIRTUAL_ENV/bin/python" --no-deps -e "$RPENT_ROOT"
 
 Provide the original multimodal model directory with its tokenizer and image
-processor. Install the task assets on each simulator host. Backends that use SAM3 need access to that service. Use the same
+processor. Simulator hosts need the task assets and access to SAM3. Use the same
 RPent revision on the planner and simulation hosts.
 
 Prepare tasks
@@ -40,7 +40,8 @@ LIBERO tasks use ``suite``, ``task`` and ``seed``. RoboCasa and RoboDojo use
 ``task_name`` and ``seed``. In RoboDojo, select a seed group installed in
 ``Assets/Eval_Layout`` and set ``layout`` to an index within that group. Run
 ``examples/agent/rpent/prepare_tasks.py`` inside the LIBERO environment to
-build its native task pool, and supply a separate task list for RoboCasa, RoboDojo and RoboTwin.
+build its native task pool, and supply a separate task list for each other
+simulator.
 
 Run training
 ------------
@@ -94,45 +95,3 @@ Set ``runner.resume_dir`` to the latest complete checkpoint to resume. Keep
 the same task pools, simulator quotas and model interface during recovery.
 The run directory stores the resolved configuration, selected groups,
 optimizer checkpoints and training metrics.
-
-ManiSkill task pool, PPO and evaluation
----------------------------------------
-
-In the simulation environment, build a pool from the installed
-``mani_skill.utils.registration.REGISTERED_ENVS``. Use repeated ``--task-name`` options to select tasks for the available arm tools. Training defaults to 29 scored pose tasks. Evaluation also includes 12 pose environments without a native success criterion, listed separately and excluded from the success-rate denominator. Five additional pose tasks can be selected explicitly after installing their assets. Each selected task gets
-one row per requested reset seed. The manifest records the official horizon
-for each task. The toolkit obtains the task instruction after reset.
-
-.. code-block:: bash
-
-   python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split train --seeds 0 --task-name PickCube-v1 --task-name DrawTriangle-v1
-   python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split eval --seeds 1 --task-name PickCube-v1 --task-name DrawTriangle-v1
-
-Run PPO and evaluation on the training host with a reachable ManiSkill
-toolkit. This example uses training GPUs 2 and 3. The toolkit assigns simulation
-workers from its own configured GPU slots. PPO collects two complete
-planner episodes per update. The planner turn budget and the simulator's
-registered step limit are independent.
-
-.. code-block:: bash
-
-   cd "$RLINF_ROOT"
-   shared=(
-     "rollout.model.model_path=$MODEL_PATH"
-     "tools.rpent.repo_path=$RPENT_ROOT"
-     "tools.rpent.remote_toolkit_endpoint=$MANISKILL_ENDPOINT"
-     "runner.output_dir=$RUN_DIR"
-   )
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_episode_maniskill_ppo \
-     "${shared[@]}" "tools.rpent.output_dir=$RUN_DIR/train-episodes" \
-     "data.train_data_paths=$TASK_DIR/train.jsonl"
-   bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_episode_maniskill \
-     "${shared[@]}" "tools.rpent.output_dir=$RUN_DIR/eval-episodes" \
-     "data.val_data_paths=$TASK_DIR/eval.jsonl"
-
-PPO scores a native success as one and failure as zero, as in LIBERO. For tasks without a success criterion it uses the native return. The trajectory records the score source. Evaluation reports
-that return for every task using the weights at MODEL_PATH and counts only episodes with a native
-``success`` value in the success rate. Open ``eval_results.json`` in the
-evaluation run directory for each task's scores and termination flags.

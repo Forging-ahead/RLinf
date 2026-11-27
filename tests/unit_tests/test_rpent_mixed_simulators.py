@@ -15,9 +15,7 @@
 
 import asyncio
 import json
-import sys
 from copy import deepcopy
-from types import ModuleType, SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
@@ -44,52 +42,6 @@ def mixed_config(names=("libero", "robotwin", "robocasa", "robodojo")):
             },
         }
     )
-
-
-def test_maniskill_registry_task_pool_and_routing(tmp_path, monkeypatch):
-    from examples.agent.rpent.prepare_tasks import write_maniskill_tasks
-
-    package = ModuleType("mani_skill")
-    package.envs = ModuleType("mani_skill.envs")
-    package.utils = ModuleType("mani_skill.utils")
-    package.utils.registration = ModuleType("mani_skill.utils.registration")
-    package.utils.registration.REGISTERED_ENVS = {
-        "Empty-v1": SimpleNamespace(max_episode_steps=200000),
-        "UnitreeG1Stand-v1": SimpleNamespace(max_episode_steps=1000),
-        "PickCube-v1": SimpleNamespace(max_episode_steps=50),
-    }
-    for module in (package, package.envs, package.utils, package.utils.registration):
-        monkeypatch.setitem(sys.modules, module.__name__, module)
-    args = SimpleNamespace(
-        output_dir=tmp_path, split="eval", seeds="3-4,3", task_name=None
-    )
-    write_maniskill_tasks(args)
-    rows = [
-        json.loads(line) for line in (tmp_path / "eval.jsonl").read_text().splitlines()
-    ]
-    tasks = [json.loads(row["answer"]) for row in rows]
-    assert [(t["task_name"], t["seed"]) for t in tasks] == [
-        ("Empty-v1", 3),
-        ("Empty-v1", 4),
-        ("PickCube-v1", 3),
-        ("PickCube-v1", 4),
-    ]
-    assert all(t["environment"] == "maniskill" for t in tasks)
-    assert len({row["query_id"] for row in rows}) == len(rows)
-    manifest = json.loads((tmp_path / "eval-manifest.json").read_text())
-    assert [t["max_episode_steps"] for t in manifest["tasks"]] == [200000, 50]
-    simulators = mixed_simulators(mixed_config(("maniskill", "libero")))
-    assert simulators["maniskill"].train_data_paths == "/tasks/maniskill.jsonl"
-
-    args.task_name = ["PickCube-v1"]
-    write_maniskill_tasks(args)
-    entries = (tmp_path / "eval.jsonl").read_text().splitlines()
-    assert [
-        json.loads(json.loads(line)["answer"])["task_name"] for line in entries
-    ] == ["PickCube-v1", "PickCube-v1"]
-    args.task_name = ["UnitreeG1Stand-v1"]
-    with pytest.raises(ValueError, match="UnitreeG1Stand-v1"):
-        write_maniskill_tasks(args)
 
 
 def test_mixed_quotas_count_full_groups():

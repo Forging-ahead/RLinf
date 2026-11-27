@@ -99,10 +99,6 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         self.extra_keys_turn = ["turn_id", "turn_ids", "tool_names"]
         self.extra_keys_traj = [
             "success",
-            "episode_return",
-            "reward_source",
-            "terminated",
-            "fail",
             "truncated",
             "task",
             "init_state_id",
@@ -671,12 +667,6 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
 
     def get_rollout_metrics(self, rollout_result):
         successes = rollout_result.extra_fields_traj["success"]
-        scored = [value for value in successes if value is not None]
-        returns = [
-            value
-            for value in rollout_result.extra_fields_traj.get("episode_return", ())
-            if value is not None
-        ]
         retry_errors = rollout_result.extra_fields_traj["infra_retry_errors"]
         counts = Counter(error["kind"] for errors in retry_errors for error in errors)
         episodes = len(successes)
@@ -684,9 +674,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             "__mean__/rpent/infra_retry_rate": (sum(map(bool, retry_errors)), episodes),
             "__sum__/rpent/infra_retry_attempts": sum(map(len, retry_errors)),
             "__sum__/rpent/infra_retry_episodes": sum(map(bool, retry_errors)),
-            "__mean__/rpent/success_rate": (sum(scored), len(scored)),
-            "__sum__/rpent/episodes_with_success_metric": len(scored),
-            "__mean__/rpent/episode_return": (sum(returns), len(returns)),
+            "__mean__/rpent/success_rate": (sum(successes), episodes),
             "__sum__/rpent/episodes": episodes,
             "__mean__/rpent/turns": (
                 sum(rollout_result.extra_fields_traj["turns"]),

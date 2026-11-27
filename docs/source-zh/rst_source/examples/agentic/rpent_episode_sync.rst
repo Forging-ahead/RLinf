@@ -16,7 +16,7 @@ RPent Episode 训练
      -r requirements/episode-planner.txt)
    uv pip install --python "$VIRTUAL_ENV/bin/python" --no-deps -e "$RPENT_ROOT"
 
-主栈使用包含 tokenizer 和图像预处理器的完整多模态权重。仿真端准备任务资产，使用 SAM3 的后端还需配置可访问的 SAM3 服务。主栈和仿真端使用同一 RPent 版本。
+主栈使用包含 tokenizer 和图像预处理器的完整多模态权重。仿真端准备任务资产和可访问的 SAM3 服务。主栈和仿真端使用同一 RPent 版本。
 
 准备任务清单
 ------------
@@ -27,7 +27,7 @@ RPent Episode 训练
 
    {"prompt":"Adjust the bottle","answer":"{\"environment\":\"robotwin\",\"task_name\":\"adjust_bottle\",\"seed\":100000,\"task_config\":\"demo_randomized\"}"}
 
-LIBERO 使用 ``suite``、``task`` 和 ``seed``。RoboCasa 和 RoboDojo 使用 ``task_name`` 和 ``seed``。RoboDojo 的 ``seed`` 选择 ``Assets/Eval_Layout`` 中已安装的组，``layout`` 指定组内索引。在 LIBERO 环境中运行 ``examples/agent/rpent/prepare_tasks.py`` 生成原生任务池，RoboCasa、RoboDojo 和 RoboTwin 各提供一份任务清单。
+LIBERO 使用 ``suite``、``task`` 和 ``seed``。RoboCasa 和 RoboDojo 使用 ``task_name`` 和 ``seed``。RoboDojo 的 ``seed`` 选择 ``Assets/Eval_Layout`` 中已安装的组，``layout`` 指定组内索引。在 LIBERO 环境中运行 ``examples/agent/rpent/prepare_tasks.py`` 生成原生任务池，其余仿真器各提供一份任务清单。
 
 启动训练
 --------
@@ -60,41 +60,3 @@ LIBERO 使用 ``suite``、``task`` 和 ``seed``。RoboCasa 和 RoboDojo 使用 `
 每次更新从各任务池取样，同组共享任务和初态。各仿真器按完成顺序选够自己的完整组，正常失败照常计入。环境和生成队列完成清理后再学习。
 
 单环境使用 ``train_qwen3.5_4b_episode_sync_grpo``，通过 ``data.train_data_paths`` 和 ``tools.rpent.remote_toolkit_endpoint`` 提供任务与地址。续训将 ``runner.resume_dir`` 指向最近的完整 checkpoint，并使用相同任务池、配额和模型接口。运行目录中保存实际配置、组选择记录、optimizer checkpoint 和训练指标。
-
-ManiSkill 任务池、PPO 与评估
-------------------------------------------
-
-在仿真环境中运行以下命令，读取已安装版本的
-``mani_skill.utils.registration.REGISTERED_ENVS``。每个注册任务按指定的 reset
-种子生成一行，清单记录该任务的官方步数上限。仿真端在 reset 后读取本回合的任务指令。
-
-重复传入 ``--task-name`` 可以选择机械臂动作已适配的任务。默认训练池含 29 个有成功判据的位姿任务。评测另外接入 12 个无成功判据的位姿环境，单列展示，不计入成功率。另有 5 个位姿任务可在安装对应资产后显式指定。
-
-.. code-block:: bash
-
-   python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split train --seeds 0 --task-name PickCube-v1 --task-name DrawTriangle-v1
-   python "$RLINF_ROOT/examples/agent/rpent/prepare_tasks.py" \
-     --environment maniskill --output-dir "$TASK_DIR" --split eval --seeds 1 --task-name PickCube-v1 --task-name DrawTriangle-v1
-
-在训练主机上，将 ``MANISKILL_ENDPOINT`` 设为可访问的 ManiSkill 工具服务地址。
-示例在训练节点的 GPU 2、3 上运行模型，仿真端从自己的 GPU 槽位分配资源。PPO 每收齐两条规划轨迹更新一次。规划器的回合轮数预算与仿真任务注册的步数上限分别生效。
-
-.. code-block:: bash
-
-   cd "$RLINF_ROOT"
-   shared=(
-     "rollout.model.model_path=$MODEL_PATH"
-     "tools.rpent.repo_path=$RPENT_ROOT"
-     "tools.rpent.remote_toolkit_endpoint=$MANISKILL_ENDPOINT"
-     "runner.output_dir=$RUN_DIR"
-   )
-   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_episode_maniskill_ppo \
-     "${shared[@]}" "tools.rpent.output_dir=$RUN_DIR/train-episodes" \
-     "data.train_data_paths=$TASK_DIR/train.jsonl"
-   bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_episode_maniskill \
-     "${shared[@]}" "tools.rpent.output_dir=$RUN_DIR/eval-episodes" \
-     "data.val_data_paths=$TASK_DIR/eval.jsonl"
-
-PPO 和 LIBERO 一样，成功计 1，失败计 0。没有原生成功判据的任务使用原生累计回报，轨迹会记录奖励来源。评估使用 MODEL_PATH 指定的权重按任务统计轨迹回报，成功率的分母只包含仿真器提供
-``success`` 的轨迹。在评估运行目录的 ``eval_results.json`` 中可以查看每个任务的统计以及每条轨迹的终止标志。

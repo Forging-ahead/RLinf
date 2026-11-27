@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluate an RPent planner on fixed tasks with their native metrics."""
+"""Evaluate an RPent planner on fixed tasks and report its success rate."""
 
 import json
 import os
@@ -35,40 +35,22 @@ _EPISODE_FIELDS = (
 )
 
 
-def _metrics(episodes: list[dict]) -> dict:
-    successes = [e["success"] for e in episodes if e["success"] is not None]
-    returns = [
-        e["episode_return"] for e in episodes if e.get("episode_return") is not None
-    ]
-    metrics = {
-        "episodes": len(episodes),
-        "episodes_with_success_metric": len(successes),
-    }
-    if successes:
-        metrics["success_rate"] = sum(successes) / len(successes)
-    if returns:
-        metrics["mean_episode_return"] = sum(returns) / len(returns)
-    return metrics
-
-
 def summarize_episodes(episodes: list[dict]) -> dict:
-    """Summarize LIBERO by suite and other simulators by native task."""
-    suites, tasks = defaultdict(list), defaultdict(list)
+    """Return the success rate overall and per LIBERO suite."""
+    by_suite = defaultdict(list)
     for episode in episodes:
-        task = episode["task"]
-        if "suite" in task:
-            suites[task["suite"]].append(episode)
-        else:
-            tasks[f"{task['environment']}/{task['task_name']}"].append(episode)
-    summary = _metrics(episodes)
-    summary["suites"] = {key: _metrics(rows) for key, rows in sorted(suites.items())}
-    if tasks:
-        summary["tasks"] = {key: _metrics(rows) for key, rows in sorted(tasks.items())}
-        unscored = [key for key, metrics in summary["tasks"].items()
-                    if not metrics["episodes_with_success_metric"]]
-        if unscored:
-            summary["tasks_without_success_metric"] = unscored
-    return summary
+        by_suite[episode["task"]["suite"]].append(episode["success"])
+    return {
+        "episodes": len(episodes),
+        "success_rate": sum(e["success"] for e in episodes) / max(len(episodes), 1),
+        "suites": {
+            suite: {
+                "episodes": len(results),
+                "success_rate": sum(results) / len(results),
+            }
+            for suite, results in sorted(by_suite.items())
+        },
+    }
 
 
 class RPentEvalRunner(AgentEvalRunner):
@@ -83,30 +65,15 @@ class RPentEvalRunner(AgentEvalRunner):
             result: DynamicRolloutResult = input_channel.get()
             traj = result.extra_fields_traj
             episodes = len(traj["success"])
-            for i in range(episodes):
-                row = {key: traj[key][i] for key in _EPISODE_FIELDS}
-                if row["task"].get("environment") == "maniskill":
-                    for key in (
-                        "episode_return",
-                        "terminated",
-                        "fail",
-                        "truncated",
-                        "terminal",
-                    ):
-                        row[key] = traj[key][i]
-                context["episodes"].append(row)
+            context["episodes"].extend(
+                {key: traj[key][i] for key in _EPISODE_FIELDS} for i in range(episodes)
+            )
             received += episodes
             eval_pbar.update(episodes)
 
     def update_batch(self, context: dict, eval_pbar, time_metrics):
         summary = summarize_episodes(context["episodes"])
-        eval_pbar.set_postfix(
-            {
-                key: f"{summary[key]:.4f}"
-                for key in ("success_rate", "mean_episode_return")
-                if key in summary
-            }
-        )
+        eval_pbar.set_postfix({"success_rate": f"{summary['success_rate']:.4f}"})
 
     def post_process(self, context: dict) -> None:
         summary = summarize_episodes(context["episodes"])
@@ -120,5 +87,6 @@ class RPentEvalRunner(AgentEvalRunner):
                 {"summary": summary, "episodes": context["episodes"]}, f, indent=2
             )
         logger.info(
-            f"Evaluated {summary['episodes']} RPent episodes. Results in {output_file}"
+            f"RPent success rate {summary['success_rate']:.4f} over "
+            f"{summary['episodes']} episodes; results in {output_file}"
         )
