@@ -101,7 +101,7 @@ def test_merge_prefix_turns_respects_chain_and_budget():
     assert len(split) == 2
 
 
-@pytest.mark.parametrize("second", ["robotwin", "metaworld"])
+@pytest.mark.parametrize("second", ["robotwin", "metaworld", "maniskill"])
 def test_mixed_simulators_and_sampler_quotas(second):
     cfg = OmegaConf.create(
         {
@@ -162,7 +162,7 @@ def test_aggregate_metrics_and_qwen35_bf16_norm():
     assert torch.equal(got, (t.float() + 1.0).to(torch.bfloat16))
 
 
-@pytest.mark.parametrize("second", ["robotwin", "metaworld"])
+@pytest.mark.parametrize("second", ["robotwin", "metaworld", "maniskill"])
 def test_validate_sim_pool_capacity(second):
     from rlinf.agents.rpent.simulators import SimulatorSpec
     from rlinf.runners.rpent_runner import validate_sim_pool_capacity

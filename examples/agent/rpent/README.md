@@ -195,6 +195,16 @@ bash examples/agent/rpent/run_train.sh \
 
 The run collects one group of two episodes per simulator and performs one GRPO optimizer step. The startup capacity check requires two resident worker slots per simulator. RPent returns the native success flag used for reward, and infrastructure failures follow the episode retry policy. The run writes group rewards under `sampling/` and optimizer metrics to TensorBoard.
 
+### ManiSkill and RoboTwin
+
+Prepare the default RGB-D task pool from the matching RPent checkout:
+
+```bash
+python examples/agent/rpent/prepare_tasks.py --maniskill-catalog "$RPENT_ROOT/robots/rl/envs/maniskill_tasks.json" --seeds 0-2 --output-dir "$RPENT_ROOT/data/maniskill"
+```
+
+Use `train_qwen3.5_4b_rpent_maniskill_smoke` with the ManiSkill and RoboTwin simulator pools.
+
 ## Unit Tests
 
 ```bash
