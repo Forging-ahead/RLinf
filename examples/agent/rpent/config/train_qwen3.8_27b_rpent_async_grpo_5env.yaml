@@ -7,26 +7,27 @@ hydra:
     dir: .
   output_subdir: null
 
-# 6-node (48x H100 80GB) Collocated Async GRPO for Qwen3.8-27B across 5 RPent envs
-# (LIBERO, RoboTwin, RoboDojo, RoboLab, MetaWorld) paired with 1 dedicated 8-GPU
-# Env+SAM3 node (h7).
+# 6-node (48x H100 80GB: h1..h5 + h7) Collocated Async GRPO for Qwen3.8-27B
+# across 5 RPent envs (LIBERO, RoboTwin, RoboDojo, RoboLab, MetaWorld) paired
+# with 1 dedicated 8-GPU Env+SAM3 node (h6, 172.27.60.49).
 #
 # Batch & quota policy:
-# - rollout_batch_size = 16 groups, group_size = 4 => 64 trajectories/step
-# - Guaranteed per-env floor: 2 groups (8 trajectories) x 5 envs = 10 groups
-# - Remaining 6 groups: first-come-first-served (FCFS) across all 5 envs
+# - rollout_batch_size = 32 groups, group_size = 4 => 128 trajectories/step
+# - Guaranteed per-env floor: 4 groups (16 trajectories) x 5 envs = 20 groups
+# - Remaining 12 groups: first-come-first-served (FCFS) across all 5 envs
 #
 # Parallelism:
 # - Rollout (SGLang): TP=2 (24 independent NVLink replicas, ~29 GB weights/GPU,
 #   ~26 GiB headroom during collocated weight sync vs ~10 MiB at TP=1)
 # - Actor (Megatron): TP=4, SP=true, CP=2, PP=1 (8 GPUs = 1 full NVLink node per replica, DP=6 across 6 nodes)
+# - AgentLoop: 18 async workers (0-17) serving max_inflight_groups=36 (~2 groups/worker, 0% idle)
 
 cluster:
   num_nodes: 6
   component_placement:
     actor: 0-47
     rollout: 0-47
-    agentloop: 0-47
+    agentloop: 0-17
     reward: 0-47
 
 runner:
@@ -44,7 +45,7 @@ runner:
   max_epochs: 100
   max_steps: 200
   val_check_interval: -1
-  save_interval: 10
+  save_interval: 5
   seq_length: 65536
   enable_dynamic_batch_size: false
   max_tokens_per_mbs: 32768
@@ -95,8 +96,8 @@ algorithm:
 data:
   type: reasoning
   max_prompt_length: 1792
-  rollout_batch_size: 16
-  sampling_batch_size: 18
+  rollout_batch_size: 32
+  sampling_batch_size: 36
   val_rollout_batch_size: null
   num_workers: 0
   prompt_key: prompt
@@ -111,47 +112,47 @@ data:
 env:
   rpent:
     libero:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.116.254}:28561
+      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28561
       train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/libero/train.jsonl
-      rollout_episodes: 8     # floor: 2 groups x 4 episodes
-      sampling_episodes: 16   # max inflight: 4 groups x 4 episodes
+      rollout_episodes: 16    # floor: 4 groups x 4 episodes
+      sampling_episodes: 40   # max inflight: 10 groups x 4 episodes
     robotwin:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.116.254}:28562
+      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28562
       train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robotwin/train.jsonl
-      rollout_episodes: 8
-      sampling_episodes: 16
+      rollout_episodes: 16
+      sampling_episodes: 32   # max inflight: 8 groups x 4 episodes
     robodojo:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.116.254}:28563
+      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28563
       train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robodojo/train.jsonl
-      rollout_episodes: 8
-      sampling_episodes: 12   # max inflight: 3 groups x 4 episodes
+      rollout_episodes: 16
+      sampling_episodes: 16   # max inflight: 4 groups x 4 episodes
     robolab:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.116.254}:28564
+      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28564
       train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robolab/train.jsonl
-      rollout_episodes: 8
-      sampling_episodes: 12   # max inflight: 3 groups x 4 episodes
+      rollout_episodes: 16
+      sampling_episodes: 16   # max inflight: 4 groups x 4 episodes
     metaworld:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.116.254}:28565
+      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28565
       train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/metaworld/ml45-train.jsonl
-      rollout_episodes: 8
-      sampling_episodes: 16
+      rollout_episodes: 16
+      sampling_episodes: 40   # max inflight: 10 groups x 4 episodes
 
 rollout_buffer:
-  max_inflight_groups: 18
-  max_buffered_groups: 32
-  max_dropped_groups_per_step: 160
+  max_inflight_groups: 36
+  max_buffered_groups: 64
+  max_dropped_groups_per_step: 320
   min_groups_per_task:
-    libero: 2
-    robotwin: 2
-    robodojo: 2
-    robolab: 2
-    metaworld: 2
-  max_inflight_per_task:
     libero: 4
     robotwin: 4
-    robodojo: 3
-    robolab: 3
+    robodojo: 4
+    robolab: 4
     metaworld: 4
+  max_inflight_per_task:
+    libero: 10
+    robotwin: 8
+    robodojo: 4
+    robolab: 4
+    metaworld: 10
 
 agentloop:
   group_name: AgentLoopGroup
@@ -187,6 +188,7 @@ agentloop:
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
     LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    RLINF_TIMEOUT: "201600"
     HF_HUB_OFFLINE: "1"
     TRANSFORMERS_OFFLINE: "1"
     NO_PROXY: 127.0.0.1,localhost,172.27.0.0/16,10.211.0.0/16
@@ -237,8 +239,8 @@ rollout:
     disable_fast_image_processor: true
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
-  max_running_requests: 8
-  cuda_graph_max_bs: 8
+  max_running_requests: 12
+  cuda_graph_max_bs: 12
   validate_weight: false
   validate_weight_first_sync: true
   validate_save_dir: null
@@ -248,6 +250,7 @@ rollout:
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
     LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    RLINF_TIMEOUT: "201600"
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
     SGLANG_MM_BUFFER_SIZE_MB: "0"
     PYTORCH_ALLOC_CONF: expandable_segments:False
@@ -352,7 +355,7 @@ actor:
     empty_cache_after_backward: true
     ddp_bucket_size: null
     distributed_backend: nccl
-    distributed_timeout_minutes: 180
+    distributed_timeout_minutes: 201600
     ckpt_format: torch
     use_dist_ckpt: false
     tp_comm_bootstrap_backend: nccl
@@ -370,6 +373,7 @@ actor:
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
     LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    RLINF_TIMEOUT: "201600"
     PYTORCH_ALLOC_CONF: expandable_segments:False
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     NCCL_MAX_CTAS: "8"
