@@ -187,36 +187,39 @@ def write_metaworld_tasks(args: argparse.Namespace) -> None:
         )
 
 
-def write_catalog_tasks(args: argparse.Namespace, environment: str) -> None:
-    """Expand the RPent task catalog into one episode task per task and seed."""
-    if args.maniskill:
-        from robots.rl.envs.maniskill import CATALOG
-
-        catalog = CATALOG
-        source_name = "robots.rl.envs.maniskill.CATALOG"
-        raw_catalog = (json.dumps(catalog, indent=2) + "\n").encode()
-    else:
-        source = getattr(args, f"{environment}_catalog")
-        source_name = source.name
-        raw_catalog = source.read_bytes()
-        catalog = json.loads(raw_catalog)
+def write_robolab_tasks(args: argparse.Namespace) -> None:
+    """Read instructions and provenance from the RoboLab catalog."""
+    source = args.robolab_catalog
+    raw_catalog = source.read_bytes()
+    catalog = json.loads(raw_catalog)
     tasks = catalog["tasks"]
-    robolab = environment == "robolab"
-    if (
-        not isinstance(tasks, dict)
-        or not tasks
-        or (robolab and catalog["task_count"] != len(tasks))
-    ):
-        raise ValueError(
-            f"{environment} requires a nonempty task map matching its catalog count."
-        )
-    seeds = parse_seeds(args.seeds)
+    if not isinstance(tasks, dict) or catalog["task_count"] != len(tasks):
+        raise ValueError("RoboLab task_count must match its task map.")
+    write_catalog_tasks(
+        args,
+        "robolab",
+        {
+            name: entry.get("instruction") if isinstance(entry, dict) else None
+            for name, entry in tasks.items()
+        },
+        {
+            "source": source.name,
+            "source_revision": catalog["source_revision"],
+            "source_metadata_sha256": catalog["source_metadata_sha256"],
+            "catalog_sha256": hashlib.sha256(raw_catalog).hexdigest(),
+        },
+    )
 
+
+def write_catalog_tasks(
+    args: argparse.Namespace, environment: str, tasks: dict, provenance: dict
+) -> None:
+    """Write one episode per task instruction and seed."""
+    if not tasks:
+        raise ValueError(f"{environment} requires at least one task.")
+    seeds = parse_seeds(args.seeds)
     rows = []
-    for task_name, entry in sorted(tasks.items()):
-        instruction = entry
-        if robolab:
-            instruction = entry.get("instruction") if isinstance(entry, dict) else None
+    for task_name, instruction in sorted(tasks.items()):
         if (
             not task_name.strip()
             or not isinstance(instruction, str)
@@ -240,13 +243,7 @@ def write_catalog_tasks(args: argparse.Namespace, environment: str) -> None:
         rows,
         {
             "environment": environment,
-            "source": source_name,
-            **{
-                k: catalog[k]
-                for k in ("source_revision", "source_metadata_sha256")
-                if robolab
-            },
-            "catalog_sha256": hashlib.sha256(raw_catalog).hexdigest(),
+            **provenance,
             "task_count": len(tasks),
             "seeds": seeds,
         },
@@ -302,9 +299,6 @@ def main() -> None:
         action="store_true",
         help="Prepare RPent's default RGB-D ManiSkill tasks",
     )
-    mode.add_argument(
-        "--maniskill-catalog", type=Path, help="Use a custom ManiSkill JSON catalog"
-    )
     mode.add_argument("--robolab-catalog", type=Path, help="RPent RoboLab task catalog")
     parser.add_argument(
         "--seeds", default="all", help="Native seeds or ranges, e.g. 0-1"
@@ -315,13 +309,29 @@ def main() -> None:
     args = parser.parse_args()
     if args.metaworld:
         write_metaworld_tasks(args)
-    elif args.robolab_catalog or args.maniskill or args.maniskill_catalog:
-        name = "RoboLab" if args.robolab_catalog else "ManiSkill"
+    elif args.robolab_catalog:
         if args.seeds == "all":
             parser.error(
-                f"{name} requires explicit --seeds (for example, --seeds 0-2)."
+                "RoboLab requires explicit --seeds (for example, --seeds 0-2)."
             )
-        write_catalog_tasks(args, name.lower())
+        write_robolab_tasks(args)
+    elif args.maniskill:
+        if args.seeds == "all":
+            parser.error(
+                "ManiSkill requires explicit --seeds (for example, --seeds 0-2)."
+            )
+        from robots.rl.envs.maniskill import CATALOG
+
+        raw_catalog = (json.dumps(CATALOG, indent=2) + "\n").encode()
+        write_catalog_tasks(
+            args,
+            "maniskill",
+            CATALOG["tasks"],
+            {
+                "source": "robots.rl.envs.maniskill.CATALOG",
+                "catalog_sha256": hashlib.sha256(raw_catalog).hexdigest(),
+            },
+        )
     elif args.robotwin_seeds is not None:
         write_robotwin_tasks(args)
     else:

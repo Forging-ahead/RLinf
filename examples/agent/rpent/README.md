@@ -196,11 +196,21 @@ The issues below are **general, recurring failure modes** when scaling multimoda
 In the RPent environment, prepare the default RGB-D task pool from the matching RPent checkout:
 
 ```bash
-PYTHONPATH="$RPENT_ROOT" python examples/agent/rpent/prepare_tasks.py --maniskill \
+PYTHONPATH="$RPENT_ROOT/RPent" python examples/agent/rpent/prepare_tasks.py --maniskill \
   --seeds 0-2 --output-dir "$RPENT_ROOT/data/maniskill"
 ```
 
-Use `train_qwen3.5_4b_rpent_maniskill_smoke` with the ManiSkill and RoboTwin simulator pools.
+To run one training step with ManiSkill and RoboTwin, reuse the two-pool configuration:
+
+```bash
+bash examples/agent/rpent/run_train.sh --config-name train_qwen3.5_4b_rpent_robolab_smoke \
+  runner.experiment_name=rpent-maniskill-robotwin-smoke tools.rpent.image_size=512 \
+  '~env.rpent' \
+  "+env.rpent.maniskill.endpoint=${MANISKILL_POOL_URL:-http://127.0.0.1:28567}" \
+  "+env.rpent.maniskill.train_data_paths=$RPENT_ROOT/data/maniskill/train.jsonl" \
+  +env.rpent.maniskill.rollout_episodes=2 +env.rpent.maniskill.sampling_episodes=2 \
+  '+env.rpent.robotwin=${smoke_pools.robotwin}'
+```
 
 ## Unit Tests
 
