@@ -197,10 +197,11 @@ The run collects one group of two episodes per simulator and performs one GRPO o
 
 ### ManiSkill and RoboTwin
 
-Prepare the default RGB-D task pool from the matching RPent checkout:
+In the RPent environment, prepare the default RGB-D task pool from the matching RPent checkout:
 
 ```bash
-python examples/agent/rpent/prepare_tasks.py --maniskill-catalog "$RPENT_ROOT/robots/rl/envs/maniskill_tasks.json" --seeds 0-2 --output-dir "$RPENT_ROOT/data/maniskill"
+PYTHONPATH="$RPENT_ROOT" python examples/agent/rpent/prepare_tasks.py --maniskill \
+  --seeds 0-2 --output-dir "$RPENT_ROOT/data/maniskill"
 ```
 
 Use `train_qwen3.5_4b_rpent_maniskill_smoke` with the ManiSkill and RoboTwin simulator pools.

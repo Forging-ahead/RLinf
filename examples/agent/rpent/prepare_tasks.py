@@ -189,9 +189,17 @@ def write_metaworld_tasks(args: argparse.Namespace) -> None:
 
 def write_catalog_tasks(args: argparse.Namespace, environment: str) -> None:
     """Expand the RPent task catalog into one episode task per task and seed."""
-    source = getattr(args, f"{environment}_catalog")
-    raw_catalog = source.read_bytes()
-    catalog = json.loads(raw_catalog)
+    if args.maniskill:
+        from robots.rl.envs.maniskill import CATALOG
+
+        catalog = CATALOG
+        source_name = "robots.rl.envs.maniskill.CATALOG"
+        raw_catalog = (json.dumps(catalog, indent=2) + "\n").encode()
+    else:
+        source = getattr(args, f"{environment}_catalog")
+        source_name = source.name
+        raw_catalog = source.read_bytes()
+        catalog = json.loads(raw_catalog)
     tasks = catalog["tasks"]
     robolab = environment == "robolab"
     if (
@@ -232,7 +240,7 @@ def write_catalog_tasks(args: argparse.Namespace, environment: str) -> None:
         rows,
         {
             "environment": environment,
-            "source": source.name,
+            "source": source_name,
             **{
                 k: catalog[k]
                 for k in ("source_revision", "source_metadata_sha256")
@@ -290,7 +298,12 @@ def main() -> None:
         "--robotwin-seeds", type=Path, help="RPent RoboTwin task/seed table"
     )
     mode.add_argument(
-        "--maniskill-catalog", type=Path, help="RPent RGB-D ManiSkill task catalog"
+        "--maniskill",
+        action="store_true",
+        help="Prepare RPent's default RGB-D ManiSkill tasks",
+    )
+    mode.add_argument(
+        "--maniskill-catalog", type=Path, help="Use a custom ManiSkill JSON catalog"
     )
     mode.add_argument("--robolab-catalog", type=Path, help="RPent RoboLab task catalog")
     parser.add_argument(
@@ -302,7 +315,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.metaworld:
         write_metaworld_tasks(args)
-    elif args.robolab_catalog or args.maniskill_catalog:
+    elif args.robolab_catalog or args.maniskill or args.maniskill_catalog:
         name = "RoboLab" if args.robolab_catalog else "ManiSkill"
         if args.seeds == "all":
             parser.error(
