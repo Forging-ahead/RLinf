@@ -114,7 +114,6 @@ class SGLangWorker(Worker):
         self._generation_outputs = {}
         self._cohort_fences = {}
         self._serverless_input_channel = None
-        self._serverless_stopping = False
         # The session-server data plane reads the weight version the
         # engines advertise in their responses, so every sync must also
         # write it to the engine.
@@ -961,7 +960,6 @@ class SGLangWorker(Worker):
         """Serve one model instance and retain request affinity across turns."""
         if not self._is_model_instance_entry:
             return
-        self._serverless_stopping = False
         self._serverless_input_channel = input_channel
         self._serverless_request_key = (
             self._placement.rollout_model_instance_id(self._rank)
@@ -980,8 +978,6 @@ class SGLangWorker(Worker):
                     fence.set()
                 continue
             await self._dispatch_gate.wait()
-            if self._serverless_stopping:
-                break
             reply_started = asyncio.Event()
             task = asyncio.create_task(
                 self.generate_and_send(
@@ -1077,18 +1073,3 @@ class SGLangWorker(Worker):
             "running": state.num_running_reqs,
             "queued": state.num_queue_reqs,
         }
-
-    async def stop_serverless(self) -> None:
-        """Cancel owned requests and release the channel consumer."""
-        if not self._is_model_instance_entry or self._serverless_input_channel is None:
-            return
-        self._serverless_stopping = True
-        self._dispatch_gate.set()
-        await self._serverless_input_channel.put(
-            None, key=self._serverless_request_key, async_op=True
-        ).async_wait()
-        for task in self._inflight_generates:
-            task.cancel()
-        if self._inflight_generates:
-            await asyncio.gather(*self._inflight_generates, return_exceptions=True)
-        self._inflight_generates.clear()

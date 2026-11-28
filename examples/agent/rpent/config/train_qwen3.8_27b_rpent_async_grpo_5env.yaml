@@ -7,20 +7,30 @@ hydra:
     dir: .
   output_subdir: null
 
-# 6-node (48x H100 80GB: h1..h5 + h7) Collocated Async GRPO for Qwen3.8-27B
-# across 5 RPent envs (LIBERO, RoboTwin, RoboDojo, RoboLab, MetaWorld) paired
-# with 1 dedicated 8-GPU Env+SAM3 node (h6, 172.27.60.49).
+# 6-node (48x 80GB H100) Collocated Async GRPO for Qwen3.8-27B across all 5 RPent
+# simulators (LIBERO, RoboTwin, RoboDojo, RoboLab, MetaWorld), paired with 1 dedicated
+# 8-GPU Env+SAM3 node (see RPent/tools/rl/sim_services_5env_h100.example.yaml).
 #
 # Batch & quota policy:
 # - rollout_batch_size = 32 groups, group_size = 4 => 128 trajectories/step
 # - Guaranteed per-env floor: 4 groups (16 trajectories) x 5 envs = 20 groups
 # - Remaining 12 groups: first-come-first-served (FCFS) across all 5 envs
 #
-# Parallelism:
+# Parallelism & worker sizing:
 # - Rollout (SGLang): TP=2 (24 independent NVLink replicas, ~29 GB weights/GPU,
-#   ~26 GiB headroom during collocated weight sync vs ~10 MiB at TP=1)
-# - Actor (Megatron): TP=4, SP=true, CP=2, PP=1 (8 GPUs = 1 full NVLink node per replica, DP=6 across 6 nodes)
-# - AgentLoop: 18 async workers (0-17) serving max_inflight_groups=36 (~2 groups/worker, 0% idle)
+#   ~26 GiB headroom during collocated weight sync vs ~10 MiB OOM at TP=1)
+# - Actor (Megatron): TP=4, SP=true, CP=2, PP=1 (8 GPUs = 1 full NVLink node per
+#   replica, DP=6 across 6 nodes; uneven-DP load balance + CP-aligned dummy rows)
+# - AgentLoop: 18 async workers (0-17) <= max_inflight_groups=36 (~2 groups/worker,
+#   0% idle, preventing Gloo recv timeouts on idle workers)
+#
+# Required runtime environment variables (set in launch script):
+#   RPENT_ROOT        Shared workspace root containing repos/, envs/, data/, models/, runs/
+#   RPENT_ENV_HOST    IP/hostname of the dedicated 5-env simulator + SAM3 node
+#   RPENT_MODEL_PATH  Optional override for model checkpoint (default: ${RPENT_ROOT}/models/Qwen3.8-27B)
+#   NCCL_IB_HCA       Optional RDMA HCA list (e.g. mlx5_0,mlx5_1,...); omitted when unset
+#   NCCL_IB_GID_INDEX Optional RoCEv2 GID index; omitted when unset
+#   NCCL_CROSS_NIC    Optional NCCL cross-NIC setting; omitted when unset
 
 cluster:
   num_nodes: 6
@@ -35,7 +45,7 @@ runner:
   synchronous: false
   async_mode: true
   experiment_name: rpent-qwen3.8-27b-async-grpo-5env-v2
-  output_dir: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/runs
+  output_dir: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/runs
   logger:
     log_path: ${runner.output_dir}/${runner.experiment_name}
     project_name: rlinf
@@ -112,28 +122,28 @@ data:
 env:
   rpent:
     libero:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28561
-      train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/libero/train.jsonl
+      endpoint: http://${oc.env:RPENT_ENV_HOST,127.0.0.1}:28561
+      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/libero/train.jsonl
       rollout_episodes: 16    # floor: 4 groups x 4 episodes
       sampling_episodes: 40   # max inflight: 10 groups x 4 episodes
     robotwin:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28562
-      train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robotwin/train.jsonl
+      endpoint: http://${oc.env:RPENT_ENV_HOST,127.0.0.1}:28562
+      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/robotwin/train.jsonl
       rollout_episodes: 16
       sampling_episodes: 32   # max inflight: 8 groups x 4 episodes
     robodojo:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28563
-      train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robodojo/train.jsonl
+      endpoint: http://${oc.env:RPENT_ENV_HOST,127.0.0.1}:28563
+      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/robodojo/train.jsonl
       rollout_episodes: 16
       sampling_episodes: 16   # max inflight: 4 groups x 4 episodes
     robolab:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28564
-      train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robolab/train.jsonl
+      endpoint: http://${oc.env:RPENT_ENV_HOST,127.0.0.1}:28564
+      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/robolab/train.jsonl
       rollout_episodes: 16
       sampling_episodes: 16   # max inflight: 4 groups x 4 episodes
     metaworld:
-      endpoint: http://${oc.env:RPENT_ENV_HOST,172.27.60.49}:28565
-      train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/metaworld/ml45-train.jsonl
+      endpoint: http://${oc.env:RPENT_ENV_HOST,127.0.0.1}:28565
+      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/metaworld/ml45-train.jsonl
       rollout_episodes: 16
       sampling_episodes: 40   # max inflight: 10 groups x 4 episodes
 
@@ -184,14 +194,14 @@ agentloop:
   max_infra_retries: 3
   max_infra_retry_rate: 1.0
   env_vars:
-    PYTHONPATH: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/envs/rl-overlay:${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/repos/RLinf:${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/repos/RPent:/opt/venv/reason/Megatron-LM
+    PYTHONPATH: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/envs/rl-overlay:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/repos/RLinf:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/repos/RPent:/opt/venv/reason/Megatron-LM
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
-    LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
-    RLINF_TIMEOUT: "201600"
+    LD_LIBRARY_PATH: ${oc.env:RPENT_LD_LIBRARY_PATH,/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64}
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     HF_HUB_OFFLINE: "1"
     TRANSFORMERS_OFFLINE: "1"
-    NO_PROXY: 127.0.0.1,localhost,172.27.0.0/16,10.211.0.0/16
+    NO_PROXY: ${oc.env:NO_PROXY,'127.0.0.1,localhost'}
 
 tools:
   rpent:
@@ -212,7 +222,7 @@ rollout:
   gpu_memory_utilization: 0.85
   pause_mode: retract
   model:
-    model_path: ${oc.env:RPENT_MODEL_PATH,/mnt/public/xzxuan/models/Qwen3.8-27B}
+    model_path: ${oc.env:RPENT_MODEL_PATH,${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/models/Qwen3.8-27B}
     model_type: qwen3_5
     precision: bf16
   enforce_eager: true
@@ -246,21 +256,21 @@ rollout:
   validate_save_dir: null
   print_outputs: false
   env_vars:
-    PYTHONPATH: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/envs/rl-overlay:${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/repos/RLinf:${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/repos/RPent:/opt/venv/reason/Megatron-LM
+    PYTHONPATH: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/envs/rl-overlay:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/repos/RLinf:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/repos/RPent:/opt/venv/reason/Megatron-LM
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
-    LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
-    RLINF_TIMEOUT: "201600"
+    LD_LIBRARY_PATH: ${oc.env:RPENT_LD_LIBRARY_PATH,/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64}
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
     SGLANG_MM_BUFFER_SIZE_MB: "0"
     PYTORCH_ALLOC_CONF: expandable_segments:False
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     NCCL_MAX_CTAS: "8"
-    NCCL_SOCKET_IFNAME: eth0
-    GLOO_SOCKET_IFNAME: eth0
-    NCCL_IB_HCA: mlx5_20,mlx5_21,mlx5_22,mlx5_23,mlx5_24,mlx5_25,mlx5_26,mlx5_27
-    NCCL_IB_GID_INDEX: "5"
-    NCCL_CROSS_NIC: "0"
+    NCCL_SOCKET_IFNAME: ${oc.env:NCCL_SOCKET_IFNAME,eth0}
+    GLOO_SOCKET_IFNAME: ${oc.env:GLOO_SOCKET_IFNAME,eth0}
+    NCCL_IB_HCA: ${oc.env:NCCL_IB_HCA,null}
+    NCCL_IB_GID_INDEX: ${oc.env:NCCL_IB_GID_INDEX,null}
+    NCCL_CROSS_NIC: ${oc.env:NCCL_CROSS_NIC,null}
     HF_HUB_OFFLINE: "1"
     TRANSFORMERS_OFFLINE: "1"
 
@@ -369,18 +379,18 @@ actor:
   expect_multi_modal_inputs: true
   trim_right_padding: true
   env_vars:
-    PYTHONPATH: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/envs/rl-overlay:${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/repos/RLinf:${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/repos/RPent:/opt/venv/reason/Megatron-LM
+    PYTHONPATH: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/envs/rl-overlay:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/repos/RLinf:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/repos/RPent:/opt/venv/reason/Megatron-LM
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
-    LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
-    RLINF_TIMEOUT: "201600"
+    LD_LIBRARY_PATH: ${oc.env:RPENT_LD_LIBRARY_PATH,/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64}
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     PYTORCH_ALLOC_CONF: expandable_segments:False
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     NCCL_MAX_CTAS: "8"
-    NCCL_SOCKET_IFNAME: eth0
-    GLOO_SOCKET_IFNAME: eth0
-    NCCL_IB_HCA: mlx5_20,mlx5_21,mlx5_22,mlx5_23,mlx5_24,mlx5_25,mlx5_26,mlx5_27
-    NCCL_IB_GID_INDEX: "5"
-    NCCL_CROSS_NIC: "0"
+    NCCL_SOCKET_IFNAME: ${oc.env:NCCL_SOCKET_IFNAME,eth0}
+    GLOO_SOCKET_IFNAME: ${oc.env:GLOO_SOCKET_IFNAME,eth0}
+    NCCL_IB_HCA: ${oc.env:NCCL_IB_HCA,null}
+    NCCL_IB_GID_INDEX: ${oc.env:NCCL_IB_GID_INDEX,null}
+    NCCL_CROSS_NIC: ${oc.env:NCCL_CROSS_NIC,null}
     HF_HUB_OFFLINE: "1"
     TRANSFORMERS_OFFLINE: "1"

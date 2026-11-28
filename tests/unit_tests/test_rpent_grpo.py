@@ -623,8 +623,8 @@ def test_trajectory_level_replica_affinity_balances_evenly() -> None:
     assert dict(counts) == dict.fromkeys(range(8), 36)
 
 
-def test_rpent_a100_sync_and_async_configs_resolve_and_validate(monkeypatch) -> None:
-    """Verify both A100 LIBERO benchmark configs resolve and pass collocated async validation."""
+def test_rpent_sync_and_async_configs_resolve_and_validate(monkeypatch) -> None:
+    """Verify Harness v2 sync, 4B async, and 27B 5-env async configs resolve and validate."""
     from pathlib import Path
     from types import SimpleNamespace
 
@@ -634,39 +634,78 @@ def test_rpent_a100_sync_and_async_configs_resolve_and_validate(monkeypatch) -> 
 
     cfg_dir = Path(__file__).parents[2] / "examples/agent/rpent/config"
     with initialize_config_dir(config_dir=str(cfg_dir), version_base="1.1"):
-        sync_cfg = compose(config_name="train_qwen3.5_4b_rpent_grpo_a100_libero_sync")
-        async_cfg = compose(config_name="train_qwen3.5_4b_rpent_grpo_a100_libero_async")
+        sync_cfg = compose(config_name="train_qwen3.5_4b_rpent_grpo")
+        async_4b_cfg = compose(config_name="train_qwen3.5_4b_rpent_async_grpo")
+        sync_5env_cfg = compose(config_name="train_qwen3.5_4b_rpent_grpo_5env")
+        async_27b_cfg = compose(config_name="train_qwen3.8_27b_rpent_async_grpo_5env")
 
     assert sync_cfg.runner.synchronous is True
-    assert sync_cfg.runner.async_mode is False
-    assert sync_cfg.data.rollout_batch_size == 4
-    assert sync_cfg.data.sampling_batch_size == 6
-    assert sync_cfg.algorithm.recompute_logprobs is False
-    assert sync_cfg.algorithm.importance_sampling_fix is False
+    assert sync_cfg.agentloop.history_compaction.strategy == "dynamic"
+    assert sync_cfg.tools.rpent.include_jaw_mm is True
+    assert sync_cfg.tools.rpent.image_size is None
+    assert len(mixed_simulators(sync_5env_cfg)) == 5
 
-    assert async_cfg.runner.synchronous is False
-    assert async_cfg.runner.async_mode is True
-    assert async_cfg.rollout.pause_mode == "retract"
-    assert async_cfg.rollout_buffer.max_inflight_groups == 6
-    assert async_cfg.rollout_buffer.max_buffered_groups == 12
-    assert async_cfg.agentloop.max_actor_accept_staleness == 3
+    assert async_4b_cfg.runner.synchronous is False
+    assert async_4b_cfg.runner.async_mode is True
+    assert async_4b_cfg.rollout.pause_mode == "retract"
+    assert async_4b_cfg.rollout_buffer.max_inflight_groups == 6
+    assert async_4b_cfg.rollout_buffer.max_buffered_groups == 12
+    assert async_4b_cfg.agentloop.max_actor_accept_staleness == 3
 
-    fake_placement = SimpleNamespace(
-        is_collocated=True,
-        is_disaggregated=False,
-        placement_mode=SimpleNamespace(name="COLLOCATED"),
-        rollout_num_model_instances=4,
-        actor_dp_size=2,
-    )
+    assert async_27b_cfg.runner.synchronous is False
+    assert async_27b_cfg.runner.async_mode is True
+    assert async_27b_cfg.rollout.tensor_parallel_size == 2
+    assert async_27b_cfg.actor.model.tensor_model_parallel_size == 4
+    assert async_27b_cfg.actor.model.context_parallel_size == 2
+    assert async_27b_cfg.data.rollout_batch_size == 32
+    assert async_27b_cfg.algorithm.group_size == 4
+    assert async_27b_cfg.rollout_buffer.max_inflight_groups == 36
+    assert async_27b_cfg.cluster.component_placement.agentloop == "0-17"
+    assert str(async_27b_cfg.agentloop.env_vars.RLINF_TIMEOUT) == "201600"
+    assert len(mixed_simulators(async_27b_cfg)) == 5
+
+    # Verify optional RDMA env vars are cleanly omitted when unset and forwarded when set
+    import importlib.util
+
+    train_path = Path(__file__).parents[2] / "examples/agent/rpent/train.py"
+    spec = importlib.util.spec_from_file_location("rpent_train_entry", train_path)
+    assert spec is not None and spec.loader is not None
+    train_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_mod)
+    _env_vars = train_mod._env_vars
+
+    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
+    resolved_unset = _env_vars(async_27b_cfg.rollout)
+    assert resolved_unset is not None
+    assert "NCCL_IB_HCA" not in resolved_unset
+    monkeypatch.setenv("NCCL_IB_HCA", "mlx5_0,mlx5_1")
+    with initialize_config_dir(config_dir=str(cfg_dir), version_base="1.1"):
+        async_27b_with_hca = compose(config_name="train_qwen3.8_27b_rpent_async_grpo_5env")
+    assert _env_vars(async_27b_with_hca.rollout)["NCCL_IB_HCA"] == "mlx5_0,mlx5_1"
+
     monkeypatch.setattr(cfg_mod, "Cluster", lambda *a, **k: None)
-    monkeypatch.setattr(
-        cfg_mod, "ModelParallelComponentPlacement", lambda *a, **k: fake_placement
-    )
     monkeypatch.setattr(cfg_mod, "version", lambda _name: "0.5.12.post1")
-    cfg_mod.validate_rpent_async_cfg(async_cfg)
+
+    for cfg_obj, replicas, dp_size in (
+        (async_4b_cfg, 4, 2),
+        (async_27b_cfg, 24, 6),
+    ):
+        fake_placement = SimpleNamespace(
+            is_collocated=True,
+            is_disaggregated=False,
+            placement_mode=SimpleNamespace(name="COLLOCATED"),
+            rollout_num_model_instances=replicas,
+            actor_dp_size=dp_size,
+        )
+        monkeypatch.setattr(
+            cfg_mod,
+            "ModelParallelComponentPlacement",
+            lambda *a, _p=fake_placement, **k: _p,
+        )
+        cfg_mod.validate_rpent_async_cfg(cfg_obj)
 
     # Reject non-retract pause_mode in collocated async mode
-    bad_cfg = OmegaConf.create(OmegaConf.to_container(async_cfg, resolve=False))
+    bad_cfg = OmegaConf.create(OmegaConf.to_container(async_4b_cfg, resolve=False))
     bad_cfg.rollout.pause_mode = "in_place"
     with pytest.raises(ValueError, match="pause_mode=retract"):
         cfg_mod.validate_rpent_async_cfg(bad_cfg)
@@ -1364,8 +1403,6 @@ def test_uneven_dp_pad_rows_balance_and_loss_normalization(monkeypatch) -> None:
         [120, 80],
     ]
     # Simulate all 6 ranks in-process with a shared in-memory all_to_all buffer
-    # First pass: collect outgoing payloads from each rank
-    sent_payloads: list[list[bytes]] = [[b""] * world_size for _ in range(world_size)]
     rank_results = [
         [SimpleNamespace(input_ids=[list(range(c))], tag=(r, i)) for i, c in enumerate(costs)]
         for r, costs in enumerate(per_rank_costs)

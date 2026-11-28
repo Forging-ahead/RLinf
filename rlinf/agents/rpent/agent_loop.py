@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""In-process RPent multi-turn agent loop with synchronous oversampling."""
+"""In-process RPent multi-turn agent loop for sync oversampling and async GRPO."""
 
 from __future__ import annotations
 

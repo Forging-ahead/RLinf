@@ -1,0 +1,49 @@
+# Single-node (8-GPU: 4 RL + 4 Sim/SAM3) Collocated Async GRPO overlay for Qwen3.5-4B (Harness v2).
+defaults:
+  - train_qwen3.5_4b_rpent_grpo
+  - _self_
+
+runner:
+  synchronous: false
+  async_mode: true
+  experiment_name: rpent-qwen3.5-4b-async-grpo-v2
+  max_steps: 100
+
+algorithm:
+  recompute_logprobs: false
+  importance_sampling_fix: false
+
+data:
+  rollout_batch_size: 4
+  sampling_batch_size: 6
+
+env:
+  rpent:
+    libero:
+      endpoint: ${oc.env:LIBERO_POOL_URL,http://127.0.0.1:28561}
+      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/libero/train.jsonl
+      rollout_episodes: 16
+      sampling_episodes: 24
+    robotwin:
+      endpoint: ${oc.env:ROBOTWIN_POOL_URL,http://127.0.0.1:28562}
+      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/robotwin/train.jsonl
+      rollout_episodes: 16
+      sampling_episodes: 24
+
+agentloop:
+  task_name: rpent
+  max_actor_accept_staleness: 3
+
+rollout:
+  pause_mode: retract
+
+rollout_buffer:
+  max_inflight_groups: 6
+  max_buffered_groups: 12
+  max_dropped_groups_per_step: 40
+  min_groups_per_task:
+    libero: 2
+    robotwin: 2
+  max_inflight_per_task:
+    libero: 3
+    robotwin: 3

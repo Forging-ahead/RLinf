@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dedicated synchronous GRPO runner with oversampling for RPent."""
+"""Synchronous (oversampling) and asynchronous GRPO runners for RPent."""
 
 from __future__ import annotations
 
@@ -182,12 +182,6 @@ class RPentGRPORunner(AgentRunner):
 
     def _sampling_batch_size(self) -> int:
         return sampling_batch_size(self.cfg)
-
-    def _uses_oversampling(self) -> bool:
-        return (
-            bool(self.simulators)
-            or self._sampling_batch_size() > self.cfg.data.rollout_batch_size
-        )
 
     def _build_dataloader(self, train_dataset, val_dataset, collate_fn=None):
         if collate_fn is None:

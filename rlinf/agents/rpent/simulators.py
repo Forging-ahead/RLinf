@@ -49,10 +49,6 @@ def episode_task(answer: str | list[str]) -> dict:
     return json.loads(answer[0])
 
 
-def simulator_for_answer(answer: str | list[str]) -> str:
-    return str(episode_task(answer)["environment"])
-
-
 def mixed_simulators(cfg: DictConfig) -> dict[str, SimulatorSpec]:
     """Parse ``env.rpent`` simulator pools and validate rollout/sampling group quotas.
 

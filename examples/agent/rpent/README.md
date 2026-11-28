@@ -1,216 +1,199 @@
-# RPent Multi-Turn Embodied GRPO Training
+# RPent Multi-Turn Embodied GRPO Training (Harness v2)
 
-This example trains a 4B Vision-Language-Action reasoning model (Qwen3.5-4B) with synchronous multi-turn GRPO and oversampling across multiple manipulation simulators (LIBERO and RoboTwin, with extensible registry support for RoboCasa, RoboDojo and MetaWorld) served by [RPent](https://github.com/RLinf/RPent).
+This example trains Vision-Language-Action reasoning models (`Qwen3.5-4B` through `Qwen3.8-27B`) with **synchronous oversampled GRPO** or **collocated asynchronous GRPO** across up to 5 manipulation simulators (`libero`, `robotwin`, `robodojo`, `robolab`, `metaworld`; plus `robocasa`) served by [RPent](https://github.com/RLinf/RPent).
 
-## Architecture
-
-```
-                     ┌──────────────────────────────────────────────────────────┐
-                     │            8-GPU Single-Node Layout                      │
-                     ├────────────────────────────┬─────────────────────────────┤
-                     │ GPUs 0–3 (Pure-RL Image)   │ GPUs 4–7 (Isolated Venvs)   │
-                     │                            │                             │
-                     │ • RPentGRPORunner          │ • SAM3 Pool (envs/sam3)     │
-                     │ • MegatronActor (DP/TP)    │     1 server/GPU + router   │
-                     │ • SGLang Rollout (DP=4)    │ • LIBERO Pool (envs/libero) │
-                     │   + External Qwen-VL       │     16 warm EGL workers     │
-                     │     Capture Processor      │ • RoboTwin Pool             │
-                     │ • RPentAgentLoopWorker     │     (envs/robotwin)         │
-                     │   (async tool loop)        │     16 warm SAPIEN workers  │
-                     └────────────────────────────┴─────────────────────────────┘
-```
+## Architecture & Config Matrix
 
 ### Core Modules
 
 | File | Responsibility |
 | :--- | :--- |
-| `rlinf/runners/rpent_runner.py` | Dedicated `RPentGRPORunner` implementing Sync GRPO + oversampling, dynamic cohort scheduling, and startup `validate_sim_pool_capacity()` checks. |
-| `rlinf/agents/rpent/agent_loop.py` | Async multi-turn tool-calling agent loop (`RPentAgentLoopWorker`), binary `/execute` HTTP client, validation retries, and infra retry handling. |
-| `rlinf/agents/rpent/history.py` | `EpisodeConversation` + `AppendOnlyHistory` (Pydantic-AI–compatible compaction, token-ID prefix caching, prefix-chain merging for Megatron training) using zero-Base64 raw `bytes` references. |
-| `rlinf/agents/rpent/simulators.py` | Multi-simulator registry, task JSONL parsing, and balanced per-domain sampling quotas. |
-| `rlinf/hybrid_engines/sglang/multimodal/qwen_vl.py` | External SGLang multimodal processor (`SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`) with LRU image-tensor caching — **zero SGLang source patches**. |
-| `rlinf/hybrid_engines/sglang/multimodal/replay.py` | Local tmpfs image staging (`stage_local_images`) + safetensors replay payload capture for exact Megatron vision-input reconstruction. |
-| `rlinf/hybrid_engines/megatron/qwen_vl_inputs.py` | Qwen3.5 VL multimodal input assembly for Megatron forward/backward without modifying Megatron-LM sources. |
-| `examples/agent/rpent/config/train_qwen3.5_4b_rpent_grpo.yaml` | 8-GPU Sync GRPO + oversampling config (`seq_length=262144`, `max_turns=50`, `max_new_tokens=16384`, `group_size=8`). |
-| `examples/agent/rpent/config/train_qwen3.5_4b_rpent_grpo_48gpu.yaml` | 48-GPU cross-cluster Sync GRPO config (`32 × 8` oversampled to `384`, early per-simulator straggler cancellation, collocated `/pool/{sleep,wake}`, `max_fraction=0.25`). |
+| `rlinf/runners/rpent_runner.py` | `RPentGRPORunner` (sync GRPO + oversampling + early straggler cancellation + collocated `/pool/{sleep,wake}`) and `RPentAsyncGRPORunner` (collocated/disaggregated async GRPO + startup capacity validation + per-step audit JSONs). |
+| `rlinf/workers/rollout_buffer/rollout_buffer_worker.py` | Asynchronous `RolloutBuffer` with per-env guaranteed floor (`min_groups_per_task`), per-env concurrency caps (`max_inflight_per_task`), FCFS surplus filling, staleness filtering, and multi-task dataloader checkpointing. |
+| `rlinf/agents/rpent/agent_loop.py` | Async multi-turn tool-calling agent loop (`RPentAgentLoopWorker`), binary `/open` & `/execute` HTTP client, validation retries, and typed infra-retry accounting. |
+| `rlinf/agents/rpent/history.py` | Harness v2 `EpisodeConversation` (`base` / `dynamic` compaction preserving opening images) + `AppendOnlyHistory` (token-ID prefix caching + prefix-chain merging for Megatron training) using zero-Base64 raw `bytes`. |
+| `rlinf/agents/rpent/simulators.py` | Multi-simulator registry, task JSONL parsing, and balanced per-domain sync/async quotas (`mixed_simulators`). |
+| `rlinf/hybrid_engines/sglang/multimodal/{qwen_vl,replay}.py` | External SGLang multimodal processor (`SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`) with O(1) LRU image-tensor caching, content-addressed tmpfs image staging, and safetensors replay payload capture — **zero SGLang source patches**. |
+| `rlinf/hybrid_engines/megatron/qwen_vl_inputs.py` | Exact Qwen-VL multimodal input assembly for Megatron forward/backward without modifying Megatron-LM sources. |
 
-## Key Optimizations
+### Available Harness v2 Configs (`examples/agent/rpent/config/`)
 
-1. **Zero engine patches & isolated environments**:
-   - No source modifications to Megatron-LM or SGLang; SGLang loads `rlinf.hybrid_engines.sglang.multimodal` via `SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`, and Qwen3.5 GDN `out_norm` weights are converted cleanly in `Qwen35Convertor` (with fp32 `+1.0` promotion before bf16 cast).
-   - The RL training container remains pure-RL (only `fla-core` for Megatron Qwen3.5 `GatedDeltaNet`), while `sam3`, `libero`, and `robotwin` each run in their own isolated virtual environment.
-2. **Full oversampling concurrency with startup validation**:
-   - `tools.rpent.episodes_per_worker: null` removes client-side semaphore throttling when simulator pools are sized to `sampling_batch_size × group_size` (e.g., 16 LIBERO + 16 RoboTwin = 32 concurrent episodes).
-   - `RPentGRPORunner` queries every simulator `/health` endpoint before step 0 and fails fast if resident workers are below the oversampling quota.
-3. **Deferred simulator rendering**:
-   - Training runs with `tools.rpent.record_artifacts: false`, disabling per-physics-step offscreen RGB-D rendering in LIBERO and RoboTwin while preserving `record_artifacts: true` for evaluation video capture.
-4. **End-to-end zero-Base64 image pipeline**:
-   - Binary `/sessions/open` and `/sessions/{sid}/execute` HTTP framing streams raw PNG bytes (including `step=0` opening images and `execute_actions(..., observe=...)` captures) from RPent to `RPentAgentLoopWorker`.
-   - `EpisodeConversation` and `AppendOnlyHistory` keep lightweight `rpent-image://<fid>` placeholders and reuse raw `bytes` by reference without deep copies.
-   - `stage_local_images()` stages each unique PNG once by content hash to local tmpfs (`/tmp/rlinf-mm-imgs-<pid>/`) so SGLang receives file paths instead of repeated multi-megabyte Base64 JSON payloads.
-5. **Harness v2 joint 5-env support (`train_qwen3.5_4b_rpent_grpo_5env.yaml`)**:
-   - `tools.rpent.image_size: null` applies per-environment defaults (`libero`/`robocasa`/`metaworld`: `512×512`, `robolab`: `768×432`, `robotwin`/`robodojo`: native) while keeping native RGB-D for SAM3 and back-projection.
-   - `tools.rpent.include_jaw_mm: true|false` toggles physical inner-pad gripper clearance (`jaw_mm`) across all 6 simulators.
-   - `agentloop.history_compaction.strategy: dynamic` preserves opening images and full tool/action text while pruning older intermediate images and older `reasoning_content` in a single batch (triggering a clean `AppendOnlyHistory` `chain_id` transition with RadixCache reuse thereafter).
+| Config | Model / Scale | Mode | Simulators | Key Parallelism & Batching |
+| :--- | :--- | :--- | :--- | :--- |
+| `train_qwen3.8_27b_rpent_async_grpo_5env.yaml` | **27B** (`6` RL nodes = `48× H100` + `1` dedicated 8-GPU Env node) | **Collocated Async GRPO** | All 5 (`libero`, `robotwin`, `robodojo`, `robolab`, `metaworld`) | Rollout `TP=2` (24 replicas), Actor `TP=4, SP=true, CP=2, DP=6`, `agentloop=0-17`, `bs=32 × G=4 = 128` (`4`/env floor + `12` FCFS) |
+| `train_qwen3.5_4b_rpent_grpo.yaml` | **4B** (`1` node: GPUs `0–3` RL, `4–7` Sim/SAM3) | Sync GRPO + oversampling | `libero`, `robotwin` | Rollout `TP=1` (4 replicas), Actor `TP=2, SP=true, DP=2`, `bs=2 × G=8` (oversampled `4 × 8`) |
+| `train_qwen3.5_4b_rpent_async_grpo.yaml` | **4B** (`1` node: GPUs `0–3` RL, `4–7` Sim/SAM3) | Collocated Async GRPO | `libero`, `robotwin` | Overlay on `train_qwen3.5_4b_rpent_grpo`: `pause_mode=retract`, `max_inflight=6`, `bs=4 × G=8` |
+| `train_qwen3.5_4b_rpent_grpo_5env.yaml` | **4B** (Sync 5-Env) | Sync GRPO + oversampling | All 5 | Overlay on `train_qwen3.5_4b_rpent_grpo`: `bs=5 × G=8` (`1` group/env, oversampled `10 × 8`) |
+| `train_qwen3.5_4b_rpent_grpo_48gpu.yaml` | **4B** (`4` RL nodes = `32× H100` + dedicated Sim nodes) | Sync GRPO + oversampling | `libero`, `robotwin` | Rollout `TP=1` (32 replicas), Actor `TP=2, DP=16`, `32 × 8` oversampled `48 × 8 = 384`, early straggler cancel, collocated `/pool/{sleep,wake}` |
+| `train_qwen3.5_4b_rpent_robolab_smoke.yaml` | **4B** (`4` RL GPUs smoke test) | Sync GRPO | `robolab`, `robotwin` | `max_steps=1`, `bs=2 × G=2`, `seq_length=16384` |
+
+## Harness v2 Protocol Highlights (F1–F5)
+
+1. **Zero engine patches & end-to-end zero-Base64 binary image pipeline**:
+   - SGLang loads `rlinf.hybrid_engines.sglang.multimodal` via `SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE` (zero Megatron/SGLang source edits).
+   - Binary `/sessions/open` and `/sessions/{sid}/execute` frames stream raw PNG `bytes` directly to `RPentAgentLoopWorker`; `stage_local_images()` writes each unique image once to local tmpfs by content hash.
+2. **Compact feedback (F1)**: `coordinates` and `position_unit` are emitted only on `initial_observation` and on `frame_version` changes; `execute_actions` returns compact per-item results plus one top-level `final_state`.
+3. **Per-env default display resolution (F2)**: Setting `tools.rpent.image_size: null` displays `512×512` (`libero`/`robocasa`/`metaworld`), `768×432` (`robolab`), and native (`robotwin` `320×240`, `robodojo` `640×480`) while retaining native RGB-D for SAM3 and back-projection.
+4. **Physical gripper `jaw_mm` (F3)**: `tools.rpent.include_jaw_mm: true` exposes measured inner-pad clearance in millimetres across all 6 simulators.
+5. **Dynamic batch compaction (F4)**: `agentloop.history_compaction.strategy: dynamic` strips older intermediate images (`[image omitted]`) and older assistant `reasoning_content` at the token high-water mark while preserving `messages[0]` (including step=0 opening images) and full tool/action text, cleanly advancing `AppendOnlyHistory.chain_id` with RadixCache reuse afterward.
+6. **Step-0 opening images & `execute_actions(..., observe=...)` (F5)**: `POST /sessions/open` returns step=0 all-camera views immediately; `execute_actions` supports `observe="none" | "all" | <camera>` to save an extra `view_env` turn when post-action visual feedback is needed.
+
+---
 
 ## Quick Start
 
-### 1. Prepare Task JSONL Files
+### 1. Prepare Task JSONL Pools
 
 ```bash
+# LIBERO (pro)
 python examples/agent/rpent/prepare_tasks.py \
-  --libero-out /path/to/data/libero/train.jsonl \
-  --robotwin-out /path/to/data/robotwin/train.jsonl
-```
+  --output-dir "${RPENT_ROOT}/data/libero"
 
-In the MetaWorld Python 3.11 environment, with both repositories on `PYTHONPATH`, prepare the MT50, ML45 train and ML45 held-out pools for native index 49 under `${RPENT_ROOT}/data/metaworld`:
-
-```bash
+# RoboTwin (from RPent task/seed table)
 python examples/agent/rpent/prepare_tasks.py \
-  --metaworld \
-  --seeds 49 \
-  --output-dir "${RPENT_ROOT:-/path/to/rpent_ppo}/data/metaworld"
+  --robotwin-seeds /path/to/robotwin_seed_table.json \
+  --output-dir "${RPENT_ROOT}/data/robotwin"
+
+# MetaWorld (run inside MetaWorld Python 3.11 venv with RPent + RLinf on PYTHONPATH)
+python examples/agent/rpent/prepare_tasks.py \
+  --metaworld --seeds 0-49 \
+  --output-dir "${RPENT_ROOT}/data/metaworld"
+
+# RoboLab (from RPent/robots/robolab/task_catalog.json)
+python examples/agent/rpent/prepare_tasks.py \
+  --robolab-catalog "${RPENT_ROOT}/repos/RPent/robots/robolab/task_catalog.json" \
+  --seeds 0-9 \
+  --output-dir "${RPENT_ROOT}/data/robolab"
 ```
 
-To mix MetaWorld into the 8-GPU GRPO config (`train_qwen3.5_4b_rpent_grpo.yaml`, which sets `rollout_batch_size: 2`, `sampling_batch_size: 4`, `group_size: 8` → `16` rollout / `32` sampling episodes total), **replace** the default `env.rpent` block (`libero` + `robotwin`) with the `libero` + `metaworld` block below (do not merge it on top of `robotwin` without adjusting `rollout_episodes` / `sampling_episodes` so they still sum to `16` / `32`), and launch the RPent MetaWorld pool with at least `--workers 16` (matching `sampling_episodes: 16`) so startup capacity validation passes:
+> **RoboDojo task JSONLs**: Ensure every RoboDojo manifest uses `seed ∈ {0, 1, 2}` (selects the `Eval_Layout/RoboDojo/arx_x5/<seed>/` directory) and `layout ∈ [0..19]` (selects `<task>_<layout>.json`). Swapping `seed` and `layout` causes immediate session-open failure.
 
-```yaml
-env:
-  rpent:
-    libero:
-      endpoint: http://127.0.0.1:28561
-      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/libero/train.jsonl
-      rollout_episodes: 8
-      sampling_episodes: 16
-    metaworld:
-      endpoint: http://127.0.0.1:28565
-      train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/metaworld/ml45-train.jsonl
-      rollout_episodes: 8
-      sampling_episodes: 16
-```
+### 2. Start Simulator & SAM3 Services
 
-> **MetaWorld runtime notes**: RPent clamps `max_episode_steps` to MetaWorld's native **500-step horizon** regardless of larger requested values. MetaWorld's fixed-wrist Sawyer enforces a strict **4-DoF `move_to` schema (`xyz`-only)** — passing `orientation_rpy` triggers a validation retry with MetaWorld's 4-DoF hint, while observations still report the calibrated live `pose.orientation_rpy`.
-
-### 2. Start Simulator & SAM3 Services (GPUs 4–7)
-
-Using the RPent service supervisor (see `RPent/robots/rl/README.md` and `RPent/tools/rl/sim_services.example.yaml`):
+See `RPent/robots/rl/README.md` and `RPent/tools/rl/sim_services_5env_h100.example.yaml` (for 5-env 27B) or `RPent/tools/rl/sim_services.example.yaml` (for 8-GPU 4B):
 
 ```bash
-PYTHONPATH=/path/to/RPent:/path/to/RLinf \
-  python /path/to/RPent/tools/rl/serve.py --config /path/to/sim_services.yaml
+ulimit -n 1048576
+PYTHONPATH="${RPENT_ROOT}/repos/RPent" \
+  python "${RPENT_ROOT}/repos/RPent/tools/rl/serve.py" \
+  --config /path/to/sim_services_5env_h100.yaml
 ```
 
-### 3. Launch 8-GPU Sync GRPO Training (GPUs 0–3)
+### 3. Launch 6-Node 27B 5-Env Collocated Async GRPO
+
+Start a 6-node (`48× H100`) Ray cluster pinning the control-plane interface (`--node-ip-address=<control_ip>`) and `ulimit -n 1048576`, then run on the head node:
 
 ```bash
-bash examples/agent/rpent/run_train.sh \
-  runner.experiment_name=rpent-qwen3.5-4b-grpo \
-  runner.max_steps=100 \
-  data.seed=42
-```
-
-For a 1-step smoke test verifying weight sync, full 32-episode concurrency, and Megatron GRPO update:
-
-```bash
-bash examples/agent/rpent/run_train.sh \
-  runner.experiment_name=rpent-qwen3.5-4b-grpo-smoke \
-  runner.max_steps=1 \
-  data.seed=42
-```
-
-> **Note on CUDA IPC weight sync (driver 535.x)**: `actor.env_vars` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` and `PYTORCH_ALLOC_CONF=expandable_segments:False` so `storage._share_cuda_()` succeeds across Actor→Rollout IPC transfers.
-
-## 48-GPU Cross-Cluster Training (`train_qwen3.5_4b_rpent_grpo_48gpu.yaml`)
-
-For large-scale synchronous GRPO (`rollout_batch_size=32`, `sampling_batch_size=48`, `group_size=8` → **384 concurrent oversampled episodes**: 24 LIBERO + 24 RoboTwin groups, taking the fastest 16 complete groups per simulator), RLinf coordinates a 4-node / 32-GPU Ray cluster with multi-node RPent `SimPoolRouter` frontends spanning heterogeneous H100 and A100 clusters.
-
-### Reference 48-GPU Topology (5× H100 + 1× A100 via Jump Host)
-
-| Node | Role | Per-GPU Allocation | Node Total |
-| :--- | :--- | :--- | :--- |
-| `h100` (8× H100) | Dedicated Sim + SAM3 (`sleepable: false`) | `4 LIBERO + 6 RoboTwin + 2 SAM3` | `32 LIBERO + 48 RoboTwin + 16 SAM3` |
-| `h100_1`–`h100_4` (32× H100) | Ray RL Cluster + Collocated Sim (`sleepable: true`) | `5 LIBERO + 2 RoboTwin` + SGLang (`DP=32`) / Megatron (`TP=2, DP=16`) | `160 LIBERO + 64 RoboTwin + 32 RL` |
-| `a100` (8× A100) | Remote Dedicated Sim + SAM3 (`sleepable: false`, bridged via jump-host SSH tunnel) | `10 RoboTwin + 1 SAM3` | `80 RoboTwin + 8 SAM3` |
-| **Total (48 GPUs)** | | | **192 LIBERO + 192 RoboTwin + 24 SAM3 (queue=2048) + 32 RL GPUs** |
-
-### Multi-Node Features & Launch
-
-1. **Early per-simulator straggler cancellation**: As soon as either simulator meets its `rollout_episodes / group_size` quota (16 complete groups), `RPentGRPORunner` immediately calls `RPentAgentLoopWorker.cancel_candidate_ids()` to abort unselected stragglers in that domain, freeing SGLang KV/Mamba cache and GPU compute for the other domain.
-2. **Collocated pool sleep/wake lifecycle**: With `tools.rpent.sleep_sim_pools_during_training: true`, `RPentGRPORunner` invokes `POST /pool/sleep` on every router before Megatron `recompute_logprobs` + backward (`~8.8s`, freeing collocated H100 VRAM to `~5.5 GiB` while dedicated `h100`/`a100` nodes stay warm) and `POST /pool/wake` (`~20.6s`) after weight sync.
-3. **Long-tail context compression (`max_fraction: 0.25`)**: Compacts conversation history at 25% of the 262k window (`~65k` tokens) to bound late-turn prefill/decode tail latency across 384 concurrent rollouts.
-
-```bash
-# On each of the 4 RL nodes (set NODE_RANK=0..3 and ulimit -n 1048576):
-# Start Ray with --temp-dir=/tmp/rpent_ppo/ray (backed by /dev/shm/rpent_ppo)
-# Then launch from head node (h100_1):
 ulimit -n 1048576
 export RPENT_ROOT=/path/to/rpent_ppo
-export RPENT_LOCAL_CACHE=/tmp/rpent_ppo        # symlink -> /dev/shm/rpent_ppo
-export RPENT_ROUTER_HOST=<H100_HEAD_IP>
-export RAY_ADDRESS=<H100_HEAD_IP>:29710
-export NO_PROXY=127.0.0.1,localhost,<VPC_CIDR>
+export RPENT_ENV_HOST=<DEDICATED_SIM_NODE_IP>
+export RPENT_MODEL_PATH="${RPENT_ROOT}/models/Qwen3.8-27B"
+export RLINF_TIMEOUT=201600
+export RAY_ADDRESS="<HEAD_CONTROL_IP>:6379"
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+# Optional RDMA / RoCEv2 overrides (forwarded to workers when set, omitted when unset):
+# export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+# export NCCL_IB_GID_INDEX=5
+# export NCCL_CROSS_NIC=0
+export NO_PROXY="127.0.0.1,localhost,<CLUSTER_CIDR>"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+
+export PATH="/opt/venv/reason/bin:/usr/local/cuda/bin:${PATH}"
+export LD_LIBRARY_PATH="/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64"
+export PYTHONPATH="${RPENT_ROOT}/envs/rl-overlay:${RPENT_ROOT}/repos/RLinf:${RPENT_ROOT}/repos/RPent:/opt/venv/reason/Megatron-LM"
 
 python examples/agent/rpent/train.py \
-  --config-name train_qwen3.5_4b_rpent_grpo_48gpu
+  --config-name train_qwen3.8_27b_rpent_async_grpo_5env
 ```
 
-### Cross-Cluster Production Issues & Fixes
+For single-node 8-GPU 4B training (sync or async):
 
-The following issues were hit and resolved during 48-GPU cross-cluster bring-up and verified end-to-end across full Step 1 (`32/32` weight sync, `384/384` zero-queue concurrency, `17.97%` success rate, `retry=0.0`, `loss=0.0125`, `peak VRAM=79.2 GiB`):
+```bash
+RPENT_ROOT=/path/to/rpent_ppo RPENT_MODEL_PATH=/path/to/Qwen3.5-4B-SFT \
+  bash examples/agent/rpent/run_train.sh \
+  --config-name train_qwen3.5_4b_rpent_async_grpo \
+  runner.max_steps=100
+```
+
+---
+
+## General Engineering Guide: Scaling to 27B+ Multi-Node Multimodal Async GRPO
+
+The issues below are **general, recurring failure modes** when scaling multimodal embodied RL to 27B+ dense models across multi-node 80 GB GPUs and heterogeneous 5-simulator pools. Every fix below is built into `rpent-harness-v2`.
+
+### 1. Collocated Weight-Sync OOM at `Rollout TP=1`
+
+- **Symptom**: `torch.OutOfMemoryError` inside `sync_model_to_rollout` / `validate_weight_first_sync` (e.g., on `posi_norm` or reshard buffers) with `< 20 MiB` free VRAM on 80 GB H100s.
+- **Root Cause**: A 27B BF16 model takes `~54 GiB` of weights alone. During collocated weight sync, SGLang `TP=1` holds `~54.8 GiB` while Megatron Actor (`TP=4, CP=2`) simultaneously holds `~24.3 GiB` of sharded weights and resharding staging buffers (`79.1 / 79.2 GiB` peak).
+- **Fix & Rule of Thumb**: Use **`rollout.tensor_parallel_size: 2`** (NVLink pairs; `24` replicas across 48 GPUs) and bound `rollout.max_running_requests` (e.g. `12`). Halving rollout weight footprint to `~29 GiB`/GPU leaves **`~26 GiB` free headroom** during weight sync, doubles decode memory bandwidth, and expands KV/Mamba cache headroom for 64k-token multimodal rollouts.
+
+### 2. Long-Context 27B Actor Parallelism & Optimizer Sharding (`TP=4, SP=true, CP=2`)
+
+- **Symptom**: Megatron forward/backward OOM on 32k–64k multimodal sequences even with full activation recomputation.
+- **Root Cause**: At `CP=1`, both long-sequence activations and distributed optimizer states concentrate on fewer ranks.
+- **Fix & Rule of Thumb**: Match one Actor model-parallel replica to one 8-GPU NVLink node via **`TP=4, SP=true, CP=2, PP=1`** (`DP = total_gpus / 8`, e.g. `DP=6` on 48 GPUs), combined with `use_distributed_optimizer: true` (shards optimizer states across `DP × CP = 12` → `~6.75 GiB`/GPU), `recompute_granularity: full` (`uniform`, `1` layer), `offload_{weight,grad,optimizer}: true`, `empty_cache_after_backward: true`, and `freeze_vision_model: true` / `freeze_vision_projection: true`.
+
+### 3. Uneven DP Batching & `CP > 1` Packed-Sequence Dummy Row Padding
+
+- **Symptom 1**: `AssertionError` in `megatron_worker.py` / `init_num_microbatches_calculator` whenever `rollout_batch_size` (e.g., `16` or `32` groups) is not divisible by `actor DP` (e.g., `DP=6` on 48 GPUs, which has factor 3).
+- **Symptom 2**: `RuntimeError: The size of tensor a (4) must match the size of tensor b (0)` inside `megatron.bridge` `preprocess_packed_seqs` on CP rank 1.
+- **Root Cause**: Standard Megatron assumes `gbs % (mbs * dp_size) == 0`, and `pad_actor_batch_rows` previously appended `1`-token dummy rows that split into an empty `0`-length shard on CP rank 1 (since Context Parallelism + Sequence Parallelism require each sequence length to be a multiple of `2 * CP * TP`).
+- **Fix Implemented**:
+  - Under `actor.enable_dp_load_balance: true`, `initialize.py` and `megatron_worker.py` round `gbs` up to a multiple of `mbs * dp_size`, `distributed.py` performs greedy LPT bin-packing across uneven DP ranks (guaranteeing `>= 1` group per rank), and `loss_scales.py` applies uniform global scaling (`uneven_dp_groups=True`).
+  - `pad_actor_batch_rows(..., min_row_len=tp * cp * 2)` pads dummy rows to `min_row_len` (`16` tokens for `TP=4, CP=2`) with `attention_mask=True`, `response_mask=False`, and zero advantage/loss scale so gradients are mathematically unchanged while CP slicing never sees an empty shard.
+
+### 4. Async GRPO Idle-Worker Gloo Timeout (`Timed out waiting 10800000ms for recv`)
+
+- **Symptom**: Training runs normally for hours, then crashes at **exactly `3h 00m`** (`10,800,000 ms`) with `RuntimeError: Timed out waiting 10800000ms for recv` on a subset of `AgentLoopGroup` ranks.
+- **Root Cause**: RLinf defaults `RLINF_TIMEOUT` to `180` minutes (`3h`) on all Gloo/NCCL channels. When `num_agentloop_workers` (e.g., placing `agentloop: 0-47` = 48 workers) exceeds `rollout_buffer.max_inflight_groups` (e.g., `18` or `36`), the excess workers remain permanently idle and blocked on `dataloader_channel.get()` until the 3-hour Gloo receive timeout aborts the entire job.
+- **Two-Layer Fix (Always Apply Both)**:
+  1. **Size `agentloop` strictly `<= max_inflight_groups`**: Ideally `~max_inflight_groups / 2` (e.g., `cluster.component_placement.agentloop: 0-17` = `18` workers for `max_inflight_groups: 36` → ~2 groups/worker, `0%` idle workers). Because `RPentAgentLoopWorker` is async I/O-bound, 18 workers easily saturate 36+ concurrent groups.
+  2. **Raise timeouts for multi-day RL runs**: Export `RLINF_TIMEOUT=201600` (`140` days, safely within `int64` `std::chrono::milliseconds`) in driver and all worker `env_vars`, and set `actor.megatron.distributed_timeout_minutes: 201600`.
+
+### 5. Multi-Env Async `RolloutBuffer` Balancing & Scaling Rules
+
+- **Problem**: Across heterogeneous simulators, fast MuJoCo environments (`metaworld`, `libero`) complete 5–10× faster than IsaacSim environments (`robodojo`, `robolab`). Pure FCFS starves slow environments out of training batches; rigid equal quotas stall the entire GPU cluster on the single slowest episode.
+- **Fix Implemented (`RolloutBufferWorker`)**:
+  - **`min_groups_per_task`**: Guarantees a per-env floor in every batch (e.g., `4` groups/env × `5` envs = `20` groups out of `rollout_batch_size=32`).
+  - **FCFS surplus slots**: Remaining batch slots (`12` groups) fill first-come-first-served from whichever environments complete earliest, keeping all 48 GPUs saturated while preserving 5-env coverage every step.
+  - **`max_inflight_per_task`**: Caps concurrent inflight groups per env to match physical simulator slots (`libero:10`, `robotwin:8`, `robodojo:4`, `robolab:4`, `metaworld:10` → matches `40/32/16/16/40` worker slots at `group_size=4`).
+  - **Batch-size scaling rule**: When doubling `rollout_batch_size` (e.g. `16 → 32`), scale `min_groups_per_task`, `max_inflight_groups` (`>= rollout_batch_size + buffer`, e.g. `36`), `max_buffered_groups` (`~2× rollout_batch_size`, e.g. `64`), and `max_dropped_groups_per_step` (`~10× rollout_batch_size`, e.g. `320`) proportionally so stale-group drops never stall batch admission.
+  - **Collocated async requirement**: Always set `rollout.pause_mode: retract` (enforced by `validate_rpent_async_cfg`) so SGLang cleanly retracts inflight requests before offloading VRAM for Megatron backward.
+
+### 6. Sparse Per-Env Metric Aggregation (`KeyError` in `aggregate_agent_metrics`)
+
+- **Symptom**: `KeyError: '__mean__/rpent/<env>/success_rate'` at the end of an async training step.
+- **Root Cause**: In multi-env async runs, an individual `AgentLoopWorker` may only complete episodes for a subset of the 5 environments within a step; assuming every worker dict contains every key crashes aggregation.
+- **Fix Implemented**: `rlinf/utils/metric_utils.py` filters `[d[k] for d in metrics_list if k in d]` with a zero-denominator guard, and `async_agent_runner.py` logs per-env `batch_task_count/<env>`, `size/<env>`, and `inflight/<env>` buffer telemetry.
+
+### 7. SGLang Multimodal, Hopper (H100), & CUDA Driver Stability
 
 | Issue / Failure | Root Cause | Fix & Operational Guidance |
 | :--- | :--- | :--- |
 | **`AttributeError` in `rlinf/utils/patcher.py` on H100 (Hopper)** | Hopper's `deep_gemm` inserts non-module sentinel objects lacking `__dict__` into `sys.modules`. | Guarded `_Patcher` in `rlinf/utils/patcher.py` with `if not hasattr(value, "__dict__"): continue`. |
-| **`GenerateInput(rank=0)` `SIGABRT: Too many open files`** | 32-GPU Ray/Gloo `ChannelWorker` opens `>1,400` TCP FDs (64 Gloo groups + Ray sockets), exceeding container default `ulimit -n 1024`. | Set `ulimit -n 1048576` in Ray node startup, `run_train.sh`, and SSH tunnel scripts (and `resource.setrlimit` in RPent `server.py`/`serve.py`). |
-| **`httpx.RemoteProtocolError: Server disconnected without sending a response`** | Client `httpx` default `keepalive_expiry=5.0` raced with `uvicorn`'s default `timeout_keep_alive=5` across the cross-cluster SSH tunnel, and bare open errors hid HTTP response details. | Set `AgentLoopWorker._client()` `keepalive_expiry=30.0` (strictly below RPent server `timeout_keep_alive=300`), included `resp.text[:300]` in `HTTPStatusError`, mapped router `TransportError` → HTTP `503`, and set `max_infra_retries: 3`. |
-| **Shared BeeGFS short-reads & container `/` overlay eviction** | Concurrent reads of Python packages, `@triton.jit` sources (`fla-core` `OSError: could not get source code`), and simulator assets from BeeGFS caused intermittent 0-byte reads; copying ~45 GB into container `/tmp` risked 100 GB overlay eviction. | Stage `RLinf`, `RPent`, `envs/rl-overlay`, `checkpoint-216`, simulator venvs, and assets into node-local RAM tmpfs (`/dev/shm/rpent_ppo`, symlinked at `/tmp/rpent_ppo`), and point Ray `--temp-dir` to `/tmp/rpent_ppo/ray`. Keeps `/` overlay at `<1.2 GiB / 100 GiB (1%–2%)` and enables `~42s` RAM-to-RAM node recovery (`1.07 GB/s`). |
-| **Megatron backward OOM on collocated RL+Sim GPUs** | Peak 32-GPU Megatron (`TP=2, DP=16`) backward reaches `79.2 GiB / 81.5 GiB` on H100; resident collocated sim workers leave insufficient VRAM. | Enable `tools.rpent.sleep_sim_pools_during_training: true` and `sleepable: true` on collocated RPent pools (`h100_1`–`h100_4`) while keeping dedicated `h100`/`a100` pools warm (`sleepable: false`). |
-| **`json.decoder.JSONDecodeError` in SGLang `l2norm_fwd_kernel` after pod crash / disk full** | Interrupted writes leave 0-byte `*.json` files inside `/root/.triton/cache`, causing all SGLang workers on that node to crash during prefill. | Audit `/root/.triton/cache` for 0-byte or invalid JSON files (`find /root/.triton/cache -type f -size 0`) before launch, and sync a verified cache from a healthy peer node. |
-| **Transient SGLang `TCPStore` `EADDRINUSE` during 8-way startup** | Concurrent `tp=1` SGLang workers on the same host can occasionally race on ephemeral ports at startup. | Cleanly retry launch once Ray reports `0.0/32.0 GPU` used and routers report `active_sessions: 0`. |
-| **SGLang CUDA Graph capture hang / illegal memory access during long multi-node RL resume** | Under heavy multimodal prefill/decode mixed with weight sync and memory saver, CUDA Graph capture/replay can stall or corrupt memory on heterogeneous driver/PyTorch stacks (`535.x` + `torch 2.11+cu128`). | Set `rollout.sglang.enforce_eager: true` in training YAML (and for standalone TP=2 serving on `535.x` drivers, pass `--disable-cuda-graph --disable-custom-all-reduce --sampling-backend pytorch --attention-backend triton`). |
-| **SGLang multimodal shared-buffer crash (`SGLANG_MM_BUFFER_SIZE_MB`)** | SGLang's multimodal embedding ring buffer can collide/corrupt under high-concurrency image batches and wake/sleep cycles. | Export `SGLANG_MM_BUFFER_SIZE_MB="0"` in rollout / actor environment variables (`train_qwen3.5_4b_rpent_grpo_48gpu.yaml`). |
-| **CUDA 12.8 / cuDNN symbol mismatch in SGLang & Megatron (`cutlass.cute` / `libcuda` errors)** | Container `LD_LIBRARY_PATH` putting `/usr/lib/x86_64-linux-gnu` ahead of `/usr/local/cuda/compat` loads older host `libcuda.so` on `535.x` nodes. | Put `/usr/local/cuda/compat` **first** in `LD_LIBRARY_PATH` for SGLang/Megatron RL workers, while keeping simulator pool processes on native host `LD_LIBRARY_PATH` (never mix `/usr/local/cuda/compat` into EGL/Vulkan simulator venvs). |
-| **SGLang memory-saver lifecycle error during collocated sleep/wake or async GRPO** | Missing or inconsistent `enable_memory_saver` handling in `sglang_worker.py` prevented clean VRAM release/reload across offload cycles. | Wired `enable_memory_saver` properly in `rlinf/workers/rollout/sglang/sglang_worker.py` and deferred Megatron imports under `TYPE_CHECKING` in `rlinf/runners/async_agent_runner.py` so collocated async GRPO and unit tests import cleanly. |
-| **Collocated 27B weight sync OOM at `Rollout TP=1` on 80GB H100** | During `sync_model_to_rollout`, Actor (`TP=4, CP=2`) holds `24.3 GiB` while SGLang `TP=1` holds `54.8 GiB` (`79.1 / 79.2 GiB`, only `9.75 MiB` free), causing OOM on `posi_norm` / `validate_weight_first_sync`. | Use `rollout.tensor_parallel_size: 2` (`24` NVLink replicas across 48 GPUs, `max_running_requests: 8`), which leaves `~26 GiB` free headroom during weight sync, passes `48/48` `validate_weight_first_sync`, and doubles decode bandwidth and KV cache. |
-| **Uneven DP (`16` groups across `DP=6`) + `CP=2` packed-sequence crash** | 48 GPUs has factor 3 so `DP=6` does not divide `rollout_batch_size=16`; `calc_num_microbatches` asserted `gbs % (mbs*dp) == 0`, and `pad_actor_batch_rows` padded dummy rows of length `1` which sliced to `[0]` on CP rank 1 inside `megatron.bridge`. | Implemented uneven-DP support across `config.py`, `initialize.py`, `megatron_worker.py`, `distributed.py` (greedy LPT with non-empty guarantee), and `loss_scales.py` (uniform global scaling), plus `min_row_len = tp * cp * 2` (`16`) for `CP>1` dummy rows (`response_mask=False`). |
-| **`KeyError: '__mean__/rpent/<env>/success_rate'` in multi-env async logging** | `aggregate_agent_metrics` assumed every worker reported every metric key; in 5-env async runs, workers may only complete a subset of envs per step. | Filtered `[d[k] for d in metrics_list if k in d]` with zero-denom guard in `rlinf/utils/metric_utils.py`, and forwarded `batch_task_count/<env>`, `size/<env>`, and `inflight/<env>` in `async_agent_runner.py`. |
-| **Ray picking RoCE NIC (`10.211.x.x`) instead of `eth0` (`172.27.x.x`)** | Multi-NIC H100 nodes default Ray to `net1` (`10.211.x.x`), breaking cross-node GCS/control plane. | Start Ray with `--node-ip-address=<eth0_ip>` on all nodes, set `NCCL_SOCKET_IFNAME=eth0` / `GLOO_SOCKET_IFNAME=eth0`, and pin RoCEv2 HCAs (`NCCL_IB_HCA=mlx5_20..27`, `NCCL_IB_GID_INDEX=5`, `NCCL_CROSS_NIC=0`). |
-| **Gloo `Timed out waiting 10800000ms for recv` at exactly 3h on `AgentLoopGroup`** | RLinf defaults `RLINF_TIMEOUT=180` min (`10,800,000 ms`) on all Gloo/NCCL collectives; when `agentloop` worker count (`48`) exceeds `max_inflight_groups` (`18`), excess idle workers stay blocked on `dataloader_channel.get()` for 3h until Gloo aborts the run. | Size `cluster.component_placement.agentloop` strictly `<= max_inflight_groups` (e.g., `0-17` for `max_inflight_groups=36` so every worker stays active with `0%` idle), and export `RLINF_TIMEOUT=201600` (140 days) in driver and worker `env_vars`. |
+| **CUDA IPC weight sync fails on `535.x` drivers (`storage._share_cuda_()`)** | PyTorch expandable allocator segments are incompatible with CUDA IPC handle export on older drivers. | Set `PYTORCH_ALLOC_CONF=expandable_segments:False` and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` in rollout & actor `env_vars`. |
+| **CUDA 12.8 / `cutlass.cute` / `libcuda` symbol mismatch** | Placing `/usr/lib/x86_64-linux-gnu` before `/usr/local/cuda/compat` loads older host `libcuda.so` on `535.x` nodes. | Put `/usr/local/cuda/compat` **first** in `LD_LIBRARY_PATH` for SGLang/Megatron RL workers, while keeping simulator pool venvs on native host `LD_LIBRARY_PATH` (never mix `compat` into EGL/Vulkan simulators). |
+| **SGLang CUDA Graph hang / illegal memory access across offload/reload cycles** | Multimodal prefill/decode mixed with weight sync and memory saver can corrupt captured CUDA graphs on `535.x` + `torch 2.11+cu128`. | Set `rollout.enforce_eager: true` and `rollout.sglang.enable_memory_saver: true`. |
+| **SGLang multimodal shared-buffer corruption** | SGLang's multimodal embedding ring buffer can collide under concurrent image batches and sleep/wake cycles. | Export `SGLANG_MM_BUFFER_SIZE_MB="0"` in `rollout.env_vars`. |
+| **`json.decoder.JSONDecodeError` in Triton `l2norm_fwd_kernel`** | Abrupt pod termination leaves 0-byte `*.json` cache files under `/root/.triton/cache`. | Before launch, audit and purge 0-byte files (`find ~/.triton/cache -type f -size 0 -delete`). |
+| **Transient SGLang `TCPStore EADDRINUSE` during 24+ replica launch** | Concurrent multi-replica startup can occasionally collide on ephemeral TCP ports. | Cleanly retry launch once `ray status` reports `0.0/<N> GPU` used and simulator pools report `active_sessions: 0`. |
 
-## 7-Node Qwen3.8-27B 5-Env Joint Collocated Async GRPO
+### 8. Multi-Node Networking, File Descriptors, & Storage
 
-`examples/agent/rpent/config/train_qwen3.8_27b_rpent_async_grpo_5env.yaml` trains `Qwen3.8-27B` jointly across all 5 simulators (`libero`, `robotwin`, `robodojo`, `robolab`, `metaworld`) using 6 collocated RL nodes (`48x H100`, `h1..h5 + h7`, `Rollout TP=2` + `Actor TP=4/SP/CP=2/DP=6`) plus 1 dedicated Env+SAM3 node (`h6`, `8x H100`, 144 concurrent simulator slots + 8× SAM3). Each step trains `32` groups × `4` episodes (`128` trajectories) with a guaranteed floor of `4` groups per environment (`20` groups) and `12` surplus groups filled FCFS (`min_groups_per_task` + `max_inflight_per_task` in `RolloutBufferWorker`).
+| Issue / Failure | Root Cause | Fix & Operational Guidance |
+| :--- | :--- | :--- |
+| **Ray GCS binds RDMA NIC instead of control-plane NIC** | Multi-NIC H100 nodes default Ray to data-plane interfaces (`net1`), breaking cross-node GCS/control plane. | Start Ray on every node with `--node-ip-address=<control_eth_ip>`, set `NCCL_SOCKET_IFNAME=eth0` / `GLOO_SOCKET_IFNAME=eth0`, and configure RDMA via `NCCL_IB_HCA`, `NCCL_IB_GID_INDEX`, `NCCL_CROSS_NIC=0`. |
+| **`GenerateInput` `SIGABRT: Too many open files`** | Multi-node Ray/Gloo channels + concurrent HTTP connections open `>1,400` FDs, exceeding container default `ulimit -n 1024`. | Set `ulimit -n 1048576` in Ray node startup, training launch scripts, and simulator supervisors. |
+| **`httpx.RemoteProtocolError: Server disconnected`** | Default `httpx` `keepalive_expiry=5.0` raced with `uvicorn`'s `timeout_keep_alive=5`. | `RPentAgentLoopWorker._client()` sets `keepalive_expiry=30.0` (strictly below RPent server's `300s`), sets `trust_env=False`, and retries transient transport failures (`max_infra_retries: 3`). |
+| **Shared BeeGFS/NFS short-reads & container `/` overlay eviction** | Concurrent module/asset reads across dozens of workers trigger short-reads; staging into `/` container overlay can cause pod eviction. | When on affected shared filesystems, stage repos/venvs/assets into `/dev/shm/rpent_ppo` (RAM tmpfs) and point Ray `--temp-dir` there. |
+| **Simulator-side issues (Vulkan `ERROR_DEVICE_LOST`, air-gapped `omniverse.toml`, IsaacSim VRAM budget, `PYTHONPATH` isolation)** | See dedicated simulator troubleshooting guide. | Follow the pre-flight checklist and pitfalls table in [`RPent/robots/rl/README.md`](https://github.com/zhexuanxu/RPent/blob/rpent-harness-v2/robots/rl/README.md). |
 
-## RoboLab and RoboTwin smoke run
-
-Use the RPent revision from [the RoboLab integration PR](https://github.com/zhexuanxu/RPent/pull/4). The run uses four training GPUs, two ready RoboLab workers, two ready RoboTwin workers, and a SAM3 endpoint for segmentation. Start with one RoboLab worker per simulator GPU and size each pool from its measured memory use. The training runtime loads a local Qwen3.5-4B SFT checkpoint through `RPENT_MODEL_PATH`.
-
-Set `RPENT_ROOT` to the directory containing both checkouts as `RLinf` and `RPent`. Set `ROBOTWIN_SEED_TABLE` to the RPent seed table and run from the RLinf checkout.
-
-```bash
-python examples/agent/rpent/prepare_tasks.py \
-  --robolab-catalog "$RPENT_ROOT/RPent/robots/robolab/task_catalog.json" \
-  --seeds 0 --output-dir "$RPENT_ROOT/data/robolab"
-
-python examples/agent/rpent/prepare_tasks.py \
-  --robotwin-seeds "$ROBOTWIN_SEED_TABLE" \
-  --output-dir "$RPENT_ROOT/data/robotwin"
-```
-
-The RoboLab command writes 120 rows for seed 0 and records the source revision and catalog and JSONL checksums in `train-manifest.json`. Generate more seeded scenes with explicit seed IDs or ranges such as `--seeds 0-3`.
-
-Start the pools using the simulator setup instructions in RPent. Point `ROBOLAB_POOL_URL` and `ROBOTWIN_POOL_URL` at the pools or their routers. The defaults are local ports 28566 and 28562. For pools sharing training GPUs, use `sleepable` to release their GPU memory for the Megatron update. Reserve memory for both SGLang and simulation during rollout.
-
-```bash
-bash examples/agent/rpent/run_train.sh \
-  --config-name train_qwen3.5_4b_rpent_robolab_smoke
-```
-
-The run collects one group of two episodes per simulator and performs one GRPO optimizer step. The startup capacity check requires two resident worker slots per simulator. RPent returns the native success flag used for reward, and infrastructure failures follow the episode retry policy. The run writes group rewards under `sampling/` and optimizer metrics to TensorBoard.
+---
 
 ## Unit Tests
 
 ```bash
 PYTHONPATH=/path/to/RLinf:/path/to/RPent:/path/to/Megatron-LM \
-  pytest tests/unit_tests/test_rpent_grpo.py -v
+  pytest tests/unit_tests/test_rpent_grpo.py tests/unit_tests/test_rollout_buffer.py -v
 ```

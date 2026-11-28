@@ -117,23 +117,25 @@ agentloop:
   episode_timeout_s: 7200
   merge_prefix_turns: true
   history_compaction:
-    strategy: base
-    max_messages: 80
+    strategy: dynamic
+    max_messages: null
     keep_messages: 10
     keep_recent_images: 4
     keep_recent_thinking: 4
     preserve_opening_images: true
     context_window: 262144
+    max_tokens: 48000
     max_fraction: 0.7
     preserve_first_user_message: true
     receipts: false
-  max_infra_retries: 1
+  max_infra_retries: 3
   max_infra_retry_rate: 1.0
   env_vars:
     PYTHONPATH: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/RLinf:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/RPent:/opt/venv/reason/Megatron-LM
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
-    LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    LD_LIBRARY_PATH: ${oc.env:RPENT_LD_LIBRARY_PATH,/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64}
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
 
 tools:
   rpent:
@@ -144,8 +146,8 @@ tools:
     record_artifacts: false
     remote_toolkit_endpoint: null
     max_actions_per_call: 3
-    image_size: null  # null => env default (libero/robocasa/metaworld=512, robolab=768, robotwin/robodojo=native)
-    include_jaw_mm: false
+    image_size: null  # null => env default (libero/robocasa/metaworld=512, robolab=768x432, robotwin/robodojo=native)
+    include_jaw_mm: true
     tool_timeout_s: 1800
 
 rollout:
@@ -155,7 +157,7 @@ rollout:
     model_path: ${oc.env:RPENT_MODEL_PATH,/path/to/models/Qwen3.5-4B-SFT}
     model_type: qwen3_5
     precision: bf16
-  enforce_eager: false
+  enforce_eager: true
   distributed_executor_backend: mp
   disable_log_stats: false
   detokenize: false
@@ -167,6 +169,7 @@ rollout:
   sglang:
     backend_type: server
     enable_weights_cpu_backup: true
+    enable_memory_saver: true
     attention_backend: triton
     decode_log_interval: 500000
     use_torch_compile: false
@@ -188,8 +191,10 @@ rollout:
     PYTHONPATH: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/RLinf:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/RPent:/opt/venv/reason/Megatron-LM
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
-    LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    LD_LIBRARY_PATH: ${oc.env:RPENT_LD_LIBRARY_PATH,/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64}
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
+    SGLANG_MM_BUFFER_SIZE_MB: "0"
     PYTORCH_ALLOC_CONF: expandable_segments:False
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     NCCL_MAX_CTAS: "8"
@@ -285,7 +290,7 @@ actor:
     empty_cache_after_backward: true
     ddp_bucket_size: null
     distributed_backend: nccl
-    distributed_timeout_minutes: 180
+    distributed_timeout_minutes: 201600
     ckpt_format: torch
     use_dist_ckpt: false
     tp_comm_bootstrap_backend: nccl
@@ -302,7 +307,8 @@ actor:
     PYTHONPATH: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/RLinf:${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/RPent:/opt/venv/reason/Megatron-LM
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
-    LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    LD_LIBRARY_PATH: ${oc.env:RPENT_LD_LIBRARY_PATH,/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64}
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     PYTORCH_ALLOC_CONF: expandable_segments:False
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     NCCL_MAX_CTAS: "8"

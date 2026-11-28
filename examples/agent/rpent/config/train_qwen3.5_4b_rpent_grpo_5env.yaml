@@ -19,27 +19,27 @@ env:
 five_env_pools:
   libero:
     endpoint: ${oc.env:LIBERO_POOL_URL,http://127.0.0.1:28561}
-    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/libero/train.jsonl
+    train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/libero/train.jsonl
     rollout_episodes: 8
     sampling_episodes: 16
   robotwin:
     endpoint: ${oc.env:ROBOTWIN_POOL_URL,http://127.0.0.1:28562}
-    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robotwin/train.jsonl
+    train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/robotwin/train.jsonl
     rollout_episodes: 8
     sampling_episodes: 16
   robodojo:
     endpoint: ${oc.env:ROBODOJO_POOL_URL,http://127.0.0.1:28563}
-    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robodojo/train.jsonl
+    train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/robodojo/train.jsonl
     rollout_episodes: 8
     sampling_episodes: 16
   robolab:
     endpoint: ${oc.env:ROBOLAB_POOL_URL,http://127.0.0.1:28564}
-    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/robolab/train.jsonl
+    train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/robolab/train.jsonl
     rollout_episodes: 8
     sampling_episodes: 16
   metaworld:
     endpoint: ${oc.env:METAWORLD_POOL_URL,http://127.0.0.1:28565}
-    train_data_paths: ${oc.env:RPENT_ROOT,/mnt/public/xzxuan}/data/metaworld/ml45-train.jsonl
+    train_data_paths: ${oc.env:RPENT_ROOT,/path/to/rpent_ppo}/data/metaworld/ml45-train.jsonl
     rollout_episodes: 8
     sampling_episodes: 16
 

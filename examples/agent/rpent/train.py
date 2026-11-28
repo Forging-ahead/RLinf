@@ -37,7 +37,10 @@ from rlinf.workers.rollout_buffer.rollout_buffer_worker import RolloutBufferWork
 
 def _env_vars(section) -> dict[str, str] | None:
     raw = section.get("env_vars")
-    return OmegaConf.to_container(raw, resolve=True) if raw else None
+    if not raw:
+        return None
+    resolved = OmegaConf.to_container(raw, resolve=True)
+    return {k: str(v) for k, v in resolved.items() if v is not None} or None
 
 
 @hydra.main(

@@ -139,6 +139,7 @@ agentloop:
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
     LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     HF_HUB_OFFLINE: "1"
     TRANSFORMERS_OFFLINE: "1"
     NO_PROXY: ${oc.env:NO_PROXY,'127.0.0.1,localhost'}
@@ -154,14 +155,14 @@ tools:
     remote_toolkit_endpoint: null
     max_actions_per_call: 3
     image_size: null
-    include_jaw_mm: false
+    include_jaw_mm: true
     tool_timeout_s: 1800
 
 rollout:
   group_name: RolloutGroup
   gpu_memory_utilization: 0.55
   model:
-    model_path: ${oc.env:RPENT_MODEL_PATH,${oc.env:RPENT_LOCAL_CACHE,/tmp/rpent_ppo}/checkpoint-216}
+    model_path: ${oc.env:RPENT_MODEL_PATH,${oc.env:RPENT_LOCAL_CACHE,/tmp/rpent_ppo}/models/Qwen3.5-4B-SFT}
     model_type: qwen3_5
     precision: bf16
   enforce_eager: true
@@ -176,6 +177,7 @@ rollout:
   sglang:
     backend_type: server
     enable_weights_cpu_backup: true
+    enable_memory_saver: true
     attention_backend: triton
     decode_log_interval: 500000
     use_torch_compile: false
@@ -198,6 +200,7 @@ rollout:
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
     LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     SGLANG_MM_BUFFER_SIZE_MB: "0"
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
     PYTORCH_ALLOC_CONF: expandable_segments:False
@@ -299,7 +302,7 @@ actor:
     empty_cache_after_backward: true
     ddp_bucket_size: null
     distributed_backend: nccl
-    distributed_timeout_minutes: 180
+    distributed_timeout_minutes: 201600
     ckpt_format: torch
     use_dist_ckpt: false
     tp_comm_bootstrap_backend: nccl
@@ -317,6 +320,7 @@ actor:
     PATH: /opt/venv/reason/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     CUDA_HOME: /usr/local/cuda
     LD_LIBRARY_PATH: /usr/local/cuda/compat:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+    RLINF_TIMEOUT: "${oc.env:RLINF_TIMEOUT,201600}"
     PYTORCH_ALLOC_CONF: expandable_segments:False
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     NCCL_SOCKET_IFNAME: eth0
