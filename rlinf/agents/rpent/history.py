@@ -50,6 +50,8 @@ def _image_tokens(png_bytes: bytes) -> int:
 
 
 def _argument_hint(name: str, environment: str) -> str:
+    if environment == "maniskill" and name in {"execute_actions", "move_base"}:
+        return "Use only the declared actions. Pens accept move_to; Fetch base commands require vy=0."
     if environment == "metaworld" and name in {
         "execute_actions",
         "move_to",
